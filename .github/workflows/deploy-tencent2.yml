@@ -1,0 +1,61 @@
+name: Mailcow deployment to Tencent server 2
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Choose what to run
+        required: true
+        type: choice
+        default: connection-test
+        options:
+          - connection-test
+          - deploy
+
+permissions: {}
+
+concurrency:
+  group: mailcow-tencent-server-2
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      DEPLOY_HOST: ${{ secrets.TENCENT2_HOST }}
+      DEPLOY_USER: ${{ secrets.TENCENT2_USER }}
+      DEPLOY_KEY: ${{ secrets.TENCENT2_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.TENCENT2_KNOWN_HOSTS }}
+      DEPLOY_MODE: ${{ inputs.mode }}
+
+    steps:
+      - name: Connect to Tencent server
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_USER"
+          test -n "$DEPLOY_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/tencent2_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/tencent2_key" "$HOME/.ssh/known_hosts"
+
+          if [[ "$DEPLOY_MODE" == "connection-test" ]]; then
+            ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
+              -i "$HOME/.ssh/tencent2_key" \
+              "$DEPLOY_USER@$DEPLOY_HOST" \
+              'whoami && sudo -n -l /usr/local/sbin/mailcow-deploy'
+          elif [[ "$DEPLOY_MODE" == "deploy" ]]; then
+            ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
+              -i "$HOME/.ssh/tencent2_key" \
+              "$DEPLOY_USER@$DEPLOY_HOST" \
+              'sudo -n /usr/local/sbin/mailcow-deploy'
+          else
+            echo "Unknown deployment mode: $DEPLOY_MODE" >&2
+            exit 1
+          fi
