@@ -23,6 +23,8 @@ if ($_SERVER['REQUEST_URI'] == '/') {
   $css_minifier->add('/web/css/site/index.css');
 }
 
+$css_minifier->add('/web/css/site/wismail.css');
+
 $hash = $css_minifier->getDataHash();
 $CSSPath = '/tmp/' . $hash . '.css';
 if(!file_exists($CSSPath)) {

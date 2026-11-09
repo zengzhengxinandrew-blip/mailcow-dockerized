@@ -1,0 +1,100 @@
+/* Wismail visual system: quiet surfaces, navy structure, turquoise actions. */
+:root {
+  --wis-navy: #09265b;
+  --wis-navy-hover: #123d76;
+  --wis-teal: #00bdb4;
+  --wis-teal-dark: #007e79;
+  --wis-canvas: #f3f8fa;
+  --wis-surface: #ffffff;
+  --wis-ink: #19354e;
+  --wis-muted: #5b7184;
+  --wis-line: #d9e7ec;
+  --bs-primary: #0b3970;
+  --bs-primary-rgb: 11, 57, 112;
+  --bs-link-color: #0b6680;
+  --bs-link-hover-color: #064f65;
+}
+
+html, body { font-family: "Noto Sans", "Segoe UI", sans-serif; }
+body { background: var(--wis-canvas); color: var(--wis-ink); }
+h1, h2, h3, h4, h5, h6, legend, .card-header {
+  font-family: "Segoe UI Variable Display", "Noto Sans", sans-serif;
+  letter-spacing: -.02em;
+  color: var(--wis-navy);
+}
+a { color: #0b6680; }
+a:hover { color: #064f65; }
+
+.navbar.bg-light {
+  background: var(--wis-navy) !important;
+  border-bottom: 3px solid var(--wis-teal);
+  box-shadow: 0 4px 18px rgba(9, 38, 91, .12);
+}
+.navbar .navbar-brand { padding: 6px 12px; background: #fff; border-radius: 10px; margin: 5px 10px 5px 0; }
+.navbar .navbar-brand img { height: 34px; width: auto; max-width: 170px; object-fit: contain; }
+.navbar .nav-link, .navbar .nav-link:hover, .navbar .dropdown-toggle { color: #e8f6fa !important; }
+.navbar .nav-link:hover, .navbar .nav-link:focus { background: rgba(255,255,255,.09); }
+.navbar .nav-link.active, .navbar .nav-item.show > .nav-link { color: #62e6db !important; }
+.navbar-toggler { border-color: rgba(255,255,255,.45); color: #fff; }
+.navbar-toggler .bi { color: #fff; }
+
+.card, .modal-content, .dropdown-menu, .panel, .list-group-item {
+  background: var(--wis-surface);
+  border: 1px solid var(--wis-line);
+  border-radius: 12px;
+  box-shadow: 0 3px 16px rgba(19, 60, 86, .045);
+}
+.card-header, .modal-header, .panel-heading {
+  background: #f8fbfc;
+  border-color: var(--wis-line);
+}
+.card-header { border-radius: 12px 12px 0 0 !important; font-weight: 700; }
+.btn { border-radius: 8px; font-weight: 600; }
+.btn-primary, .btn-info, .page-item.active .page-link {
+  background: var(--wis-navy) !important;
+  border-color: var(--wis-navy) !important;
+  color: #fff !important;
+}
+.btn-primary:hover, .btn-info:hover, .page-item.active .page-link:hover {
+  background: var(--wis-navy-hover) !important;
+  border-color: var(--wis-navy-hover) !important;
+}
+.btn-success { background: var(--wis-teal-dark); border-color: var(--wis-teal-dark); }
+.btn-success:hover { background: #006b67; border-color: #006b67; }
+.btn-outline-primary { color: var(--wis-navy); border-color: var(--wis-navy); }
+.btn-outline-primary:hover { background: var(--wis-navy); border-color: var(--wis-navy); }
+.badge.bg-info { background: #d9f6f3 !important; color: #075d5a !important; }
+
+.form-control, .form-select, .input-group-text, .bootstrap-select > .dropdown-toggle {
+  border-color: var(--wis-line);
+  border-radius: 8px;
+}
+.form-control:focus, .form-select:focus, .bootstrap-select > .dropdown-toggle:focus {
+  border-color: var(--wis-teal-dark);
+  box-shadow: 0 0 0 .2rem rgba(0, 189, 180, .18);
+}
+.form-check-input:checked { background-color: var(--wis-teal-dark); border-color: var(--wis-teal-dark); }
+:focus-visible { outline: 2px solid var(--wis-teal-dark); outline-offset: 2px; }
+
+.nav-tabs { border-bottom: 1px solid var(--wis-line); }
+.nav-tabs .nav-link { border: 0 !important; border-bottom: 3px solid transparent !important; color: var(--wis-muted); }
+.nav-tabs .nav-link:hover, .nav-tabs .nav-link.active {
+  color: var(--wis-navy) !important;
+  border-bottom-color: var(--wis-teal) !important;
+  background: transparent;
+}
+.table { --bs-table-border-color: var(--wis-line); color: var(--wis-ink); }
+.table thead th { background: #eaf3f6; color: var(--wis-navy); font-weight: 700; border-bottom-color: var(--wis-line); }
+.table-striped > tbody > tr:nth-of-type(odd) > * { --bs-table-accent-bg: #f7fafb; }
+.table-hover > tbody > tr:hover > * { --bs-table-accent-bg: #eaf8f7; }
+.dropdown-item.active, .dropdown-item:active { background: var(--wis-navy); }
+.alert-info { color: #0b5669; background: #e6f8f7; border-color: #b9e9e5; }
+
+@media (max-width: 767px) {
+  .navbar .navbar-brand { margin-left: 6px; }
+  .navbar .navbar-brand img { height: 30px; max-width: 145px; }
+  .card, .modal-content { border-radius: 10px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
+}
