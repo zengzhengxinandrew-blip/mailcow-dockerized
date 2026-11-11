@@ -1,0 +1,17 @@
+# Place at mailcow-dockerized/data/conf/nginx/site.bulk.custom.
+location = /bulk {
+    return 308 /bulk/;
+}
+
+location ^~ /bulk/ {
+    resolver 127.0.0.11 ipv6=off valid=30s;
+    set $wismail_bulk_upstream wismail-bulk-sender;
+    proxy_pass http://$wismail_bulk_upstream:8765$request_uri;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_connect_timeout 10s;
+    proxy_read_timeout 60s;
+    client_max_body_size 6m;
+}

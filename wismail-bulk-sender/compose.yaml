@@ -1,0 +1,15 @@
+services:
+  wismail-bulk-sender:
+    build: .
+    env_file: .env
+    environment:
+      WISMAIL_BIND_HOST: 0.0.0.0
+      WISMAIL_DB_PATH: /app/data/wismail.sqlite3
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - wismail-bulk-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  wismail-bulk-data:

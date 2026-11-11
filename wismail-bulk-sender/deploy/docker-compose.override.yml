@@ -1,0 +1,21 @@
+# Place beside mailcow's docker-compose.yml, with wismail-bulk-sender inside the mailcow repository.
+services:
+  wismail-bulk-sender:
+    build:
+      context: ./wismail-bulk-sender
+    env_file:
+      - ./wismail-bulk-sender/.env
+    environment:
+      WISMAIL_BIND_HOST: 0.0.0.0
+      WISMAIL_DB_PATH: /app/data/wismail.sqlite3
+      WISMAIL_URL_PREFIX: /bulk
+    volumes:
+      - wismail-bulk-data:/app/data
+    networks:
+      mailcow-network:
+        aliases:
+          - wismail-bulk-sender
+    restart: unless-stopped
+
+volumes:
+  wismail-bulk-data:
