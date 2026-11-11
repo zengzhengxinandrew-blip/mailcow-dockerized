@@ -2,7 +2,7 @@ name: Mailcow deployment to Tencent server 2
 
 on:
   push:
-    branches: [master]
+    branches: [master, feature/wismail-bulk-sender-v2]
   workflow_dispatch:
     inputs:
       mode:
@@ -13,6 +13,7 @@ on:
         options:
           - connection-test
           - deploy
+          - wismail-deploy
 
 permissions: {}
 
@@ -47,16 +48,24 @@ jobs:
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/tencent2_key" "$HOME/.ssh/known_hosts"
 
+          SSH_OPTS=(-T -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
+          SSH_KEY=(-i "$HOME/.ssh/tencent2_key")
+          SSH_TARGET="$DEPLOY_USER@$DEPLOY_HOST"
+
           if [[ "$DEPLOY_MODE" == "connection-test" ]]; then
-            ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
-              -i "$HOME/.ssh/tencent2_key" \
-              "$DEPLOY_USER@$DEPLOY_HOST" \
+            ssh "${SSH_OPTS[@]}" "${SSH_KEY[@]}" "$SSH_TARGET" \
               'whoami && sudo -n -l /usr/local/sbin/mailcow-deploy'
+          elif [[ "$DEPLOY_MODE" == "wismail-deploy" ]]; then
+            ssh "${SSH_OPTS[@]}" "${SSH_KEY[@]}" "$SSH_TARGET" \
+              'sudo -n /usr/local/sbin/wismail-deploy'
           elif [[ "$DEPLOY_MODE" == "deploy" ]]; then
-            ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
-              -i "$HOME/.ssh/tencent2_key" \
-              "$DEPLOY_USER@$DEPLOY_HOST" \
-              'sudo -n /usr/local/sbin/mailcow-deploy'
+            if [[ "$GITHUB_REF_NAME" == "feature/wismail-bulk-sender-v2" ]]; then
+              ssh "${SSH_OPTS[@]}" "${SSH_KEY[@]}" "$SSH_TARGET" \
+                'sudo -n /usr/local/sbin/wismail-deploy'
+            else
+              ssh "${SSH_OPTS[@]}" "${SSH_KEY[@]}" "$SSH_TARGET" \
+                'sudo -n /usr/local/sbin/mailcow-deploy'
+            fi
           else
             echo "Unknown deployment mode: $DEPLOY_MODE" >&2
             exit 1
