@@ -4,6 +4,7 @@ import os
 import tempfile
 import threading
 import unittest
+from urllib.parse import urlencode
 from http.server import HTTPServer
 
 import core
@@ -39,6 +40,28 @@ class HttpFlowTests(unittest.TestCase):
         output = (result.status, dict(result.getheaders()), result.read())
         conn.close()
         return output
+
+    def test_contacts_and_public_unsubscribe(self):
+        old_secret = server.SETTINGS["SESSION_SECRET"]
+        server.SETTINGS["SESSION_SECRET"] = "a-long-test-secret"
+        try:
+            body = urlencode({"csrf": server.CSRF_TOKEN, "email": "buyer@example.com", "name": "Buyer"})
+            status, _, _ = self.request("POST", "/contacts/add", body,
+                                        {"Content-Type": "application/x-www-form-urlencoded"})
+            self.assertEqual(status, 303)
+            status, _, page = self.request("GET", "/contacts")
+            self.assertEqual(status, 200)
+            self.assertIn(b"buyer@example.com", page)
+            token = core.unsubscribe_token("__legacy_admin__", "buyer@example.com", server.SETTINGS["SESSION_SECRET"])
+            status, _, _ = self.request("GET", "/unsubscribe?token=" + token)
+            self.assertEqual(status, 200)
+            status, _, _ = self.request("POST", "/unsubscribe", urlencode({"token": token}),
+                                        {"Content-Type": "application/x-www-form-urlencoded"})
+            self.assertEqual(status, 200)
+            with core.connect(server.DB_PATH) as db:
+                self.assertEqual(db.execute("SELECT status FROM contacts").fetchone()["status"], "unsubscribed")
+        finally:
+            server.SETTINGS["SESSION_SECRET"] = old_secret
 
     def test_template_upload_preview_requires_explicit_start(self):
         status, _, template = self.request("GET", "/template.xlsx")

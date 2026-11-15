@@ -11,6 +11,7 @@ import hmac
 import html
 import http.cookies
 import io
+import json
 import os
 import re
 import secrets
@@ -20,8 +21,10 @@ from urllib.parse import parse_qs, urlparse
 from cryptography.fernet import Fernet
 
 from core import (MAX_UPLOAD_BYTES, Worker, add_suppression, cancel_batch, connect, create_draft,
-                  init_db, mailbox_settings, parse_upload, revoke_mailbox_auth, save_mailbox_auth,
-                  schedule_batch, set_batch_state, utcnow, verify_mailbox_auth)
+                  import_contacts, init_db, mailbox_settings, parse_contacts_upload, parse_upload,
+                  revoke_mailbox_auth, save_contact, save_mailbox_auth, schedule_batch,
+                  set_batch_state, set_contact_deleted, set_contact_status, utcnow, verify_mailbox_auth)
+from core import unsubscribe_token, verify_unsubscribe_token
 import oauth_login
 from template_xlsx import build_template
 
@@ -51,6 +54,7 @@ SETTINGS = {
     "OAUTH_CLIENT_SECRET": os.getenv("WISMAIL_OAUTH_CLIENT_SECRET", ""),
     "OAUTH_REDIRECT_URI": os.getenv("WISMAIL_OAUTH_REDIRECT_URI", ""),
     "SESSION_SECRET": os.getenv("WISMAIL_SESSION_SECRET", ""),
+    "URL_PREFIX": URL_PREFIX,
 }
 STATUS = {
     "draft": "待确认", "queued": "待发送", "sending": "发送中",
@@ -83,6 +87,7 @@ def page(title, content, user=""):
     account_link = ('<span class="top-meta">{}</span><a class="top-account" href="/account">发件授权</a>'
                     '<a class="top-account" href="/logout">退出</a>'.format(h(user)) if oauth_login.configured(SETTINGS) and user
                     else '<span class="top-meta">外贸邮件工作台 / V2</span>')
+    account_link = '<a class="top-account" href="/contacts">联系人</a>' + account_link
     markup = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Wismail</title>
 <link rel="stylesheet" href="/static.css"></head><body>
@@ -145,6 +150,43 @@ def dashboard(error="", user="__legacy_admin__"):
         suppression_count=suppression_count,
         suppressions="".join('<div><span>{}</span><small>{}</small></div>'.format(h(x["recipient_email"]), local_time(x["created_at"])) for x in suppressions) if suppressions else '<p class="muted">名单为空</p>')
     return page("发送批次", content, user)
+
+
+def contacts_page(user, error="", search="", status="", category="", recycle=False):
+    query = "SELECT c.*, (SELECT group_concat(g.name, ', ') FROM contact_category_links l JOIN contact_categories g ON g.id=l.category_id WHERE l.contact_id=c.id) AS categories FROM contacts c WHERE c.owner_email=? AND c.deleted_at IS {}".format("NOT NULL" if recycle else "NULL")
+    params = [user]
+    if search:
+        query += " AND (c.email LIKE ? OR c.name LIKE ?)"
+        params += ["%" + search[:100] + "%"] * 2
+    if status:
+        query += " AND c.status=?"
+        params.append(status)
+    if category:
+        query += " AND EXISTS (SELECT 1 FROM contact_category_links l JOIN contact_categories g ON g.id=l.category_id WHERE l.contact_id=c.id AND g.owner_email=? AND g.name=?)"
+        params += [user, category]
+    with connect(DB_PATH) as db:
+        rows = db.execute(query + " ORDER BY c.id DESC LIMIT 200", params).fetchall()
+        categories = db.execute("SELECT name FROM contact_categories WHERE owner_email=? ORDER BY name", (user,)).fetchall()
+        count = db.execute("SELECT COUNT(*) AS n FROM contacts WHERE owner_email=?", (user,)).fetchone()["n"]
+    options = ''.join('<option value="{0}" {1}>{0}</option>'.format(h(x["name"]), 'selected' if x["name"] == category else '') for x in categories)
+    items = []
+    for row in rows:
+        actions = ('<form method="post" action="/contacts/restore">{csrf}<input type="hidden" name="id" value="{id}"><button type="submit">恢复</button></form>' if recycle else
+                   '<form method="post" action="/contacts/status">{csrf}<input type="hidden" name="id" value="{id}"><select name="status"><option value="unsubscribed">退订</option><option value="complained">投诉</option><option value="invalid">无效地址</option></select><button type="submit">停止发送</button></form><form method="post" action="/contacts/delete">{csrf}<input type="hidden" name="id" value="{id}"><button type="submit">回收</button></form>')
+        items.append('<tr><td>{email}</td><td>{name}</td><td>{categories}</td><td>{status}</td><td>{actions}</td></tr>'.format(
+            email=h(row["email"]), name=h(row["name"]), categories=h(row["categories"] or ""),
+            status=h(row["status"]), actions=actions.format(csrf=csrf(user), id=row["id"])))
+    alert = '<div class="alert">{}</div>'.format(h(error)) if error else ''
+    content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>联系人 <small>共 {count} 人</small></h1>{alert}
+<p class="muted">导入同一邮箱会合并资料；退订、投诉、无效地址和回收站状态不会被导入重置。发送前再次检查状态。</p>
+<div class="two-col"><form method="post" action="/contacts/add">{csrf}<h2>添加联系人</h2><label>邮箱</label><input type="email" name="email" required><label>姓名</label><input name="name"><label>分类（逗号分隔）</label><input name="categories"><button class="button" type="submit">保存</button></form>
+<form method="post" action="/contacts/import" enctype="multipart/form-data">{csrf}<h2>导入联系人</h2><p>CSV 或 XLSX：邮箱、姓名、性别、生日、手机、地区、分类、变量1至变量10。</p><input type="file" name="file" accept=".csv,.xlsx" required><button class="button" type="submit">导入并合并</button></form></div></section>
+<section class="panel"><form method="get" action="/contacts"><input name="q" value="{search}" placeholder="搜索邮箱或姓名"><select name="status"><option value="">全部状态</option><option value="subscribed" {subscribed}>可发送</option><option value="unsubscribed" {unsubscribed}>退订</option><option value="complained" {complained}>投诉</option><option value="invalid" {invalid}>无效</option></select><select name="category"><option value="">全部分类</option>{options}</select><button type="submit">筛选</button></form>
+<p><a href="/contacts/export.csv">导出全部联系人 CSV</a> · <a href="/contacts?recycle=1">回收站</a></p><div class="table-wrap"><table><thead><tr><th>邮箱</th><th>姓名</th><th>分类</th><th>状态</th><th>操作</th></tr></thead><tbody>{items}</tbody></table></div></section>'''.format(
+        count=count, alert=alert, csrf=csrf(user), search=h(search), options=options,
+        items=''.join(items) or '<tr><td colspan="5">暂无联系人</td></tr>',
+        **{key: 'selected' if status == key else '' for key in ('subscribed', 'unsubscribed', 'complained', 'invalid')})
+    return page("联系人", content, user)
 
 
 def batch_page(batch_id, error="", user="__legacy_admin__"):
@@ -296,6 +338,16 @@ class Handler(BaseHTTPRequestHandler):
         if path is None:
             self._send(404, "页面不存在")
             return
+        if path == "/unsubscribe":
+            token = parse_qs(urlparse(self.path).query).get("token", [""])[0]
+            try:
+                verify_unsubscribe_token(token, SETTINGS["SESSION_SECRET"])
+            except ValueError:
+                self._send(400, "退订链接无效")
+                return
+            content = '<section class="panel"><h1>停止接收邮件</h1><p>确认后将不再向此邮箱发送 Wismail 批量邮件。</p><form method="post" action="/unsubscribe"><input type="hidden" name="token" value="{}"><button class="button" type="submit">确认退订</button></form></section>'.format(h(token))
+            self._send(200, page("确认退订", content))
+            return
         if oauth_login.configured(SETTINGS) and path == "/login":
             state, cookie = oauth_login.new_state(SETTINGS)
             header = "wismail_oauth_state={}; Path={}/oauth/callback; Max-Age=600; HttpOnly; SameSite=Lax{}".format(
@@ -332,6 +384,28 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/":
             self._send(200, dashboard(user=self.current_user))
+        elif path == "/contacts":
+            query = parse_qs(urlparse(self.path).query)
+            self._send(200, contacts_page(self.current_user, search=query.get("q", [""])[0],
+                                          status=query.get("status", [""])[0],
+                                          category=query.get("category", [""])[0],
+                                          recycle=query.get("recycle", [""])[0] == "1"))
+        elif path == "/contacts/export.csv":
+            with connect(DB_PATH) as db:
+                rows = db.execute("""SELECT c.*, (SELECT group_concat(g.name, ', ') FROM contact_category_links l
+                                     JOIN contact_categories g ON g.id=l.category_id WHERE l.contact_id=c.id) AS categories
+                                     FROM contacts c WHERE c.owner_email=? ORDER BY c.id""", (self.current_user,)).fetchall()
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["邮箱", "姓名", "性别", "生日", "手机", "地区", "分类", "状态", "状态原因", "回收时间"] + ["变量{}".format(i) for i in range(1, 11)])
+            for row in rows:
+                custom = json.loads(row["custom_json"])
+                values = [row["email"], row["name"], row["gender"], row["birthday"], row["phone"], row["region"],
+                          row["categories"], row["status"], row["status_reason"], row["deleted_at"]]
+                values += [custom.get("custom_" + str(i), "") for i in range(1, 11)]
+                writer.writerow([csv_safe(value) for value in values])
+            self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
+                       {"Content-Disposition": 'attachment; filename="wismail-contacts.csv"'})
         elif path == "/account" and oauth_login.configured(SETTINGS):
             self._send(200, account_page(self.current_user))
         elif path == "/static.css":
@@ -373,6 +447,19 @@ class Handler(BaseHTTPRequestHandler):
                                 keep_blank_values=True)
 
     def do_POST(self):
+        if self._route_path() == "/unsubscribe":
+            try:
+                owner, recipient = verify_unsubscribe_token(self._form().getfirst("token", ""), SETTINGS["SESSION_SECRET"])
+                add_suppression(DB_PATH, recipient, "收件人退订", owner)
+                with connect(DB_PATH) as db:
+                    row = db.execute("SELECT id FROM contacts WHERE owner_email=? AND email=?", (owner, recipient)).fetchone()
+                if row:
+                    set_contact_status(DB_PATH, owner, row["id"], "unsubscribed", "收件人退订")
+            except (ValueError, KeyError):
+                self._send(400, "退订链接无效")
+                return
+            self._send(200, page("退订完成", '<section class="panel"><h1>已退订</h1><p>该邮箱不会再收到此账号的批量邮件。</p></section>'))
+            return
         if not self._auth_or_401():
             return
         path = self._route_path()
@@ -405,6 +492,25 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/suppressions":
                 add_suppression(DB_PATH, form.getfirst("email", ""), owner_email=self.current_user)
                 self._redirect("/")
+                return
+            if path == "/contacts/add":
+                save_contact(DB_PATH, self.current_user, {key: form.getfirst(key, "") for key in ("email", "name", "categories")})
+                self._redirect("/contacts")
+                return
+            if path == "/contacts/import":
+                item = form["file"] if "file" in form else None
+                if item is None or not getattr(item, "filename", None):
+                    raise ValueError("请选择联系人文件")
+                import_contacts(DB_PATH, self.current_user, parse_contacts_upload(item.filename, item.file.read(MAX_UPLOAD_BYTES + 1)))
+                self._redirect("/contacts")
+                return
+            if path == "/contacts/status":
+                set_contact_status(DB_PATH, self.current_user, int(form.getfirst("id", "0")), form.getfirst("status", ""))
+                self._redirect("/contacts")
+                return
+            if path in ("/contacts/delete", "/contacts/restore"):
+                set_contact_deleted(DB_PATH, self.current_user, int(form.getfirst("id", "0")), path.endswith("delete"))
+                self._redirect("/contacts")
                 return
             if path == "/upload":
                 item = form["file"] if "file" in form else None
@@ -441,6 +547,9 @@ class Handler(BaseHTTPRequestHandler):
                 cancel_batch(DB_PATH, batch_id)
             self._redirect("/batches/{}".format(batch_id))
         except (ValueError, KeyError) as exc:
+            if path.startswith("/contacts"):
+                self._send(400, contacts_page(self.current_user, str(exc)))
+                return
             if path == "/account" and oauth_login.configured(SETTINGS):
                 self._send(400, account_page(self.current_user, str(exc)))
                 return

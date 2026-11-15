@@ -4,11 +4,15 @@ This module deliberately contains no AI client or model dependency.
 """
 
 import csv
+import base64
 import datetime as dt
 import email
 import email.policy
 import io
 import imaplib
+import hashlib
+import hmac
+import json
 import os
 import re
 import smtplib
@@ -110,6 +114,35 @@ def init_db(path):
           matched_message_id INTEGER,
           observed_at TEXT NOT NULL,
           detail TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS contacts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          owner_email TEXT NOT NULL,
+          email TEXT NOT NULL,
+          name TEXT NOT NULL DEFAULT '',
+          gender TEXT NOT NULL DEFAULT '',
+          birthday TEXT NOT NULL DEFAULT '',
+          phone TEXT NOT NULL DEFAULT '',
+          region TEXT NOT NULL DEFAULT '',
+          custom_json TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL DEFAULT 'subscribed',
+          status_reason TEXT NOT NULL DEFAULT '',
+          deleted_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(owner_email,email)
+        );
+        CREATE INDEX IF NOT EXISTS idx_contacts_owner_status ON contacts(owner_email,status,deleted_at);
+        CREATE TABLE IF NOT EXISTS contact_categories (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          owner_email TEXT NOT NULL,
+          name TEXT NOT NULL,
+          UNIQUE(owner_email,name)
+        );
+        CREATE TABLE IF NOT EXISTS contact_category_links (
+          contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+          category_id INTEGER NOT NULL REFERENCES contact_categories(id) ON DELETE CASCADE,
+          PRIMARY KEY(contact_id,category_id)
         );
         """)
         batch_columns = [item["name"] for item in db.execute("PRAGMA table_info(batches)")]
@@ -238,6 +271,8 @@ def create_draft(path, name, messages, owner_email="__legacy_admin__"):
             if db.execute("SELECT 1 FROM suppressions WHERE recipient_email=? AND owner_email IN (?, '*')",
                           (recipient.lower(), owner_email)).fetchone():
                 blocked.append("第 {} 行：{} 已在不再联系名单".format(row_number, recipient))
+            elif contact_blocked(db, owner_email, recipient):
+                blocked.append("第 {} 行：{} 的联系人状态禁止发送".format(row_number, recipient))
         if blocked:
             raise ValueError("上传检查未通过：\n" + "\n".join(blocked[:30]))
         cur = db.execute("INSERT INTO batches(owner_email,name,state,created_at) VALUES (?,?,?,?)",
@@ -255,9 +290,168 @@ def add_suppression(path, recipient, reason="手动添加", owner_email="__legac
     with connect(path) as db:
         db.execute("INSERT OR REPLACE INTO suppressions(owner_email,recipient_email,reason,created_at) VALUES (?,?,?,?)",
                    (owner_email, recipient, reason[:200], iso(utcnow())))
+        db.execute("""UPDATE contacts SET status='unsubscribed',status_reason=?,updated_at=?
+                      WHERE email=? AND status='subscribed' AND (?='*' OR owner_email=?)""",
+                   (reason[:200], iso(utcnow()), recipient, owner_email, owner_email))
         db.execute("""UPDATE messages SET status='suppressed',last_error='已加入不再联系名单'
                       WHERE lower(recipient_email)=? AND status='queued' AND batch_id IN
                       (SELECT id FROM batches WHERE owner_email=?)""", (recipient, owner_email))
+
+
+CONTACT_STATUSES = {"subscribed", "unsubscribed", "complained", "invalid"}
+CONTACT_COLUMNS = {"邮箱": "email", "email": "email", "姓名": "name", "name": "name",
+                   "性别": "gender", "gender": "gender", "生日": "birthday", "birthday": "birthday",
+                   "手机": "phone", "phone": "phone", "地区": "region", "region": "region",
+                   "分类": "categories", "categories": "categories"}
+
+
+def parse_contacts_upload(filename, data):
+    if not data or len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError("联系人文件为空或超过 5 MB")
+    if filename.lower().endswith(".csv"):
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise ValueError("联系人 CSV 请使用 UTF-8 编码")
+        rows = list(csv.reader(io.StringIO(text, newline="")))
+        raw = [(number, dict(enumerate(row))) for number, row in enumerate(rows, 1) if any(v.strip() for v in row)]
+    elif filename.lower().endswith(".xlsx"):
+        raw = _xlsx_rows(data)
+    else:
+        raise ValueError("联系人文件仅支持 .xlsx 或 UTF-8 .csv")
+    if len(raw) < 2 or len(raw) > 1001:
+        raise ValueError("联系人文件需有表头，且每次最多 1000 人")
+    columns = {}
+    for index, value in raw[0][1].items():
+        label = str(value).strip().lower()
+        key = CONTACT_COLUMNS.get(label)
+        match = re.fullmatch(r"(?:变量|custom_)(10|[1-9])", label)
+        if match:
+            key = "custom_" + match.group(1)
+        if key:
+            if key in columns:
+                raise ValueError("联系人表头重复：" + key)
+            columns[key] = index
+    if "email" not in columns:
+        raise ValueError("联系人表头缺少邮箱列")
+    contacts, errors = [], []
+    for number, cells in raw[1:]:
+        item = {key: str(cells.get(index, "")).strip() for key, index in columns.items()}
+        address = item["email"].lower()
+        if not EMAIL_RE.fullmatch(address) or len(address) > 254:
+            errors.append("第 {} 行邮箱无效".format(number))
+            continue
+        item["email"] = address
+        contacts.append(item)
+    if errors:
+        raise ValueError("；".join(errors[:20]))
+    return contacts
+
+
+def save_contact(path, owner_email, item):
+    address = str(item.get("email", "")).strip().lower()
+    if not EMAIL_RE.fullmatch(address) or len(address) > 254:
+        raise ValueError("联系人邮箱无效")
+    fields = {key: str(item.get(key, "")).strip()[:200] for key in ("name", "gender", "birthday", "phone", "region")}
+    custom = {"custom_" + str(i): str(item.get("custom_" + str(i), "")).strip()[:500]
+              for i in range(1, 11) if item.get("custom_" + str(i))}
+    categories = [name.strip()[:80] for name in re.split(r"[,，;；]", str(item.get("categories", ""))) if name.strip()]
+    now = iso(utcnow())
+    with connect(path) as db:
+        existing = db.execute("SELECT id FROM contacts WHERE owner_email=? AND email=?", (owner_email, address)).fetchone()
+        values = (fields["name"], fields["gender"], fields["birthday"], fields["phone"], fields["region"],
+                  json.dumps(custom, ensure_ascii=False))
+        if existing:
+            contact_id = existing["id"]
+            db.execute("""UPDATE contacts SET name=?,gender=?,birthday=?,phone=?,region=?,custom_json=?,updated_at=?
+                          WHERE id=?""", values + (now, contact_id))
+        else:
+            contact_id = db.execute("""INSERT INTO contacts(owner_email,email,name,gender,birthday,phone,region,custom_json,created_at,updated_at)
+                                      VALUES (?,?,?,?,?,?,?,?,?,?)""", (owner_email, address) + values + (now, now)).lastrowid
+        suppression = db.execute("SELECT reason FROM suppressions WHERE recipient_email=? AND owner_email IN (?, '*') LIMIT 1",
+                                 (address, owner_email)).fetchone()
+        if suppression:
+            db.execute("""UPDATE contacts SET status='unsubscribed',status_reason=?
+                          WHERE id=? AND status='subscribed'""", (suppression["reason"], contact_id))
+        for name in dict.fromkeys(categories):
+            db.execute("INSERT OR IGNORE INTO contact_categories(owner_email,name) VALUES (?,?)", (owner_email, name))
+            category_id = db.execute("SELECT id FROM contact_categories WHERE owner_email=? AND name=?", (owner_email, name)).fetchone()["id"]
+            db.execute("INSERT OR IGNORE INTO contact_category_links(contact_id,category_id) VALUES (?,?)", (contact_id, category_id))
+    return contact_id
+
+
+def import_contacts(path, owner_email, contacts):
+    for item in contacts:
+        save_contact(path, owner_email, item)
+    return len(contacts)
+
+
+def set_contact_status(path, owner_email, contact_id, status, reason=""):
+    if status not in CONTACT_STATUSES - {"subscribed"}:
+        raise ValueError("不支持的联系人状态")
+    with connect(path) as db:
+        row = db.execute("SELECT email FROM contacts WHERE id=? AND owner_email=?", (contact_id, owner_email)).fetchone()
+        if not row:
+            raise ValueError("联系人不存在")
+        db.execute("UPDATE contacts SET status=?,status_reason=?,updated_at=? WHERE id=?",
+                   (status, reason[:200], iso(utcnow()), contact_id))
+        db.execute("""UPDATE messages SET status='suppressed',last_error='联系人已停止发送'
+                      WHERE lower(recipient_email)=? AND status='queued' AND batch_id IN
+                      (SELECT id FROM batches WHERE owner_email=?)""", (row["email"], owner_email))
+
+
+def set_contact_deleted(path, owner_email, contact_id, deleted):
+    with connect(path) as db:
+        row = db.execute("SELECT email FROM contacts WHERE id=? AND owner_email=?", (contact_id, owner_email)).fetchone()
+        if not row:
+            raise ValueError("联系人不存在")
+        changed = db.execute("UPDATE contacts SET deleted_at=?,updated_at=? WHERE id=? AND owner_email=?",
+                             (iso(utcnow()) if deleted else None, iso(utcnow()), contact_id, owner_email))
+        if deleted:
+            db.execute("""UPDATE messages SET status='suppressed',last_error='联系人已移入回收站'
+                          WHERE lower(recipient_email)=? AND status='queued' AND batch_id IN
+                          (SELECT id FROM batches WHERE owner_email=?)""", (row["email"], owner_email))
+
+
+def contact_blocked(db, owner_email, address):
+    row = db.execute("SELECT status,deleted_at FROM contacts WHERE owner_email=? AND email=?",
+                     (owner_email, address.lower())).fetchone()
+    return bool(row and (row["status"] != "subscribed" or row["deleted_at"]))
+
+
+def unsubscribe_token(owner_email, recipient_email, secret):
+    if not secret:
+        raise ValueError("退订签名密钥未配置")
+    payload = (owner_email + "\0" + recipient_email.lower()).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(secret.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    return encoded + "." + signature
+
+
+def verify_unsubscribe_token(token, secret):
+    if not secret or len(token) > 1200 or not re.fullmatch(r"[A-Za-z0-9_-]+\.[0-9a-f]{64}", token):
+        raise ValueError("退订链接无效")
+    encoded, signature = token.rsplit(".", 1)
+    expected = hmac.new(secret.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError("退订链接无效")
+    try:
+        owner, recipient = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8").split("\0", 1)
+    except (ValueError, UnicodeError):
+        raise ValueError("退订链接无效")
+    if not owner or not EMAIL_RE.fullmatch(recipient):
+        raise ValueError("退订链接无效")
+    return owner, recipient
+
+
+def unsubscribe_url(settings, owner_email, recipient_email):
+    base = settings.get("OAUTH_BASE_URL", "").rstrip("/")
+    secret = settings.get("SESSION_SECRET", "")
+    if not base or not secret:
+        return ""
+    from urllib.parse import quote
+    return base + settings.get("URL_PREFIX", "").rstrip("/") + "/unsubscribe?token=" + quote(
+        unsubscribe_token(owner_email, recipient_email, secret))
 
 
 def save_mailbox_auth(path, owner_email, smtp_password, imap_password, encryption_key):
@@ -375,7 +569,10 @@ def _smtp_submit(row, settings):
     msg["Date"] = email.utils.format_datetime(utcnow())
     message_id = "<{}@{}>".format(uuid.uuid4().hex, sender.rsplit("@", 1)[1])
     msg["Message-ID"] = message_id
-    msg.set_content(row["body"])
+    link = unsubscribe_url(settings, row["owner_email"], row["recipient_email"]) if "owner_email" in row.keys() else ""
+    msg.set_content(row["body"] + ("\n\n不再接收此类邮件：" + link if link else ""))
+    if link:
+        msg["List-Unsubscribe"] = "<{}>".format(link)
     port = int(settings["SMTP_PORT"])
     timeout = 30
     if port == 465:
@@ -409,6 +606,11 @@ def dispatch_one(path, settings):
                       WHERE id IN (SELECT m.id FROM messages m JOIN batches b ON b.id=m.batch_id
                       JOIN suppressions s ON s.recipient_email=lower(m.recipient_email)
                       AND s.owner_email IN (b.owner_email,'*') WHERE m.status='queued')""")
+        db.execute("""UPDATE messages SET status='suppressed',last_error='联系人状态禁止发送'
+                      WHERE status='queued' AND EXISTS (
+                        SELECT 1 FROM batches b JOIN contacts c ON c.owner_email=b.owner_email
+                        WHERE b.id=messages.batch_id AND c.email=lower(messages.recipient_email)
+                        AND (c.status!='subscribed' OR c.deleted_at IS NOT NULL))""")
         db.execute("""UPDATE batches SET state='completed' WHERE state='active'
                       AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.batch_id=batches.id AND m.status IN ('queued','sending'))""")
         offset = int(settings.get("UTC_OFFSET_HOURS", 8))
