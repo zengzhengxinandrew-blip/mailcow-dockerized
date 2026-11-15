@@ -134,8 +134,12 @@ class CampaignTests(unittest.TestCase):
         imap_settings = {"IMAP_HOST": "imap.example.com", "IMAP_USER": "sender@example.com", "IMAP_PASSWORD": "test"}
         with mock.patch.object(core.imaplib, "IMAP4_SSL", return_value=FakeImap()):
             self.assertEqual(core.poll_imap(self.db_path, imap_settings), 1)
+            with core.connect(self.db_path) as db:
+                db.execute("DELETE FROM imap_state")
+            self.assertEqual(core.poll_imap(self.db_path, imap_settings), 1)
         with core.connect(self.db_path) as db:
             self.assertTrue(db.execute("SELECT replied_at FROM messages WHERE batch_id=?", (batch_id,)).fetchone()["replied_at"])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM delivery_events WHERE kind='reply'").fetchone()[0], 1)
 
     def test_smtp_submission_uses_tls_and_one_recipient(self):
         class FakeSmtp:

@@ -94,6 +94,10 @@ def init_db(path):
         );
         CREATE INDEX IF NOT EXISTS idx_messages_queue ON messages(status, next_attempt_at);
         CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_email);
+        CREATE INDEX IF NOT EXISTS idx_messages_submitted_at ON messages(submitted_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_last_attempt_at ON messages(last_attempt_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_bounced_at ON messages(bounced_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_replied_at ON messages(replied_at);
         CREATE TABLE IF NOT EXISTS imap_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS suppressions (
           owner_email TEXT NOT NULL DEFAULT '*',
@@ -170,6 +174,15 @@ def init_db(path):
           detail TEXT NOT NULL,
           created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS delivery_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL,
+          smtp_code INTEGER,
+          observed_at TEXT NOT NULL,
+          detail TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_delivery_events_message ON delivery_events(message_id,id);
         """)
         batch_columns = [item["name"] for item in db.execute("PRAGMA table_info(batches)")]
         if "owner_email" not in batch_columns:
@@ -187,6 +200,9 @@ def init_db(path):
                           SELECT '*',recipient_email,reason,created_at FROM suppressions_legacy""")
             db.execute("DROP TABLE suppressions_legacy")
         # A restart during SMTP submission has an uncertain result. Never resend automatically.
+        db.execute("""INSERT INTO delivery_events(message_id,kind,observed_at,detail)
+                      SELECT id,'needs_review',?, '发送进程中断；请核对外部邮箱后手动处理'
+                      FROM messages WHERE status='sending'""", (iso(utcnow()),))
         db.execute("UPDATE messages SET status='needs_review', last_error='发送进程中断；请核对外部邮箱后手动处理' WHERE status='sending'")
 
 
@@ -311,6 +327,46 @@ def create_draft(path, name, messages, owner_email="__legacy_admin__"):
         db.executemany("INSERT INTO messages(batch_id,row_number,recipient_email,subject,body,body_html) VALUES (?,?,?,?,?,?)",
                        [(batch_id,) + tuple(row[:4]) + (row[4] if len(row) > 4 else "",) for row in messages])
     return batch_id
+
+
+def report_data(path, owner_email, start_date, end_date, offset_hours=8):
+    """Counts distinct messages by the local date of each observed event."""
+    if start_date > end_date or (end_date - start_date).days >= 366:
+        raise ValueError("统计时间范围最多为 366 天")
+    offset = dt.timedelta(hours=offset_hours)
+    lower = iso((dt.datetime.combine(start_date, dt.time()) - offset).replace(tzinfo=dt.timezone.utc))
+    upper = iso((dt.datetime.combine(end_date + dt.timedelta(days=1), dt.time()) - offset).replace(tzinfo=dt.timezone.utc))
+    fields = {"submitted": "submitted_at", "failed": "last_attempt_at",
+              "bounced": "bounced_at", "replied": "replied_at"}
+    with connect(path) as db:
+        rows = db.execute("""SELECT m.batch_id,b.name,m.status,m.submitted_at,m.last_attempt_at,
+                                   m.bounced_at,m.replied_at FROM messages m JOIN batches b ON b.id=m.batch_id
+                            WHERE b.owner_email=? AND (
+                              (m.submitted_at>=? AND m.submitted_at<?) OR
+                              (m.last_attempt_at>=? AND m.last_attempt_at<?) OR
+                              (m.bounced_at>=? AND m.bounced_at<?) OR
+                              (m.replied_at>=? AND m.replied_at<?))""",
+                          (owner_email,) + (lower, upper) * 4).fetchall()
+    def empty():
+        return {key: 0 for key in fields}
+    totals, days, months, batches = empty(), {}, {}, {}
+    for row in rows:
+        for key, column in fields.items():
+            value = row[column]
+            if key == "failed" and row["status"] not in ("failed", "needs_review"):
+                continue
+            if not value or not lower <= value < upper:
+                continue
+            day = (parse_iso(value) + offset).date().isoformat()
+            month = day[:7]
+            batch = batches.setdefault(row["batch_id"], {"id": row["batch_id"], "name": row["name"], **empty()})
+            totals[key] += 1
+            days.setdefault(day, empty())[key] += 1
+            months.setdefault(month, empty())[key] += 1
+            batch[key] += 1
+    return {"totals": totals, "days": sorted(days.items(), reverse=True),
+            "months": sorted(months.items(), reverse=True),
+            "batches": sorted(batches.values(), key=lambda item: (-item["submitted"], item["id"]))}
 
 
 VARIABLE_RE = re.compile(r"\{\{([^{}]+)\}\}")
@@ -787,6 +843,8 @@ def dispatch_one(path, settings):
             return False
         db.execute("UPDATE messages SET status='sending', attempt_count=attempt_count+1, last_attempt_at=? WHERE id=? AND status='queued'",
                    (iso(now), row["id"]))
+        db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,'attempt',?,?)",
+                   (row["id"], iso(now), "第 {} 次提交 SMTP".format(row["attempt_count"] + 1)))
     try:
         message_id = _smtp_submit(row, sender_settings)
     except Exception as exc:
@@ -801,10 +859,15 @@ def dispatch_one(path, settings):
         with connect(path) as db:
             db.execute("UPDATE messages SET status=?,next_attempt_at=?,last_error=? WHERE id=?",
                        ("queued" if retry else "failed", next_at, error, row["id"]))
+            db.execute("INSERT INTO delivery_events(message_id,kind,smtp_code,observed_at,detail) VALUES (?,?,?,?,?)",
+                       (row["id"], "retry" if retry else "failed", int(code) if code is not None else None,
+                        iso(utcnow()), error))
     else:
         with connect(path) as db:
             db.execute("UPDATE messages SET status='submitted',submitted_at=?,message_id=?,last_error=NULL WHERE id=?",
-                       (iso(now), message_id, row["id"]))
+                       (iso(utcnow()), message_id, row["id"]))
+            db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,'submitted',?,?)",
+                       (row["id"], iso(utcnow()), "SMTP 已接受提交"))
     return True
 
 
@@ -852,6 +915,8 @@ def poll_imap(path, settings, owner_email="__legacy_admin__"):
             kind = "bounce" if recipient else "reply"
             matched = None
             with connect(path) as db:
+                source_uid = owner_email + ":" + str(uid)
+                already_seen = db.execute("SELECT 1 FROM imap_events WHERE source_uid=?", (source_uid,)).fetchone()
                 for message_id in ids:
                     matched = db.execute("""SELECT m.id FROM messages m JOIN batches b ON b.id=m.batch_id
                                             WHERE m.message_id=? AND b.owner_email=?""", (message_id, owner_email)).fetchone()
@@ -865,12 +930,14 @@ def poll_imap(path, settings, owner_email="__legacy_admin__"):
                     if len(candidates) == 1:
                         matched = candidates[0]
                 matched_id = matched["id"] if matched else None
-                if matched_id:
+                if matched_id and not already_seen:
                     field = "bounced_at" if kind == "bounce" else "replied_at"
                     db.execute("UPDATE messages SET {}=COALESCE({},?) WHERE id=?".format(field, field),
                                (iso(utcnow()), matched_id))
+                    db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,?,?,?)",
+                               (matched_id, kind, iso(utcnow()), "IMAP 检测到{}".format("退信" if kind == "bounce" else "回复")))
                 db.execute("INSERT OR IGNORE INTO imap_events(kind,source_uid,matched_message_id,observed_at,detail) VALUES (?,?,?,?,?)",
-                           (kind, owner_email + ":" + str(uid), matched_id, iso(utcnow()), recipient or str(msg.get("From", ""))[:200]))
+                           (kind, source_uid, matched_id, iso(utcnow()), recipient or str(msg.get("From", ""))[:200]))
                 db.execute("INSERT OR REPLACE INTO imap_state(key,value) VALUES (?,?)", (state_key, str(uid)))
             processed += 1
         return processed

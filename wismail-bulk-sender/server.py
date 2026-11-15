@@ -22,7 +22,7 @@ from cryptography.fernet import Fernet
 
 from core import (MAX_UPLOAD_BYTES, Worker, add_suppression, cancel_batch, connect, create_draft,
                   create_contact_campaign, get_template, import_contacts, init_db, mailbox_settings,
-                  parse_contacts_upload, parse_upload, render_template, save_template, send_template_test,
+                  parse_contacts_upload, parse_upload, render_template, report_data, save_template, send_template_test,
                   revoke_mailbox_auth, save_contact, save_mailbox_auth, schedule_batch,
                   set_batch_state, set_contact_deleted, set_contact_status, utcnow, verify_mailbox_auth)
 from core import unsubscribe_token, verify_unsubscribe_token
@@ -89,7 +89,7 @@ def page(title, content, user=""):
     account_link = ('<span class="top-meta">{}</span><a class="top-account" href="/account">发件授权</a>'
                     '<a class="top-account" href="/logout">退出</a>'.format(h(user)) if oauth_login.configured(SETTINGS) and user
                     else '<span class="top-meta">外贸邮件工作台 / V2</span>')
-    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a>' + account_link
+    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/reports">统计报表</a>' + account_link
     markup = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Wismail</title>
 <link rel="stylesheet" href="/static.css"></head><body>
@@ -116,6 +116,68 @@ def summary_for(db, batch_id):
         "replied": sum(bool(x["replied_at"]) for x in rows),
         "bounced": sum(bool(x["bounced_at"]) for x in rows),
     }
+
+
+def report_period(start, end):
+    today = (utcnow() + dt.timedelta(hours=int(SETTINGS["UTC_OFFSET_HOURS"]))).date()
+    if not start and not end:
+        return today - dt.timedelta(days=29), today
+    try:
+        first = dt.datetime.strptime(start, "%Y-%m-%d").date()
+        last = dt.datetime.strptime(end, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError("请填写完整且有效的起止日期")
+    if first > last or (last - first).days >= 366:
+        raise ValueError("统计时间范围最多为 366 天")
+    return first, last
+
+
+def reports_page(user, start="", end=""):
+    first, last = report_period(start, end)
+    data = report_data(DB_PATH, user, first, last, int(SETTINGS["UTC_OFFSET_HOURS"]))
+    labels = (("submitted", "SMTP 已接受"), ("failed", "发送失败/待核对"),
+              ("bounced", "检测到退信"), ("replied", "检测到回复"))
+    summary = ''.join('<div class="stat"><strong>{}</strong><span>{}</span></div>'.format(data["totals"][key], label)
+                      for key, label in labels)
+    def cells(row):
+        return ''.join('<td>{}</td>'.format(row[key]) for key, _ in labels)
+    day_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(day), cells(row)) for day, row in data["days"])
+    month_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(month), cells(row)) for month, row in data["months"])
+    batch_rows = ''.join('<tr><td><a class="text-link" href="/batches/{}">{}</a></td>{}</tr>'.format(
+        row["id"], h(row["name"]), cells(row)) for row in data["batches"])
+    headings = '<tr><th>维度</th>' + ''.join('<th>{}</th>'.format(label) for _, label in labels) + '</tr>'
+    query = 'start={}&amp;end={}'.format(first.isoformat(), last.isoformat())
+    content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>统计报表</h1>
+<p>以下数字按所选时区内的事件发生日期统计。SMTP 已接受只代表发信服务器收件；退信和回复依赖 IMAP 检测。失败是当前仍处于失败或待核对状态、且最后一次尝试落在所选日期内的邮件。</p>
+<form method="get" action="/reports" class="report-filter"><label>开始日期<input type="date" name="start" value="{start}" required></label><label>结束日期<input type="date" name="end" value="{end}" required></label><button class="button" type="submit">查看报表</button></form>
+<p><a class="text-link" href="/reports/export.csv?{query}">导出报表 CSV ↗</a> <button type="button" class="button secondary print-button" onclick="window.print()">打印或保存 PDF</button></p></section>
+<section class="stats report-stats">{summary}</section>
+<section class="panel report-table"><h2>按日期</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{days}</tbody></table></div></section>
+<section class="panel report-table"><h2>按月份</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{months}</tbody></table></div></section>
+<section class="panel report-table"><h2>按批次</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{batches}</tbody></table></div></section>'''.format(
+        start=first.isoformat(), end=last.isoformat(), query=query, summary=summary, headings=headings,
+        days=day_rows or '<tr><td colspan="5">暂无记录</td></tr>',
+        months=month_rows or '<tr><td colspan="5">暂无记录</td></tr>',
+        batches=batch_rows or '<tr><td colspan="5">暂无记录</td></tr>')
+    return page("统计报表", content, user)
+
+
+EVENT_LABELS = {"attempt": "提交尝试", "submitted": "SMTP 已接受", "retry": "等待重试",
+                "failed": "发送失败", "needs_review": "需人工核对", "bounce": "检测到退信", "reply": "检测到回复"}
+
+
+def event_suggestion(kind, code):
+    if kind == "needs_review":
+        return "先核对发件箱及收件状态，避免重复发送。"
+    if kind == "retry":
+        return "系统将按计划重试；请留意后续记录。"
+    if kind == "failed":
+        if code == 535:
+            return "检查发件授权或应用密码。"
+        if code == 550:
+            return "核对收件地址和服务器拒收原因。"
+        return "查看 SMTP 返回信息，修正后再创建新批次。"
+    return ""
 
 
 def dashboard(error="", user="__legacy_admin__"):
@@ -236,6 +298,9 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
             return None
         rows = db.execute("SELECT * FROM messages WHERE batch_id=? ORDER BY row_number", (batch_id,)).fetchall()
         stats = summary_for(db, batch_id)
+        events = db.execute("""SELECT e.kind,e.smtp_code,e.observed_at,e.detail,m.row_number
+                               FROM delivery_events e JOIN messages m ON m.id=e.message_id
+                               WHERE m.batch_id=? ORDER BY e.id DESC LIMIT 30""", (batch_id,)).fetchall()
     alert = '<div class="alert">{}</div>'.format(h(error).replace("\n", "<br>")) if error else ""
     offset = int(SETTINGS["UTC_OFFSET_HOURS"])
     default_time = (utcnow() + dt.timedelta(hours=offset, minutes=5)).strftime("%Y-%m-%dT%H:%M")
@@ -271,12 +336,19 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
             scheduled=local_time(row["scheduled_at"]), submitted=local_time(row["submitted_at"]),
             error=h(row["last_error"] or "—")))
     account = mailbox_settings(DB_PATH, user, SETTINGS)
+    event_rows = ''.join('''<tr><td>{time}</td><td>{number}</td><td>{kind}</td><td>{code}</td><td>{detail}</td><td>{suggestion}</td></tr>'''.format(
+        time=local_time(item["observed_at"]), number=item["row_number"],
+        kind=h(EVENT_LABELS.get(item["kind"], item["kind"])), code=h(item["smtp_code"] or "—"),
+        detail=h(item["detail"]), suggestion=h(event_suggestion(item["kind"], item["smtp_code"]))) for item in events)
     content = '''<nav class="back"><a href="/">← 返回批次列表</a></nav><section class="batch-head"><div><div class="eyebrow">批次 #{id} · {state}</div><h1>{name}</h1><p class="muted">创建于 {created} · 发件账号 {sender}</p></div><a class="text-link" href="/batches/{id}/export.csv">导出明细 CSV ↗</a></section>
 {alert}<section class="stats">{stats}</section>{controls}<section class="list-section"><div class="section-heading"><h2>逐封结果</h2><span class="muted">已提交表示发信服务器已接受，不代表进入收件箱。</span></div>
-<div class="table-wrap"><table><thead><tr><th>行</th><th>邮件</th><th>状态</th><th>计划时间</th><th>提交时间</th><th>原因</th></tr></thead><tbody>{rows}</tbody></table></div></section>'''.format(
+<div class="table-wrap"><table><thead><tr><th>行</th><th>邮件</th><th>状态</th><th>计划时间</th><th>提交时间</th><th>原因</th></tr></thead><tbody>{rows}</tbody></table></div></section>
+<section class="list-section"><div class="section-heading"><h2>发送日志</h2><a class="text-link" href="/batches/{id}/events.csv">导出全部日志 CSV ↗</a></div><p class="muted">显示最近 30 条；部署此功能后产生的新事件才会记录。SMTP 返回码及建议仅供排查，具体原因以服务器返回信息为准。</p>
+<div class="table-wrap"><table><thead><tr><th>时间</th><th>行</th><th>事件</th><th>SMTP 码</th><th>详情</th><th>建议</th></tr></thead><tbody>{events}</tbody></table></div></section>'''.format(
         id=batch_id, state=STATE.get(batch["state"], batch["state"]), name=h(batch["name"]),
         created=local_time(batch["created_at"]), sender=h(account["SMTP_FROM"] if account else "未配置"),
-        alert=alert, stats=stat_html, controls=controls, rows="".join(row_html))
+        alert=alert, stats=stat_html, controls=controls, rows="".join(row_html),
+        events=event_rows or '<tr><td colspan="6">暂无新日志，既有邮件仍可查看逐封状态。</td></tr>')
     return page(batch["name"], content, user)
 
 
@@ -424,6 +496,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/":
             self._send(200, dashboard(user=self.current_user))
+        elif path in ("/reports", "/reports/export.csv"):
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                first, last = report_period(query.get("start", [""])[0], query.get("end", [""])[0])
+                if path == "/reports":
+                    self._send(200, reports_page(self.current_user, first.isoformat(), last.isoformat()))
+                else:
+                    data = report_data(DB_PATH, self.current_user, first, last, int(SETTINGS["UTC_OFFSET_HOURS"]))
+                    output = io.StringIO()
+                    writer = csv.writer(output)
+                    writer.writerow(["维度", "日期/批次", "SMTP 已接受", "发送失败/待核对", "检测到退信", "检测到回复"])
+                    for kind, rows in (("日期", data["days"]), ("月份", data["months"])):
+                        for label, values in rows:
+                            writer.writerow([kind, label] + [values[key] for key in ("submitted", "failed", "bounced", "replied")])
+                    for values in data["batches"]:
+                        writer.writerow(["批次", csv_safe(values["name"])] +
+                                        [values[key] for key in ("submitted", "failed", "bounced", "replied")])
+                    self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
+                               {"Content-Disposition": 'attachment; filename="wismail-reports.csv"'})
+            except ValueError as exc:
+                self._send(400, page("统计报表", '<section class="panel"><h1>日期无效</h1><p>{}</p><a href="/reports">返回统计报表</a></section>'.format(h(exc)), self.current_user))
         elif path == "/templates":
             query = parse_qs(urlparse(self.path).query)
             try:
@@ -466,12 +559,30 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, build_template(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        {"Content-Disposition": 'attachment; filename="wismail-upload-template.xlsx"'})
         else:
-            match = re.match(r"^/batches/(\d+)(/export\.csv)?$", path)
+            match = re.match(r"^/batches/(\d+)(/export\.csv|/events\.csv)?$", path)
             if not match:
                 self._send(404, page("未找到", '<div class="empty">页面不存在。<a href="/">返回首页</a></div>', self.current_user))
                 return
             batch_id = int(match.group(1))
-            if match.group(2):
+            if match.group(2) == "/events.csv":
+                with connect(DB_PATH) as db:
+                    owned = db.execute("SELECT 1 FROM batches WHERE id=? AND owner_email=?", (batch_id, self.current_user)).fetchone()
+                    events = db.execute("""SELECT m.row_number,e.observed_at,e.kind,e.smtp_code,e.detail
+                                           FROM delivery_events e JOIN messages m ON m.id=e.message_id
+                                           WHERE m.batch_id=? ORDER BY e.id""", (batch_id,)).fetchall() if owned else None
+                if events is None:
+                    self._send(404, "批次不存在")
+                    return
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(["表格行号", "事件时间(UTC)", "事件", "SMTP 返回码", "详情", "建议"])
+                for item in events:
+                    writer.writerow([item["row_number"], item["observed_at"],
+                                     csv_safe(EVENT_LABELS.get(item["kind"], item["kind"])), item["smtp_code"] or "",
+                                     csv_safe(item["detail"]), csv_safe(event_suggestion(item["kind"], item["smtp_code"]))])
+                self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
+                           {"Content-Disposition": 'attachment; filename="wismail-batch-{}-events.csv"'.format(batch_id)})
+            elif match.group(2):
                 with connect(DB_PATH) as db:
                     batch = db.execute("SELECT id FROM batches WHERE id=? AND owner_email=?", (batch_id, self.current_user)).fetchone()
                     rows = db.execute("SELECT row_number,recipient_email,subject,status,scheduled_at,submitted_at,bounced_at,replied_at,last_error FROM messages WHERE batch_id=? ORDER BY row_number", (batch_id,)).fetchall() if batch else None

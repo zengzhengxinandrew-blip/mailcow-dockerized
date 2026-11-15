@@ -105,6 +105,27 @@ class HttpFlowTests(unittest.TestCase):
         self.assertEqual(batch["state"], "draft")
         self.assertEqual(tuple(message), (1, "draft", "Hello Buyer", "<p>Buyer</p>"))
 
+    def test_report_and_event_exports_use_existing_results(self):
+        batch = core.create_draft(server.DB_PATH, "=报价", [(1, "buyer@example.com", "报价", "正文")])
+        with core.connect(server.DB_PATH) as db:
+            db.execute("UPDATE messages SET status='submitted',submitted_at=? WHERE batch_id=?",
+                       ("2026-11-15T01:00:00+00:00", batch))
+            message_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (batch,)).fetchone()[0]
+            db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,?,?,?)",
+                       (message_id, "submitted", "2026-11-15T01:00:00+00:00", "SMTP 已接受"))
+        status, _, page = self.request("GET", "/reports?start=2026-11-15&end=2026-11-15")
+        self.assertEqual(status, 200)
+        self.assertIn("SMTP 已接受".encode("utf-8"), page)
+        status, _, report_csv = self.request("GET", "/reports/export.csv?start=2026-11-15&end=2026-11-15")
+        self.assertEqual(status, 200)
+        self.assertIn("'=报价".encode("utf-8"), report_csv)
+        status, _, events_csv = self.request("GET", "/batches/1/events.csv")
+        self.assertEqual(status, 200)
+        self.assertIn("SMTP 已接受".encode("utf-8"), events_csv)
+        other = core.create_draft(server.DB_PATH, "他人", [(1, "other@example.com", "主题", "正文")], "other@example.com")
+        self.assertEqual(self.request("GET", "/batches/{}/events.csv".format(other))[0], 404)
+        self.assertEqual(self.request("GET", "/reports?start=2026-11-16&end=2026-11-15")[0], 400)
+
 
 if __name__ == "__main__":
     unittest.main()
