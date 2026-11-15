@@ -77,6 +77,7 @@ def init_db(path):
           created_at TEXT NOT NULL,
           start_at TEXT,
           interval_seconds INTEGER,
+          hourly_limit INTEGER,
           reply_to TEXT NOT NULL DEFAULT '',
           ab_mode INTEGER NOT NULL DEFAULT 0,
           track_open INTEGER NOT NULL DEFAULT 0,
@@ -204,6 +205,8 @@ def init_db(path):
             db.execute("ALTER TABLE batches ADD COLUMN owner_email TEXT NOT NULL DEFAULT '__legacy_admin__'")
         if "reply_to" not in batch_columns:
             db.execute("ALTER TABLE batches ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''")
+        if "hourly_limit" not in batch_columns:
+            db.execute("ALTER TABLE batches ADD COLUMN hourly_limit INTEGER")
         if "ab_mode" not in batch_columns:
             db.execute("ALTER TABLE batches ADD COLUMN ab_mode INTEGER NOT NULL DEFAULT 0")
         for column in ("track_open", "track_click"):
@@ -889,9 +892,18 @@ def verify_mailbox_auth(owner_email, smtp_password, imap_password, settings):
 
 
 def schedule_batch(path, batch_id, start_local, interval_seconds, offset_hours=8,
-                   track_open=False, track_click=False, reply_to="", sender_email=""):
+                   track_open=False, track_click=False, reply_to="", sender_email="", hourly_limit=None):
     if not 60 <= interval_seconds <= 86400:
         raise ValueError("发送间隔需为 60 秒至 24 小时")
+    if hourly_limit not in (None, ""):
+        try:
+            hourly_limit = int(hourly_limit)
+        except (TypeError, ValueError):
+            raise ValueError("批次每小时上限须为整数")
+        if not 1 <= hourly_limit <= 1000:
+            raise ValueError("批次每小时上限需为 1 至 1000 封")
+    else:
+        hourly_limit = None
     reply_to = str(reply_to or "").strip().lower()
     sender_email = str(sender_email or "").strip().lower()
     if reply_to:
@@ -922,8 +934,8 @@ def schedule_batch(path, batch_id, start_local, interval_seconds, offset_hours=8
         for index, row in enumerate(rows):
             due = iso(start + dt.timedelta(seconds=index * interval_seconds))
             db.execute("UPDATE messages SET status='queued',scheduled_at=?,next_attempt_at=? WHERE id=?", (due, due, row["id"]))
-        db.execute("UPDATE batches SET state='active',start_at=?,interval_seconds=?,track_open=?,track_click=?,reply_to=? WHERE id=?",
-                   (iso(start), interval_seconds, int(bool(track_open)), int(bool(track_click)), reply_to, batch_id))
+        db.execute("UPDATE batches SET state='active',start_at=?,interval_seconds=?,track_open=?,track_click=?,reply_to=?,hourly_limit=? WHERE id=?",
+                   (iso(start), interval_seconds, int(bool(track_open)), int(bool(track_click)), reply_to, hourly_limit, batch_id))
 
 
 def set_batch_state(path, batch_id, state):
@@ -1139,30 +1151,55 @@ def dispatch_one(path, settings):
         offset = int(settings.get("UTC_OFFSET_HOURS", 8))
         local_day = (now + dt.timedelta(hours=offset)).date()
         day_start = dt.datetime.combine(local_day, dt.time()).replace(tzinfo=dt.timezone.utc) - dt.timedelta(hours=offset)
-        candidates = db.execute("""SELECT m.*,b.owner_email,b.track_open,b.track_click,b.reply_to FROM messages m JOIN batches b ON b.id=m.batch_id
-                            WHERE m.status='queued' AND b.state='active' AND m.next_attempt_at<=?
-                            ORDER BY m.next_attempt_at,m.id LIMIT 100""", (iso(now),)).fetchall()
         row, sender_settings = None, None
-        for candidate in candidates:
-            owner = candidate["owner_email"]
-            account = mailbox_settings(path, owner, settings)
-            if not account or not all(account.get(key) for key in ("SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM")):
-                continue
-            last = db.execute("""SELECT MAX(m.last_attempt_at) AS value FROM messages m
-                                 JOIN batches b ON b.id=m.batch_id WHERE b.owner_email=?""", (owner,)).fetchone()["value"]
-            if last and parse_iso(last) + dt.timedelta(seconds=int(settings.get("MIN_INTERVAL_SECONDS", 60))) > now:
-                continue
-            sent_today = db.execute("""SELECT COUNT(*) AS n FROM messages m JOIN batches b ON b.id=m.batch_id
-                                       WHERE b.owner_email=? AND m.submitted_at>=?""", (owner, iso(day_start))).fetchone()["n"]
-            if sent_today >= int(settings.get("DAILY_LIMIT", 100)):
-                continue
-            hour_start = iso(now - dt.timedelta(hours=1))
-            sent_hour = db.execute("""SELECT COUNT(*) AS n FROM messages m JOIN batches b ON b.id=m.batch_id
-                                      WHERE b.owner_email=? AND m.submitted_at>=?""", (owner, hour_start)).fetchone()["n"]
-            if sent_hour >= int(settings.get("HOURLY_LIMIT", 20)):
-                continue
-            row, sender_settings = candidate, account
-            break
+        cursor_time, cursor_id = "", 0
+        capped_batches = set()
+        blocked_owners = set()
+        while not row:
+            candidates = db.execute("""SELECT m.*,b.owner_email,b.track_open,b.track_click,b.reply_to,b.hourly_limit
+                                       FROM messages m JOIN batches b ON b.id=m.batch_id
+                                       WHERE m.status='queued' AND b.state='active' AND m.next_attempt_at<=?
+                                       AND (m.next_attempt_at>? OR (m.next_attempt_at=? AND m.id>?))
+                                       ORDER BY m.next_attempt_at,m.id LIMIT 100""",
+                                    (iso(now), cursor_time, cursor_time, cursor_id)).fetchall()
+            if not candidates:
+                break
+            for candidate in candidates:
+                if candidate["batch_id"] in capped_batches:
+                    continue
+                owner = candidate["owner_email"]
+                if owner in blocked_owners:
+                    continue
+                account = mailbox_settings(path, owner, settings)
+                if not account or not all(account.get(key) for key in ("SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM")):
+                    blocked_owners.add(owner)
+                    continue
+                last = db.execute("""SELECT MAX(m.last_attempt_at) AS value FROM messages m
+                                     JOIN batches b ON b.id=m.batch_id WHERE b.owner_email=?""", (owner,)).fetchone()["value"]
+                if last and parse_iso(last) + dt.timedelta(seconds=int(settings.get("MIN_INTERVAL_SECONDS", 60))) > now:
+                    blocked_owners.add(owner)
+                    continue
+                sent_today = db.execute("""SELECT COUNT(*) AS n FROM messages m JOIN batches b ON b.id=m.batch_id
+                                           WHERE b.owner_email=? AND m.submitted_at>=?""", (owner, iso(day_start))).fetchone()["n"]
+                if sent_today >= int(settings.get("DAILY_LIMIT", 100)):
+                    blocked_owners.add(owner)
+                    continue
+                hour_start = iso(now - dt.timedelta(hours=1))
+                sent_hour = db.execute("""SELECT COUNT(*) AS n FROM messages m JOIN batches b ON b.id=m.batch_id
+                                          WHERE b.owner_email=? AND m.submitted_at>=?""", (owner, hour_start)).fetchone()["n"]
+                if sent_hour >= int(settings.get("HOURLY_LIMIT", 20)):
+                    blocked_owners.add(owner)
+                    continue
+                if candidate["hourly_limit"] is not None:
+                    sent_batch_hour = db.execute("""SELECT COUNT(*) AS n FROM messages
+                                                    WHERE batch_id=? AND submitted_at>=?""",
+                                                 (candidate["batch_id"], hour_start)).fetchone()["n"]
+                    if sent_batch_hour >= candidate["hourly_limit"]:
+                        capped_batches.add(candidate["batch_id"])
+                        continue
+                row, sender_settings = candidate, account
+                break
+            cursor_time, cursor_id = candidates[-1]["next_attempt_at"], candidates[-1]["id"]
         if not row:
             return False
         db.execute("UPDATE messages SET status='sending', attempt_count=attempt_count+1, last_attempt_at=? WHERE id=? AND status='queued'",

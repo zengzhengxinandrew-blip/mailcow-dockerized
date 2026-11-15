@@ -71,6 +71,73 @@ class CampaignTests(unittest.TestCase):
         with core.connect(self.db_path) as db:
             self.assertEqual(db.execute("SELECT state FROM batches WHERE id=?", (batch_id,)).fetchone()["state"], "completed")
 
+    def test_batch_hourly_limit_allows_other_batches_and_resets_after_hour(self):
+        first = core.create_draft(self.db_path, "慢速批次", [
+            (1, "one@example.test", "主题", "正文"),
+            (2, "two@example.test", "主题", "正文")])
+        second = core.create_draft(self.db_path, "另一个批次", [(1, "three@example.test", "主题", "正文")])
+        core.schedule_batch(self.db_path, first, "now", 60, hourly_limit=1)
+        core.schedule_batch(self.db_path, second, "now", 60)
+        now = core.utcnow()
+        with core.connect(self.db_path) as db:
+            db.execute("UPDATE messages SET next_attempt_at=?", (core.iso(now - dt.timedelta(seconds=5)),))
+        settings = dict(SETTINGS, HOURLY_LIMIT="20")
+        with mock.patch.object(core, "utcnow", return_value=now) as clock, \
+                mock.patch.object(core, "_smtp_submit", side_effect=[
+                    "<test-1@example.test>", "<test-2@example.test>", "<test-3@example.test>"]) as submit:
+            self.assertTrue(core.dispatch_one(self.db_path, settings))
+            clock.return_value = now + dt.timedelta(seconds=2)
+            self.assertTrue(core.dispatch_one(self.db_path, settings))
+            self.assertFalse(core.dispatch_one(self.db_path, settings))
+            clock.return_value = now + dt.timedelta(minutes=61)
+            self.assertTrue(core.dispatch_one(self.db_path, settings))
+            self.assertEqual(submit.call_count, 3)
+        with core.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT hourly_limit FROM batches WHERE id=?", (first,)).fetchone()[0], 1)
+            self.assertIsNone(db.execute("SELECT hourly_limit FROM batches WHERE id=?", (second,)).fetchone()[0])
+            self.assertEqual([row[0] for row in db.execute(
+                "SELECT recipient_email FROM messages WHERE submitted_at IS NOT NULL ORDER BY submitted_at,id")],
+                ["one@example.test", "three@example.test", "two@example.test"])
+        third = core.create_draft(self.db_path, "无效上限", [(1, "four@example.test", "主题", "正文")])
+        with self.assertRaisesRegex(ValueError, "1 至 1000"):
+            core.schedule_batch(self.db_path, third, "now", 60, hourly_limit=0)
+
+    def test_capped_backlog_does_not_hide_later_batch(self):
+        backlog = core.create_draft(self.db_path, "积压批次", [
+            (number, "buyer{}@example.test".format(number), "主题", "正文")
+            for number in range(102)])
+        later = core.create_draft(self.db_path, "其他批次", [(1, "later@example.test", "主题", "正文")])
+        core.schedule_batch(self.db_path, backlog, "now", 60, hourly_limit=1)
+        core.schedule_batch(self.db_path, later, "now", 60)
+        now = core.utcnow()
+        with core.connect(self.db_path) as db:
+            db.execute("UPDATE messages SET next_attempt_at=?", (core.iso(now - dt.timedelta(seconds=5)),))
+        settings = dict(SETTINGS, HOURLY_LIMIT="20")
+        with mock.patch.object(core, "utcnow", return_value=now) as clock, \
+                mock.patch.object(core, "_smtp_submit", side_effect=[
+                    "<backlog@example.test>", "<later@example.test>"]):
+            self.assertTrue(core.dispatch_one(self.db_path, settings))
+            clock.return_value = now + dt.timedelta(seconds=2)
+            self.assertTrue(core.dispatch_one(self.db_path, settings))
+        with core.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT status FROM messages WHERE batch_id=?", (later,)).fetchone()[0],
+                             "submitted")
+
+    def test_account_hourly_limit_still_applies_to_batch(self):
+        batch = core.create_draft(self.db_path, "账号上限", [
+            (1, "one@example.test", "主题", "正文"),
+            (2, "two@example.test", "主题", "正文")])
+        core.schedule_batch(self.db_path, batch, "now", 60, hourly_limit=2)
+        now = core.utcnow()
+        with core.connect(self.db_path) as db:
+            db.execute("UPDATE messages SET next_attempt_at=?", (core.iso(now - dt.timedelta(seconds=5)),))
+        with mock.patch.object(core, "utcnow", return_value=now) as clock, \
+                mock.patch.object(core, "_smtp_submit", return_value="<one@example.test>") as submit:
+            self.assertTrue(core.dispatch_one(self.db_path, dict(SETTINGS, HOURLY_LIMIT="1")))
+            clock.return_value = now + dt.timedelta(seconds=2)
+            self.assertFalse(core.dispatch_one(self.db_path, dict(SETTINGS, HOURLY_LIMIT="1")))
+            submit.assert_called_once()
+
     def test_restart_leaves_uncertain_send_for_manual_review(self):
         batch_id = core.create_draft(self.db_path, "重启检查", [(2, "buyer@example.com", "主题", "正文")])
         with core.connect(self.db_path) as db:
@@ -210,6 +277,7 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT owner_email FROM batches WHERE id=1").fetchone()[0], "__legacy_admin__")
             self.assertEqual(db.execute("SELECT reply_to FROM batches WHERE id=1").fetchone()[0], "")
             self.assertEqual(db.execute("SELECT ab_mode FROM batches WHERE id=1").fetchone()[0], 0)
+            self.assertIsNone(db.execute("SELECT hourly_limit FROM batches WHERE id=1").fetchone()[0])
             self.assertEqual(db.execute("SELECT owner_email FROM suppressions").fetchone()[0], "*")
 
     def test_reply_address_is_same_domain_and_used_in_submitted_message(self):

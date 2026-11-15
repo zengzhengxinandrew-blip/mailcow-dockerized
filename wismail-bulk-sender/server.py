@@ -387,17 +387,20 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
         controls = '''<section class="panel launch"><div><div class="eyebrow">检查完成</div><h2>设置发送计划</h2><p class="muted">启动前请抽查正文、报价与收件人。开始后按顺序逐封发送。</p></div>
 <form method="post" action="/batches/{id}/start">{csrf}<div class="form-grid"><div><label for="start">开始时间（UTC{offset:+d}）</label><input type="datetime-local" id="start" name="start" value="{default}"><label><input type="checkbox" name="immediate" value="1"> 立即开始</label></div>
 <div><label for="interval">每封间隔（秒）</label><input type="number" id="interval" name="interval" min="{minimum}" max="86400" value="120" required></div></div>
+<label for="hourly-limit">本批次每小时上限（可选）</label><input type="number" id="hourly-limit" name="hourly_limit" min="1" max="{max_hourly}" placeholder="留空仅使用邮箱总上限"><p class="muted">按最近 60 分钟已提交的邮件计算；本批次上限和邮箱总上限同时生效。当前邮箱总上限为每小时 {global_hourly} 封。</p>
 <label for="reply-to">回复地址（可选）</label><input id="reply-to" type="email" name="reply_to" maxlength="254" placeholder="留空则回复到发件邮箱"><p class="muted">仅可填写与发件邮箱同域的地址。若回复送到其他邮箱，本账号的 IMAP 回复统计可能无法识别。</p>
 <p class="muted">仅 HTML 邮件可启用。图片代理与安全扫描也可能触发记录。</p><label><input type="checkbox" name="track_open" value="1"> 记录首次打开请求</label><label><input type="checkbox" name="track_click" value="1"> 记录首次链接点击</label>
 <button class="button" type="submit">确认并开始排队</button></form></section>'''.format(
-            id=batch_id, csrf=csrf(user), offset=offset, default=default_time, minimum=h(SETTINGS["MIN_INTERVAL_SECONDS"]))
+            id=batch_id, csrf=csrf(user), offset=offset, default=default_time,
+            minimum=h(SETTINGS["MIN_INTERVAL_SECONDS"]),
+            max_hourly=min(int(SETTINGS["HOURLY_LIMIT"]), 1000), global_hourly=h(SETTINGS["HOURLY_LIMIT"]))
     elif batch["state"] in ("active", "paused"):
         action = "pause" if batch["state"] == "active" else "resume"
         label = "暂停剩余邮件" if action == "pause" else "继续发送"
         controls = '''<div class="actions"><form method="post" action="/batches/{id}/{action}">{csrf}<button class="button secondary">{label}</button></form>
 <form method="post" action="/batches/{id}/cancel">{csrf}<button class="button subtle" onclick="return confirm('取消后，待发送邮件不会再发出。确定取消？')">取消剩余邮件</button></form></div>'''.format(
             id=batch_id, action=action, csrf=csrf(user), label=label)
-    copy_controls = '''<section class="panel"><h2>复制为新任务</h2><p class="muted">复制收件人、主题和正文为待确认草稿；不会沿用发送时间、发送状态、回复地址、A/B 模式或跟踪设置。复制时重新检查退订、投诉、无效地址、回收站和不再联系名单；如有禁止发送的地址，复制将被拒绝，可重新筛选联系人创建任务。</p>
+    copy_controls = '''<section class="panel"><h2>复制为新任务</h2><p class="muted">复制收件人、主题和正文为待确认草稿；不会沿用发送时间、发送状态、回复地址、每小时上限、A/B 模式或跟踪设置。复制时重新检查退订、投诉、无效地址、回收站和不再联系名单；如有禁止发送的地址，复制将被拒绝，可重新筛选联系人创建任务。</p>
 <form method="post" action="/batches/{id}/copy">{csrf}<label>新批次名称</label><input name="name" maxlength="120" value="{name}" required><button class="button secondary" type="submit">复制并检查</button></form></section>'''.format(
         id=batch_id, csrf=csrf(user), name=h(batch["name"] + "（副本）"))
     stat_html = "".join('<div class="stat"><strong>{}</strong><span>{}</span></div>'.format(stats[key], label) for key, label in
@@ -431,6 +434,8 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
                       if batch["state"] != "draft" else "")
     reply_state = (" · 回复地址：{}".format(batch["reply_to"] or "发件邮箱")
                    if batch["state"] != "draft" else "")
+    hourly_state = (" · 本批次每小时上限：{}".format(batch["hourly_limit"] or "沿用邮箱总上限")
+                    if batch["state"] != "draft" else "")
     event_rows = ''.join('''<tr><td>{time}</td><td>{number}</td><td>{kind}</td><td>{code}</td><td>{detail}</td><td>{suggestion}</td></tr>'''.format(
         time=local_time(item["observed_at"]), number=item["row_number"],
         kind=h(EVENT_LABELS.get(item["kind"], item["kind"])), code=h(item["smtp_code"] or "—"),
@@ -463,7 +468,7 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
 <div class="table-wrap"><table><thead><tr><th>时间</th><th>行</th><th>事件</th><th>SMTP 码</th><th>详情</th><th>建议</th></tr></thead><tbody>{events}</tbody></table></div></section>'''.format(
         id=batch_id, state=STATE.get(batch["state"], batch["state"]), name=h(batch["name"]),
         created=local_time(batch["created_at"]), sender=h(account["SMTP_FROM"] if account else "未配置"),
-        tracking_state=h(tracking_state + reply_state),
+        tracking_state=h(tracking_state + reply_state + hourly_state),
         alert=alert, stats=stat_html, controls=controls, copy_controls=copy_controls,
         template_summary=template_summary, rows="".join(row_html),
         events=event_rows or '<tr><td colspan="6">暂无新日志，既有邮件仍可查看逐封状态。</td></tr>')
@@ -901,8 +906,18 @@ class Handler(BaseHTTPRequestHandler):
                 if (track_open or track_click) and not tracking_ready(SETTINGS):
                     raise ValueError("跟踪需要 HTTPS 网站地址和至少 32 位的签名密钥")
                 start = "now" if form.getfirst("immediate", "") == "1" else form.getfirst("start", "")
+                hourly_text = form.getfirst("hourly_limit", "").strip()
+                if hourly_text:
+                    try:
+                        hourly_limit = int(hourly_text)
+                    except ValueError:
+                        raise ValueError("本批次每小时上限须为整数")
+                    if hourly_limit > int(SETTINGS["HOURLY_LIMIT"]):
+                        raise ValueError("本批次每小时上限不能超过邮箱总上限")
+                else:
+                    hourly_limit = None
                 schedule_batch(DB_PATH, batch_id, start, interval, int(SETTINGS["UTC_OFFSET_HOURS"]),
-                               track_open, track_click, form.getfirst("reply_to", ""), account["SMTP_FROM"])
+                               track_open, track_click, form.getfirst("reply_to", ""), account["SMTP_FROM"], hourly_limit)
             elif action == "pause":
                 set_batch_state(DB_PATH, batch_id, "paused")
             elif action == "resume":

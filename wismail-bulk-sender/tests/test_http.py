@@ -140,6 +140,25 @@ class HttpFlowTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT reply_to,state FROM batches WHERE id=?", (batch,)).fetchone()[:],
                              ("replies@example.test", "active"))
 
+    def test_start_batch_saves_hourly_limit_and_rejects_above_account_limit(self):
+        batch = core.create_draft(server.DB_PATH, "限速任务", [(1, "buyer@example.com", "主题", "正文")])
+        account = {"SMTP_HOST": "smtp.example.test", "SMTP_USER": "sender@example.test",
+                   "SMTP_PASSWORD": "test-secret", "SMTP_FROM": "sender@example.test"}
+        form = {"csrf": server.CSRF_TOKEN, "immediate": "1", "interval": "120", "hourly_limit": "21"}
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        with mock.patch.object(server, "mailbox_settings", return_value=account):
+            status, _, error = self.request("POST", "/batches/{}/start".format(batch), urlencode(form), headers)
+            self.assertEqual(status, 400)
+            self.assertIn("不能超过邮箱总上限".encode("utf-8"), error)
+            form["hourly_limit"] = "2"
+            status, response_headers, _ = self.request("POST", "/batches/{}/start".format(batch), urlencode(form), headers)
+        self.assertEqual((status, response_headers["Location"]), (303, "/batches/1"))
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT hourly_limit FROM batches WHERE id=?", (batch,)).fetchone()[0], 2)
+        status, _, detail = self.request("GET", "/batches/1")
+        self.assertEqual(status, 200)
+        self.assertIn("本批次每小时上限：2".encode("utf-8"), detail)
+
     def test_copy_template_route_uses_selected_version(self):
         original, _ = core.save_template(server.DB_PATH, "__legacy_admin__", "原模板", "旧主题", "正文")
         core.save_template(server.DB_PATH, "__legacy_admin__", "原模板", "新主题", "新正文",
