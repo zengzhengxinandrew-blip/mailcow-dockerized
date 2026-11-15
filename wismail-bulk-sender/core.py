@@ -454,6 +454,12 @@ def get_template(path, owner_email, template_id, version=None):
     return dict(row)
 
 
+def copy_template(path, owner_email, template_id, name, version=None):
+    """Create an independent v1 copy of an owned template version."""
+    source = get_template(path, owner_email, template_id, version)
+    return save_template(path, owner_email, name, source["subject"], source["body_text"], source["body_html"])
+
+
 def render_template(template, contact):
     fields = {"邮箱": contact["email"], "姓名": contact["name"], "性别": contact["gender"],
               "生日": contact["birthday"], "手机": contact["phone"], "地区": contact["region"]}

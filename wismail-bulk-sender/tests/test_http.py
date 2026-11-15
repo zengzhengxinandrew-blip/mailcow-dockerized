@@ -119,6 +119,23 @@ class HttpFlowTests(unittest.TestCase):
         with core.connect(server.DB_PATH) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM batches").fetchone()[0], 3)
 
+    def test_copy_template_route_uses_selected_version(self):
+        original, _ = core.save_template(server.DB_PATH, "__legacy_admin__", "原模板", "旧主题", "正文")
+        core.save_template(server.DB_PATH, "__legacy_admin__", "原模板", "新主题", "新正文",
+                           template_id=original)
+        form = urlencode({"csrf": server.CSRF_TOKEN, "template_id": original,
+                          "version": "1", "name": "模板副本"})
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        status, response_headers, _ = self.request("POST", "/templates/copy", form, headers)
+        self.assertEqual((status, response_headers["Location"]), (303, "/templates?id=2"))
+        self.assertEqual(core.get_template(server.DB_PATH, "__legacy_admin__", 2)["subject"], "旧主题")
+        other, _ = core.save_template(server.DB_PATH, "other@example.com", "私有", "主题", "正文")
+        form = urlencode({"csrf": server.CSRF_TOKEN, "template_id": other,
+                          "version": "1", "name": "越权"})
+        self.assertEqual(self.request("POST", "/templates/copy", form, headers)[0], 400)
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM templates").fetchone()[0], 3)
+
     def test_report_and_event_exports_use_existing_results(self):
         batch = core.create_draft(server.DB_PATH, "=报价", [(1, "buyer@example.com", "报价", "正文")])
         with core.connect(server.DB_PATH) as db:

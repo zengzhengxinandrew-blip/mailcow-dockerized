@@ -15,3 +15,4 @@
 @media(max-width:680px){.campaign-grid{grid-template-columns:1fr}}
 .stats,.report-stats{grid-template-columns:repeat(auto-fit,minmax(115px,1fr))}
 @media(max-width:560px){.stats,.report-stats{grid-template-columns:repeat(2,1fr)}}
+.template-preview{display:block;width:100%;min-height:360px;margin:12px 0 18px;border:1px solid var(--line);border-radius:10px;background:#fff}

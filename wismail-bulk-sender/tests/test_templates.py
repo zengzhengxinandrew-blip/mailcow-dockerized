@@ -29,6 +29,22 @@ class TemplateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不存在"):
             core.get_template(self.path, "b@example.com", template_id)
 
+    def test_copy_historical_template_is_independent_and_owner_scoped(self):
+        owner = "a@example.com"
+        original, _ = core.save_template(self.path, owner, "报价", "旧标题", "旧正文", "<p>旧版</p>")
+        core.save_template(self.path, owner, "报价", "新标题", "新正文", "<p>新版</p>", template_id=original)
+        copied, version = core.copy_template(self.path, owner, original, "报价副本", 1)
+        self.assertNotEqual(copied, original)
+        self.assertEqual(version, 1)
+        self.assertEqual(core.get_template(self.path, owner, copied)["subject"], "旧标题")
+        self.assertEqual(core.get_template(self.path, owner, copied)["body_html"], "<p>旧版</p>")
+        core.save_template(self.path, owner, "报价副本", "副本修改", "正文", template_id=copied)
+        self.assertEqual(core.get_template(self.path, owner, original)["subject"], "新标题")
+        with self.assertRaisesRegex(ValueError, "不存在"):
+            core.copy_template(self.path, "b@example.com", original, "越权副本", 1)
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM templates").fetchone()[0], 2)
+
     def test_render_and_contact_campaign_snapshot(self):
         core.save_contact(self.path, "a@example.com", {"email": "buyer@example.com", "name": "<Buyer>", "categories": "德国"})
         core.save_contact(self.path, "a@example.com", {"email": "other@example.com", "name": "Other", "categories": "法国"})
@@ -132,6 +148,24 @@ class TemplateTests(unittest.TestCase):
             page = server.templates_page("a@example.com", selected_id=template_id)
             self.assertIn("&lt;script&gt;", page)
             self.assertNotIn("<script>", page)
+        finally:
+            server.DB_PATH = old
+
+    def test_html_preview_is_sandboxed_and_escapes_outer_page(self):
+        old = server.DB_PATH
+        server.DB_PATH = self.path
+        try:
+            owner = "a@example.com"
+            contact_id = core.save_contact(self.path, owner, {"email": "buyer@example.com", "name": "Buyer"})
+            template_id, _ = core.save_template(self.path, owner, "HTML", "Hello", "Plain",
+                                                '<p>Buyer</p><script>alert(1)</script><img src="https://example.com/a.png">')
+            page = server.templates_page(owner, selected_id=template_id, preview_contact_id=contact_id)
+            self.assertIn('sandbox=""', page)
+            self.assertIn('referrerpolicy="no-referrer"', page)
+            self.assertIn("Content-Security-Policy", page)
+            self.assertIn("img-src data:", page)
+            self.assertNotIn("<script>", page)
+            self.assertIn("&lt;script&gt;", page)
         finally:
             server.DB_PATH = old
 

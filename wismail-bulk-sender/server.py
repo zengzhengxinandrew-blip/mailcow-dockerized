@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 from cryptography.fernet import Fernet
 
-from core import (MAX_UPLOAD_BYTES, Worker, add_suppression, cancel_batch, connect, copy_batch, create_draft,
+from core import (MAX_UPLOAD_BYTES, Worker, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_draft,
                   create_contact_campaign, get_template, import_contacts, init_db, mailbox_settings,
                   parse_contacts_upload, parse_upload, prepare_contact_campaign, render_template, report_data,
                   save_template, send_template_test,
@@ -279,20 +279,35 @@ def templates_page(user, error="", selected_id=0, selected_version=None, preview
     if selected and contact:
         try:
             subject, text, body_html = render_template(selected, contact)
-            preview = '<section class="panel"><h2>变量预览 · {}</h2><strong>{}</strong><pre>{}</pre><details><summary>HTML 源码预览</summary><pre>{}</pre></details></section>'.format(
-                h(contact["email"]), h(subject), h(text), h(body_html))
+            frame = ''
+            if body_html:
+                preview_doc = ('<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
+                               'img-src data:; style-src \'unsafe-inline\'; form-action \'none\'; '
+                               'base-uri \'none\'">' + body_html)
+                frame = ('<h3>HTML 效果预览</h3><p class="muted">外部图片在预览中不加载；实际邮件显示由收件人的邮箱客户端决定。</p>'
+                         '<iframe class="template-preview" title="HTML 效果预览" sandbox="" '
+                         'referrerpolicy="no-referrer" loading="lazy" srcdoc="{}"></iframe>').format(h(preview_doc))
+            preview = '<section class="panel"><h2>变量预览 · {}</h2><strong>{}</strong><pre>{}</pre>{}<details><summary>HTML 源码预览</summary><pre>{}</pre></details></section>'.format(
+                h(contact["email"]), h(subject), h(text), frame, h(body_html))
         except ValueError as exc:
             preview = '<div class="alert">{}</div>'.format(h(exc))
+    copy_form = ''
+    if selected:
+        copy_form = '''<section class="panel"><h2>复制此版本</h2><p class="muted">以当前显示的 v{version} 创建独立模板；新模板从 v1 开始，不复制历史版本或测试记录。</p>
+<form method="post" action="/templates/copy">{csrf}<input type="hidden" name="template_id" value="{id}"><input type="hidden" name="version" value="{version}"><label>新模板名称</label><input name="name" maxlength="120" value="{name}" required><button class="button secondary" type="submit">复制模板</button></form></section>'''.format(
+            version=selected["version"], csrf=csrf(user), id=selected_id,
+            name=h(selected["name"][:116] + "（副本）"))
     alert = '<div class="alert">{}</div>'.format(h(error)) if error else ''
     content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>邮件模板</h1>{alert}<p>模板按邮箱账号隔离；每次保存产生新版本，已创建的批次保留当时的邮件内容。</p><ul>{list_html}</ul><a href="/templates">新建模板</a> {campaign_link}</section>
 <section class="panel"><h2>{heading}</h2><form method="post" action="/templates/save">{csrf}<input type="hidden" name="id" value="{id}"><label>模板名称</label><input name="name" maxlength="120" value="{name}" required><label>主题</label><input name="subject" maxlength="998" value="{subject}" required><label>纯文本正文</label><textarea name="body_text" rows="9" required>{text}</textarea><label>HTML 正文（可选）</label><textarea name="body_html" rows="9">{html}</textarea><p>可用变量：{{{{邮箱}}}}、{{{{姓名}}}}、{{{{性别}}}}、{{{{生日}}}}、{{{{手机}}}}、{{{{地区}}}}、{{{{变量1}}}} 至 {{{{变量10}}}}。缺值时停止创建批次。</p><button class="button" type="submit">保存为新版本</button></form><p>历史版本：{versions}</p></section>
-{preview}<section class="panel"><h2>预览与创建批次</h2><p>先保存模板，再选一个联系人预览变量；创建批次后仍需在批次页面明确启动发送。</p><form method="get" action="/templates"><input type="hidden" name="id" value="{id}"><select name="contact_id"><option value="">选择预览联系人</option>{contacts}</select><button type="submit">预览</button></form><form method="post" action="/campaigns/from-contacts">{csrf}<input type="hidden" name="template_id" value="{id}"><label>批次名称</label><input name="name" maxlength="120" required><label>联系人分类</label><select name="category"><option value="">全部可发送联系人</option>{categories}</select><button class="button" type="submit" {disabled}>创建待确认批次</button></form></section>
+{copy_form}{preview}<section class="panel"><h2>预览与创建批次</h2><p>先保存模板，再选一个联系人预览变量；创建批次后仍需在批次页面明确启动发送。</p><form method="get" action="/templates"><input type="hidden" name="id" value="{id}"><select name="contact_id"><option value="">选择预览联系人</option>{contacts}</select><button type="submit">预览</button></form><form method="post" action="/campaigns/from-contacts">{csrf}<input type="hidden" name="template_id" value="{id}"><label>批次名称</label><input name="name" maxlength="120" required><label>联系人分类</label><select name="category"><option value="">全部可发送联系人</option>{categories}</select><button class="button" type="submit" {disabled}>创建待确认批次</button></form></section>
 <section class="panel"><h2>发送测试</h2><p>这是一次真实 SMTP 提交，只允许发到你自己的发件邮箱。请先核对模板内容和收件邮箱。</p><form method="post" action="/templates/test">{csrf}<input type="hidden" name="template_id" value="{id}"><label>测试收件邮箱</label><input type="email" name="recipient" value="{test_recipient}" required><label>用于变量展开的联系人</label><select name="contact_id" required><option value="">请选择</option>{contacts}</select><label><input type="checkbox" name="confirm_test" value="1" required> 我确认发送这一封测试邮件</label><button type="submit" {disabled}>发送测试</button></form><p>最近测试记录：</p><ul>{test_logs}</ul></section>'''.format(
         alert=alert, list_html=list_html, heading='编辑模板' if selected else '新建模板', csrf=csrf(user),
         campaign_link=('· <a href="/campaigns?template_id={}">按条件创建任务</a>'.format(selected_id) if selected else ''),
         id=selected_id or '', name=h(selected["name"] if selected else ''), subject=h(selected["subject"] if selected else ''),
         text=h(selected["body_text"] if selected else ''), html=h(selected["body_html"] if selected else ''),
-        versions=version_html, preview=preview, contacts=contact_options, categories=category_options,
+        versions=version_html, preview=preview, copy_form=copy_form,
+        contacts=contact_options, categories=category_options,
         disabled='' if selected else 'disabled', test_recipient=h(test_recipient), test_logs=test_logs)
     return page("邮件模板", content, user)
 
@@ -764,6 +779,13 @@ class Handler(BaseHTTPRequestHandler):
                                                form.getfirst("body_html", ""), int(form.getfirst("id", "0") or "0"))
                 self._redirect("/templates?id={}".format(template_id))
                 return
+            if path == "/templates/copy":
+                template_id, _ = copy_template(DB_PATH, self.current_user,
+                                               int(form.getfirst("template_id", "0")),
+                                               form.getfirst("name", ""),
+                                               int(form.getfirst("version", "0")))
+                self._redirect("/templates?id={}".format(template_id))
+                return
             if path == "/campaigns/from-contacts":
                 batch_id = create_contact_campaign(DB_PATH, self.current_user, form.getfirst("name", ""),
                                                    int(form.getfirst("template_id", "0")), form.getfirst("category", ""))
@@ -860,7 +882,7 @@ class Handler(BaseHTTPRequestHandler):
                 cancel_batch(DB_PATH, batch_id)
             self._redirect("/batches/{}".format(batch_id))
         except (ValueError, KeyError) as exc:
-            if path in ("/templates/save", "/templates/test", "/campaigns/from-contacts"):
+            if path in ("/templates/save", "/templates/copy", "/templates/test", "/campaigns/from-contacts"):
                 self._send(400, templates_page(self.current_user, str(exc)))
                 return
             if path.startswith("/contacts"):
