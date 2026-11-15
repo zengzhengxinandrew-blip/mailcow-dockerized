@@ -22,7 +22,7 @@ from cryptography.fernet import Fernet
 
 from core import (MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_draft,
                   create_contact_campaign, get_template, import_contacts, init_db, mailbox_settings,
-                  parse_contacts_upload, parse_upload, prepare_contact_campaign, render_template, report_data,
+                  parse_contacts_upload, parse_upload, preflight_template, prepare_contact_campaign, render_template, report_data,
                   save_template, send_template_test,
                   revoke_mailbox_auth, save_contact, save_mailbox_auth, schedule_batch,
                   set_batch_state, set_contact_deleted, set_contact_status, tracking_ready,
@@ -293,7 +293,7 @@ def contacts_page(user, error="", search="", status="", category="", recycle=Fal
     return page("联系人", content, user)
 
 
-def templates_page(user, error="", selected_id=0, selected_version=None, preview_contact_id=0):
+def templates_page(user, error="", selected_id=0, selected_version=None, preview_contact_id=0, precheck=False):
     with connect(DB_PATH) as db:
         templates = db.execute("SELECT * FROM templates WHERE owner_email=? ORDER BY updated_at DESC,id DESC", (user,)).fetchall()
         contacts = db.execute("SELECT id,email,name FROM contacts WHERE owner_email=? AND status='subscribed' AND deleted_at IS NULL ORDER BY id DESC LIMIT 200", (user,)).fetchall()
@@ -310,6 +310,9 @@ def templates_page(user, error="", selected_id=0, selected_version=None, preview
     test_logs = ''.join('<li>{} · {}</li>'.format(local_time(row["created_at"]), h(row["status"])) for row in tests)
     account = mailbox_settings(DB_PATH, user, SETTINGS)
     test_recipient = account.get("SMTP_FROM", "") if account else (user if "@" in user else "")
+    current_version = bool(selected and versions and selected["version"] == versions[0]["version"])
+    version_input = ('<input type="hidden" name="version" value="{}">'.format(selected["version"])
+                     if selected else '')
     preview = ''
     if selected and contact:
         try:
@@ -326,6 +329,20 @@ def templates_page(user, error="", selected_id=0, selected_version=None, preview
                 h(contact["email"]), h(subject), h(text), frame, h(body_html))
         except ValueError as exc:
             preview = '<div class="alert">{}</div>'.format(h(exc))
+    precheck_html = ''
+    if selected and precheck:
+        if contact:
+            errors, warnings = preflight_template(selected, contact)
+            findings = ''.join('<li class="{}">{}</li>'.format(kind, h(message))
+                               for kind, messages in (("check-error", errors), ("check-warning", warnings))
+                               for message in messages)
+            precheck_html = '''<section class="panel template-check" aria-label="模板预检测"><h2>发送前预检测 · v{version}</h2>
+<p>本次使用联系人 {email} 展开变量；只检查常见内容问题，不联网检测链接，也不预测送达率。</p>
+<ul>{findings}</ul></section>'''.format(
+                version=selected["version"], email=h(contact["email"]),
+                findings=findings or '<li class="check-pass">本次检查未发现常见问题；发送前仍请核对实际邮件效果。</li>')
+        else:
+            precheck_html = '<div class="alert">请先选择当前账号下的联系人，再运行模板预检测。</div>'
     copy_form = ''
     if selected:
         copy_form = '''<section class="panel"><h2>复制此版本</h2><p class="muted">以当前显示的 v{version} 创建独立模板；新模板从 v1 开始，不复制历史版本或测试记录。</p>
@@ -338,16 +355,21 @@ def templates_page(user, error="", selected_id=0, selected_version=None, preview
 <div class="editor-switch" role="group" aria-label="HTML 编辑方式"><button type="button" data-editor-mode="visual">可视化编辑</button><button type="button" data-editor-mode="source">HTML 源码</button></div>
 <div id="visual-panel" hidden><div class="editor-toolbar" role="toolbar" aria-label="文字排版"><button type="button" data-editor-command="formatBlock" data-editor-value="p">正文</button><button type="button" data-editor-command="formatBlock" data-editor-value="h2">标题</button><button type="button" data-editor-command="bold"><strong>加粗</strong></button><button type="button" data-editor-command="italic"><em>斜体</em></button><button type="button" data-editor-command="insertUnorderedList">项目列表</button><button type="button" data-editor-command="insertOrderedList">编号列表</button><button type="button" data-editor-link>插入链接</button></div><div id="visual-editor" class="visual-editor" contenteditable="true" role="textbox" aria-label="邮件 HTML 正文" aria-multiline="true" data-placeholder="在这里编写邮件正文…"></div><p id="editor-status" class="muted" role="status" aria-live="polite"></p></div>
 <textarea id="body-html" name="body_html" rows="9">{html}</textarea><p class="muted">可视化模式支持基础排版与链接。切换到可视化模式时，不支持的 HTML 标签或属性会被移除；复杂版式请保留源码模式。纯文本正文也需单独填写。</p><p>可用变量：{{{{邮箱}}}}、{{{{姓名}}}}、{{{{性别}}}}、{{{{生日}}}}、{{{{手机}}}}、{{{{地区}}}}、{{{{变量1}}}} 至 {{{{变量10}}}}。缺值时停止创建批次。</p><button class="button" type="submit">保存为新版本</button></form><p>历史版本：{versions}</p></section>
-{copy_form}{preview}<section class="panel"><h2>预览与创建批次</h2><p>先保存模板，再选一个联系人预览变量；创建批次后仍需在批次页面明确启动发送。</p><form method="get" action="/templates"><input type="hidden" name="id" value="{id}"><select name="contact_id"><option value="">选择预览联系人</option>{contacts}</select><button type="submit">预览</button></form><form method="post" action="/campaigns/from-contacts">{csrf}<input type="hidden" name="template_id" value="{id}"><label>批次名称</label><input name="name" maxlength="120" required><label>联系人分类</label><select name="category"><option value="">全部可发送联系人</option>{categories}</select><button class="button" type="submit" {disabled}>创建待确认批次</button></form></section>
-<section class="panel"><h2>发送测试</h2><p>这是一次真实 SMTP 提交，只允许发到你自己的发件邮箱。请先核对模板内容和收件邮箱。</p><form method="post" action="/templates/test">{csrf}<input type="hidden" name="template_id" value="{id}"><label>测试收件邮箱</label><input type="email" name="recipient" value="{test_recipient}" required><label>用于变量展开的联系人</label><select name="contact_id" required><option value="">请选择</option>{contacts}</select><label><input type="checkbox" name="confirm_test" value="1" required> 我确认发送这一封测试邮件</label><button type="submit" {disabled}>发送测试</button></form><p>最近测试记录：</p><ul>{test_logs}</ul></section><script src="editor.js" defer></script>'''.format(
+{copy_form}{precheck}{preview}<section class="panel"><h2>预览与创建批次</h2><p>先保存模板，再选一个联系人预览或预检测变量。预检测只针对已保存的当前显示版本；未保存的编辑需先保存。创建批次后仍需在批次页面明确启动发送。</p><form method="get" action="/templates"><input type="hidden" name="id" value="{id}">{version_input}<select name="contact_id"><option value="">选择预览联系人</option>{contacts}</select><button type="submit" {disabled}>预览</button><button type="submit" name="check" value="1" class="button secondary" {disabled}>发送前预检测</button></form><form method="post" action="/campaigns/from-contacts">{csrf}<input type="hidden" name="template_id" value="{id}"><label>批次名称</label><input name="name" maxlength="120" required><label>联系人分类</label><select name="category"><option value="">全部可发送联系人</option>{categories}</select><button class="button" type="submit" {campaign_disabled}>创建待确认批次</button></form>{historic_notice}</section>
+<section class="panel"><h2>发送测试</h2><p>这是一次真实 SMTP 提交，只允许发到你自己的发件邮箱。请先核对模板内容和收件邮箱。</p><form method="post" action="/templates/test">{csrf}<input type="hidden" name="template_id" value="{id}">{version_input}<label>测试收件邮箱</label><input type="email" name="recipient" value="{test_recipient}" required><label>用于变量展开的联系人</label><select name="contact_id" required><option value="">请选择</option>{contacts}</select><label><input type="checkbox" name="confirm_test" value="1" required> 我确认发送这一封测试邮件</label><button type="submit" {disabled}>发送测试</button></form><p>最近测试记录：</p><ul>{test_logs}</ul></section><script src="editor.js" defer></script>'''.format(
         alert=alert, list_html=list_html, heading='编辑模板' if selected else '新建模板', csrf=csrf(user),
-        campaign_link=('· <a href="/campaigns?template_id={}">按条件创建任务</a>'.format(selected_id) if selected else ''),
+        campaign_link=('· <a href="/campaigns?template_id={}">按条件创建任务</a>'.format(selected_id)
+                       if current_version else ''),
         id=selected_id or '', editor_default='source' if selected else 'visual',
         name=h(selected["name"] if selected else ''), subject=h(selected["subject"] if selected else ''),
         text=h(selected["body_text"] if selected else ''), html=h(selected["body_html"] if selected else ''),
-        versions=version_html, preview=preview, copy_form=copy_form,
+        versions=version_html, preview=preview, precheck=precheck_html, copy_form=copy_form,
         contacts=contact_options, categories=category_options,
-        disabled='' if selected else 'disabled', test_recipient=h(test_recipient), test_logs=test_logs)
+        version_input=version_input, disabled='' if selected else 'disabled',
+        campaign_disabled='' if current_version else 'disabled',
+        historic_notice=('<p class="muted">当前显示历史版本。若要用此版本创建任务，请先复制为新模板。</p>'
+                         if selected and not current_version else ''),
+        test_recipient=h(test_recipient), test_logs=test_logs)
     return page("邮件模板", content, user)
 
 
@@ -705,7 +727,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = templates_page(self.current_user,
                                       selected_id=int(query.get("id", ["0"])[0] or "0"),
                                       selected_version=int(query["version"][0]) if query.get("version") else None,
-                                      preview_contact_id=int(query.get("contact_id", ["0"])[0] or "0"))
+                                      preview_contact_id=int(query.get("contact_id", ["0"])[0] or "0"),
+                                      precheck=query.get("check", [""])[0] == "1")
             except ValueError:
                 self._send(404, "模板不存在")
                 return
@@ -884,9 +907,13 @@ class Handler(BaseHTTPRequestHandler):
                 if form.getfirst("confirm_test", "") != "1":
                     raise ValueError("请明确确认发送测试邮件")
                 template_id = int(form.getfirst("template_id", "0"))
+                version_text = form.getfirst("version", "")
+                version = int(version_text) if version_text else None
                 send_template_test(DB_PATH, self.current_user, template_id,
-                                   int(form.getfirst("contact_id", "0")), form.getfirst("recipient", ""), SETTINGS)
-                self._redirect("/templates?id={}".format(template_id))
+                                   int(form.getfirst("contact_id", "0")), form.getfirst("recipient", ""), SETTINGS,
+                                   version)
+                self._redirect("/templates?id={}{}".format(template_id,
+                               "&version={}".format(version) if version else ""))
                 return
             if path == "/contacts/add":
                 save_contact(DB_PATH, self.current_user, {key: form.getfirst(key, "") for key in ("email", "name", "categories")})

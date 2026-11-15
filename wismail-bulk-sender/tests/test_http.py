@@ -176,6 +176,33 @@ class HttpFlowTests(unittest.TestCase):
         with core.connect(server.DB_PATH) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM templates").fetchone()[0], 3)
 
+    def test_historical_template_precheck_and_test_use_displayed_version(self):
+        owner = "__legacy_admin__"
+        contact_id = core.save_contact(server.DB_PATH, owner, {"email": "buyer@example.com", "name": "Buyer"})
+        template_id, _ = core.save_template(server.DB_PATH, owner, "报价", "Old {{姓名}}", "Old body",
+                                            '<p>Old</p><a href="javascript:alert(1)">Bad</a>')
+        core.save_template(server.DB_PATH, owner, "报价", "New {{姓名}}", "New body", template_id=template_id)
+        path = "/templates?id={}&version=1&contact_id={}&check=1".format(template_id, contact_id)
+        with mock.patch.object(core, "_smtp_submit") as submit:
+            status, _, checked = self.request("GET", path)
+            submit.assert_not_called()
+        self.assertEqual(status, 200)
+        self.assertIn("发送前预检测 · v1".encode("utf-8"), checked)
+        self.assertIn(b"Old Buyer", checked)
+        self.assertIn("不支持的链接".encode("utf-8"), checked)
+        self.assertIn(b'name="version" value="1"', checked)
+        self.assertIn("当前显示历史版本".encode("utf-8"), checked)
+        account = {"SMTP_HOST": "smtp.example.test", "SMTP_USER": "sender@example.test",
+                   "SMTP_PASSWORD": "test-secret", "SMTP_FROM": "sender@example.test"}
+        form = urlencode({"csrf": server.CSRF_TOKEN, "template_id": template_id, "version": "1",
+                          "contact_id": contact_id, "recipient": "sender@example.test", "confirm_test": "1"})
+        with mock.patch.object(core, "mailbox_settings", return_value=account), \
+                mock.patch.object(core, "_smtp_submit", return_value="<old@example.test>") as submit:
+            status, headers, _ = self.request("POST", "/templates/test", form,
+                                               {"Content-Type": "application/x-www-form-urlencoded"})
+        self.assertEqual((status, headers["Location"]), (303, "/templates?id=1&version=1"))
+        self.assertEqual(submit.call_args[0][0]["subject"], "[测试] Old Buyer")
+
     def test_template_editor_asset_and_source_fallback(self):
         status, _, page = self.request("GET", "/templates")
         self.assertEqual(status, 200)

@@ -524,6 +524,68 @@ def render_template(template, contact):
     return subject, text, body_html
 
 
+class _TemplateHtmlInspector(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self.images = []
+        self.unsupported = set()
+        self.event_attributes = False
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if any(name.startswith("on") for name in attributes):
+            self.event_attributes = True
+        if tag in ("script", "form", "iframe", "object", "embed"):
+            self.unsupported.add(tag)
+        if tag == "a":
+            self.links.append(attributes.get("href") or "")
+        if tag == "img":
+            self.images.append(attributes)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+
+def preflight_template(template, contact):
+    """Check one rendered template without requesting URLs or sending mail."""
+    try:
+        subject, text, body_html = render_template(template, contact)
+    except ValueError as exc:
+        return [str(exc)], []
+    errors, warnings = [], []
+    if any("{{" in value or "}}" in value for value in (subject, text, body_html)):
+        errors.append("展开后仍有疑似未填的 {{变量}}，请检查拼写与括号。")
+    if len(subject) > 78:
+        warnings.append("主题超过 78 个字符，部分邮箱界面可能截断显示。")
+    if body_html:
+        inspector = _TemplateHtmlInspector()
+        inspector.feed(body_html)
+        if inspector.unsupported:
+            errors.append("HTML 含有邮件客户端通常不支持的标签：{}。".format(", ".join(sorted(inspector.unsupported))))
+        if inspector.event_attributes:
+            errors.append("HTML 含有交互事件属性，邮件客户端通常不会执行，请检查内容。")
+        for target in inspector.links:
+            target = target.strip()
+            try:
+                parsed = urlparse(target)
+            except ValueError:
+                errors.append("HTML 含空链接、相对链接或不支持的链接地址，请逐项检查。")
+                continue
+            if parsed.scheme in ("http", "https") and _safe_click_target(target):
+                if parsed.scheme == "http":
+                    warnings.append("存在非 HTTPS 链接，建议检查目标站点是否支持 HTTPS。")
+            elif parsed.scheme == "mailto" and EMAIL_RE.fullmatch(parsed.path):
+                pass
+            else:
+                errors.append("HTML 含空链接、相对链接或不支持的链接地址，请逐项检查。")
+        if inspector.images:
+            warnings.append("HTML 含图片；预览不会加载外部图片，部分收件客户端也可能默认阻止显示。")
+            if any(not (item.get("alt") or "").strip() for item in inspector.images):
+                warnings.append("有图片缺少替代文字，建议填写 alt 说明。")
+    return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))
+
+
 def _like_literal(value):
     return "%" + value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
@@ -624,7 +686,7 @@ def create_contact_campaign(path, owner_email, name, template_id, category="", f
     return create_draft(path, name, messages, owner_email, ab_mode)
 
 
-def send_template_test(path, owner_email, template_id, contact_id, recipient, settings):
+def send_template_test(path, owner_email, template_id, contact_id, recipient, settings, version=None):
     account = mailbox_settings(path, owner_email, settings)
     if not account or not all(account.get(key) for key in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM")):
         raise ValueError("请先配置发件授权")
@@ -635,7 +697,7 @@ def send_template_test(path, owner_email, template_id, contact_id, recipient, se
         contact = db.execute("SELECT * FROM contacts WHERE id=? AND owner_email=?", (contact_id, owner_email)).fetchone()
     if not contact:
         raise ValueError("请选择用于变量预览的联系人")
-    subject, text, body_html = render_template(get_template(path, owner_email, template_id), contact)
+    subject, text, body_html = render_template(get_template(path, owner_email, template_id, version), contact)
     row = {"owner_email": owner_email, "recipient_email": recipient, "subject": "[测试] " + subject,
            "body": text, "body_html": body_html}
     try:

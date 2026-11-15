@@ -205,6 +205,31 @@ class TemplateTests(unittest.TestCase):
         finally:
             server.DB_PATH = old
 
+    def test_template_preflight_checks_rendered_content_without_sending(self):
+        owner = "a@example.com"
+        contact_id = core.save_contact(self.path, owner, {"email": "buyer@example.com", "name": "Buyer"})
+        with core.connect(self.path) as db:
+            contact = db.execute("SELECT * FROM contacts WHERE id=?", (contact_id,)).fetchone()
+        template_id, _ = core.save_template(self.path, owner, "检查", "Hello {{姓名}}", "Body for {{姓名}}",
+            '<p>Buyer</p><a href="javascript:alert(1)">Bad</a><a href="http://example.com">Open</a>'
+            '<img src="https://example.com/a.png"><script>alert(1)</script>')
+        with mock.patch.object(core, "_smtp_submit") as submit:
+            errors, warnings = core.preflight_template(core.get_template(self.path, owner, template_id), contact)
+            submit.assert_not_called()
+        self.assertTrue(any("script" in item for item in errors))
+        self.assertTrue(any("链接" in item for item in errors))
+        self.assertTrue(any("非 HTTPS" in item for item in warnings))
+        self.assertTrue(any("替代文字" in item for item in warnings))
+        active, missing_alt = core.preflight_template({"subject": "Hi", "body_text": "Body", "body_html":
+            '<p onclick="alert(1)">Text</p><img src="https://example.com/a.png" alt>'}, contact)
+        self.assertTrue(any("交互事件" in item for item in active))
+        self.assertTrue(any("替代文字" in item for item in missing_alt))
+        missing, _ = core.preflight_template({"subject": "Hi {{地区}}", "body_text": "Body", "body_html": ""}, contact)
+        self.assertTrue(any("地区" in item for item in missing))
+        clean, notes = core.preflight_template({"subject": "Hi {{姓名}}", "body_text": "Body", "body_html":
+            '<p>Body</p><a href="https://example.com">Site</a>'}, contact)
+        self.assertEqual((clean, notes), ([], []))
+
     def test_test_send_requires_own_address_and_records_result(self):
         owner = "__legacy_admin__"
         contact_id = core.save_contact(self.path, owner, {"email": "buyer@example.com", "name": "Buyer"})
@@ -219,6 +244,17 @@ class TemplateTests(unittest.TestCase):
             self.assertEqual(submit.call_args[0][0]["subject"], "[测试] Hello Buyer")
         with core.connect(self.path) as db:
             self.assertEqual(db.execute("SELECT status FROM template_test_logs").fetchone()[0], "submitted")
+
+    def test_test_send_uses_requested_historical_version(self):
+        owner = "__legacy_admin__"
+        contact_id = core.save_contact(self.path, owner, {"email": "buyer@example.com", "name": "Buyer"})
+        template_id, _ = core.save_template(self.path, owner, "T", "Old {{姓名}}", "Old body")
+        core.save_template(self.path, owner, "T", "New {{姓名}}", "New body", template_id=template_id)
+        settings = {"SMTP_HOST": "smtp.example.test", "SMTP_PORT": "587", "SMTP_USER": "sender@example.test",
+                    "SMTP_PASSWORD": "test-secret", "SMTP_FROM": "sender@example.test"}
+        with mock.patch.object(core, "_smtp_submit", return_value="<old@example.test>") as submit:
+            core.send_template_test(self.path, owner, template_id, contact_id, "sender@example.test", settings, 1)
+        self.assertEqual(submit.call_args[0][0]["subject"], "[测试] Old Buyer")
 
     def test_html_mail_has_text_alternative_and_unsubscribe(self):
         row = {"owner_email": "sender@example.test", "recipient_email": "buyer@example.test",
