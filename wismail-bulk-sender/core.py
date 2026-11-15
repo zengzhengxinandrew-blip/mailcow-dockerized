@@ -165,6 +165,23 @@ def init_db(path):
           category_id INTEGER NOT NULL REFERENCES contact_categories(id) ON DELETE CASCADE,
           PRIMARY KEY(contact_id,category_id)
         );
+        CREATE TABLE IF NOT EXISTS automation_rules (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          owner_email TEXT NOT NULL,
+          event_kind TEXT NOT NULL,
+          category_name TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          UNIQUE(owner_email,event_kind,category_name)
+        );
+        CREATE TABLE IF NOT EXISTS automation_runs (
+          rule_id INTEGER NOT NULL REFERENCES automation_rules(id) ON DELETE CASCADE,
+          event_key TEXT NOT NULL,
+          contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+          applied_at TEXT NOT NULL,
+          PRIMARY KEY(rule_id,event_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_automation_runs_contact ON automation_runs(contact_id,applied_at);
         CREATE TABLE IF NOT EXISTS templates (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           owner_email TEXT NOT NULL,
@@ -727,6 +744,75 @@ def add_suppression(path, recipient, reason="手动添加", owner_email="__legac
         db.execute("""UPDATE messages SET status='suppressed',last_error='已加入不再联系名单'
                       WHERE lower(recipient_email)=? AND status='queued' AND batch_id IN
                       (SELECT id FROM batches WHERE owner_email=?)""", (recipient, owner_email))
+        if reason == "收件人退订" and owner_email != "*":
+            event_key = "unsubscribe:" + hashlib.sha256(recipient.encode("utf-8")).hexdigest()
+            _apply_automation_event(db, owner_email, recipient, "unsubscribe", event_key)
+
+
+AUTOMATION_EVENTS = {"open": "观测打开", "click": "观测点击", "unsubscribe": "收件人退订"}
+
+
+def save_automation_rule(path, owner_email, event_kind, category_name):
+    category_name = str(category_name or "").strip()
+    if event_kind not in AUTOMATION_EVENTS:
+        raise ValueError("请选择支持的触发行为")
+    if not category_name or len(category_name) > 80 or re.search(r"[,，;；\x00-\x1f]", category_name):
+        raise ValueError("分类名称需为 1 至 80 个字符，且不能包含逗号或分号")
+    with connect(path) as db:
+        db.execute("INSERT OR IGNORE INTO contact_categories(owner_email,name) VALUES (?,?)", (owner_email, category_name))
+        count = db.execute("SELECT COUNT(*) FROM automation_rules WHERE owner_email=?", (owner_email,)).fetchone()[0]
+        if count >= 20:
+            raise ValueError("每个账号最多创建 20 条自动分类规则")
+        if db.execute("""SELECT 1 FROM automation_rules WHERE owner_email=? AND event_kind=? AND category_name=?""",
+                      (owner_email, event_kind, category_name)).fetchone():
+            raise ValueError("相同的自动分类规则已存在")
+        try:
+            return db.execute("""INSERT INTO automation_rules(owner_email,event_kind,category_name,created_at)
+                                 VALUES (?,?,?,?)""", (owner_email, event_kind, category_name, iso(utcnow()))).lastrowid
+        except sqlite3.IntegrityError:
+            raise ValueError("相同的自动分类规则已存在")
+
+
+def set_automation_rule(path, owner_email, rule_id, enabled):
+    with connect(path) as db:
+        changed = db.execute("UPDATE automation_rules SET enabled=? WHERE id=? AND owner_email=?",
+                             (int(bool(enabled)), rule_id, owner_email)).rowcount
+        if not changed:
+            raise ValueError("自动分类规则不存在")
+
+
+def delete_automation_rule(path, owner_email, rule_id):
+    with connect(path) as db:
+        changed = db.execute("DELETE FROM automation_rules WHERE id=? AND owner_email=?",
+                             (rule_id, owner_email)).rowcount
+        if not changed:
+            raise ValueError("自动分类规则不存在")
+
+
+def _apply_automation_event(db, owner_email, recipient_email, event_kind, event_key):
+    contact = db.execute("""SELECT id FROM contacts WHERE owner_email=? AND email=? AND deleted_at IS NULL
+                            AND (status='subscribed' OR ?='unsubscribe')""",
+                         (owner_email, recipient_email.lower(), event_kind)).fetchone()
+    if not contact:
+        return 0
+    applied = 0
+    rules = db.execute("""SELECT id,category_name FROM automation_rules
+                          WHERE owner_email=? AND event_kind=? AND enabled=1""",
+                       (owner_email, event_kind)).fetchall()
+    for rule in rules:
+        inserted = db.execute("""INSERT OR IGNORE INTO automation_runs(rule_id,event_key,contact_id,applied_at)
+                                 VALUES (?,?,?,?)""",
+                              (rule["id"], event_key, contact["id"], iso(utcnow()))).rowcount
+        if not inserted:
+            continue
+        db.execute("INSERT OR IGNORE INTO contact_categories(owner_email,name) VALUES (?,?)",
+                   (owner_email, rule["category_name"]))
+        category_id = db.execute("""SELECT id FROM contact_categories WHERE owner_email=? AND name=?""",
+                                 (owner_email, rule["category_name"])).fetchone()["id"]
+        db.execute("INSERT OR IGNORE INTO contact_category_links(contact_id,category_id) VALUES (?,?)",
+                   (contact["id"], category_id))
+        applied += 1
+    return applied
 
 
 CONTACT_STATUSES = {"subscribed", "unsubscribed", "complained", "invalid"}
@@ -1134,7 +1220,8 @@ def record_tracking_event(path, message_id, kind):
         return False
     field, flag = ("opened_at", "track_open") if kind == "o" else ("clicked_at", "track_click")
     with connect(path) as db:
-        row = db.execute("""SELECT m.status,m.opened_at,m.clicked_at,b.track_open,b.track_click FROM messages m
+        row = db.execute("""SELECT m.status,m.opened_at,m.clicked_at,m.recipient_email,
+                            b.owner_email,b.track_open,b.track_click FROM messages m
                             JOIN batches b ON b.id=m.batch_id WHERE m.id=?""", (message_id,)).fetchone()
         if not row or not row[flag] or row["status"] not in ("sending", "submitted"):
             return False
@@ -1144,8 +1231,11 @@ def record_tracking_event(path, message_id, kind):
         changed = db.execute("UPDATE messages SET {}=? WHERE id=? AND {} IS NULL".format(field, field),
                              (now, message_id)).rowcount
         if changed:
+            event_kind = "open" if kind == "o" else "click"
             db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,?,?,?)",
-                       (message_id, "open" if kind == "o" else "click", now, "观测到首次打开" if kind == "o" else "观测到首次点击"))
+                       (message_id, event_kind, now, "观测到首次打开" if kind == "o" else "观测到首次点击"))
+            _apply_automation_event(db, row["owner_email"], row["recipient_email"],
+                                    event_kind, "{}:{}".format(event_kind, message_id))
     return True
 
 

@@ -83,6 +83,66 @@ class TrackingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "筛选结果为空"):
             core.select_campaign_contacts(self.path, "other-owner@example.com", {"opened_days": "30"})
 
+    def test_automation_tags_only_owned_contact_on_first_observed_events(self):
+        owner, other = "sender@example.com", "other@example.com"
+        for account in (owner, other):
+            core.save_contact(self.path, account, {"email": "buyer@example.com"})
+        core.save_automation_rule(self.path, owner, "open", "已打开")
+        core.save_automation_rule(self.path, owner, "click", "已点击")
+        core.save_automation_rule(self.path, other, "open", "其他账号分类")
+        batch = core.create_draft(self.path, "tracked", [(1, "buyer@example.com", "Hi", "Text", "<p>HTML</p>")], owner)
+        core.schedule_batch(self.path, batch, "now", 60, track_open=True, track_click=True)
+        with core.connect(self.path) as db:
+            db.execute("UPDATE messages SET status='submitted',submitted_at=? WHERE batch_id=?",
+                       (core.iso(core.utcnow()), batch))
+            message_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (batch,)).fetchone()[0]
+        for kind in ("o", "o", "c", "c"):
+            self.assertTrue(core.record_tracking_event(self.path, message_id, kind))
+        with core.connect(self.path) as db:
+            rows = db.execute("""SELECT c.owner_email,g.name FROM contact_category_links l
+                                 JOIN contacts c ON c.id=l.contact_id JOIN contact_categories g ON g.id=l.category_id
+                                 ORDER BY c.owner_email,g.name""").fetchall()
+            self.assertEqual([tuple(row) for row in rows], [(owner, "已打开"), (owner, "已点击")])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM automation_runs").fetchone()[0], 2)
+
+    def test_unsubscribe_rule_tags_once_and_keeps_send_block(self):
+        owner = "sender@example.com"
+        core.save_contact(self.path, owner, {"email": "buyer@example.com"})
+        rule = core.save_automation_rule(self.path, owner, "unsubscribe", "已退订")
+        batch = core.create_draft(self.path, "queued", [(1, "buyer@example.com", "Hi", "Text")], owner)
+        core.schedule_batch(self.path, batch, "now", 60)
+        core.add_suppression(self.path, "buyer@example.com", "收件人退订", owner)
+        core.add_suppression(self.path, "buyer@example.com", "收件人退订", owner)
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT status FROM contacts WHERE owner_email=?", (owner,)).fetchone()[0], "unsubscribed")
+            self.assertEqual(db.execute("SELECT status FROM messages WHERE batch_id=?", (batch,)).fetchone()[0], "suppressed")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM automation_runs WHERE rule_id=?", (rule,)).fetchone()[0], 1)
+            category = db.execute("""SELECT g.name FROM contact_category_links l
+                                     JOIN contact_categories g ON g.id=l.category_id""").fetchone()[0]
+            self.assertEqual(category, "已退订")
+
+    def test_paused_rule_does_not_replay_old_click(self):
+        owner = "sender@example.com"
+        core.save_contact(self.path, owner, {"email": "buyer@example.com"})
+        rule = core.save_automation_rule(self.path, owner, "click", "新点击")
+        core.set_automation_rule(self.path, owner, rule, False)
+        batch = core.create_draft(self.path, "tracked", [
+            (1, "buyer@example.com", "Hi", "Text", "<p>HTML</p>"),
+            (2, "buyer@example.com", "Hi", "Text", "<p>HTML</p>")], owner)
+        core.schedule_batch(self.path, batch, "now", 60, track_click=True)
+        with core.connect(self.path) as db:
+            db.execute("UPDATE messages SET status='submitted',submitted_at=? WHERE batch_id=?",
+                       (core.iso(core.utcnow()), batch))
+            first, second = [row[0] for row in db.execute("SELECT id FROM messages WHERE batch_id=? ORDER BY row_number", (batch,))]
+        self.assertTrue(core.record_tracking_event(self.path, first, "c"))
+        core.set_automation_rule(self.path, owner, rule, True)
+        self.assertTrue(core.record_tracking_event(self.path, first, "c"))
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM automation_runs").fetchone()[0], 0)
+        self.assertTrue(core.record_tracking_event(self.path, second, "c"))
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM automation_runs").fetchone()[0], 1)
+
     def test_plain_text_batch_cannot_claim_tracking(self):
         batch = core.create_draft(self.path, "plain", [(1, "buyer@example.com", "Hi", "Text")])
         with self.assertRaisesRegex(ValueError, "HTML"):

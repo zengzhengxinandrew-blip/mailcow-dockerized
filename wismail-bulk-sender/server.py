@@ -20,10 +20,10 @@ from urllib.parse import parse_qs, urlparse
 
 from cryptography.fernet import Fernet
 
-from core import (MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_draft,
+from core import (AUTOMATION_EVENTS, MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_draft,
                   create_contact_campaign, get_template, import_contacts, init_db, mailbox_settings,
                   parse_contacts_upload, parse_upload, preflight_template, prepare_contact_campaign, render_template, report_data,
-                  save_template, send_template_test,
+                  save_automation_rule, set_automation_rule, delete_automation_rule, save_template, send_template_test,
                   revoke_mailbox_auth, save_contact, save_mailbox_auth, schedule_batch,
                   set_batch_state, set_contact_deleted, set_contact_status, tracking_ready,
                   record_tracking_event, verify_tracking_token, utcnow, verify_mailbox_auth)
@@ -92,7 +92,7 @@ def page(title, content, user=""):
     account_link = ('<span class="top-meta">{}</span><a class="top-account" href="/account">发件授权</a>'
                     '<a class="top-account" href="/logout">退出</a>'.format(h(user)) if oauth_login.configured(SETTINGS) and user
                     else '<span class="top-meta">外贸邮件工作台 / V2</span>')
-    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/campaigns">创建任务</a><a class="top-account" href="/reports">统计报表</a>' + account_link
+    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/campaigns">创建任务</a><a class="top-account" href="/automations">自动分类</a><a class="top-account" href="/reports">统计报表</a>' + account_link
     markup = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Wismail</title>
 <link rel="stylesheet" href="/static.css"></head><body>
@@ -291,6 +291,38 @@ def contacts_page(user, error="", search="", status="", category="", recycle=Fal
         items=''.join(items) or '<tr><td colspan="5">暂无联系人</td></tr>',
         **{key: 'selected' if status == key else '' for key in ('subscribed', 'unsubscribed', 'complained', 'invalid')})
     return page("联系人", content, user)
+
+
+def automations_page(user, error=""):
+    with connect(DB_PATH) as db:
+        rules = db.execute("""SELECT r.*, (SELECT COUNT(*) FROM automation_runs a WHERE a.rule_id=r.id) AS runs
+                              FROM automation_rules r WHERE r.owner_email=? ORDER BY r.id DESC""", (user,)).fetchall()
+        recent = db.execute("""SELECT a.applied_at,r.event_kind,r.category_name,c.email
+                               FROM automation_runs a JOIN automation_rules r ON r.id=a.rule_id
+                               JOIN contacts c ON c.id=a.contact_id
+                               WHERE r.owner_email=? ORDER BY a.applied_at DESC LIMIT 20""", (user,)).fetchall()
+    options = ''.join('<option value="{}">{}</option>'.format(kind, h(label))
+                      for kind, label in AUTOMATION_EVENTS.items())
+    rows = ''.join('''<tr><td>{event}</td><td>{category}</td><td>{state}</td><td>{runs}</td><td>
+<form method="post" action="/automations/toggle">{csrf}<input type="hidden" name="id" value="{id}"><input type="hidden" name="enabled" value="{next_state}"><button type="submit">{toggle}</button></form>
+<form method="post" action="/automations/delete">{csrf}<input type="hidden" name="id" value="{id}"><button type="submit" onclick="return confirm('删除规则不会移除已添加的联系人分类。确定删除？')">删除</button></form></td></tr>'''.format(
+        event=h(AUTOMATION_EVENTS[row["event_kind"]]), category=h(row["category_name"]),
+        state="启用" if row["enabled"] else "暂停", runs=row["runs"], csrf=csrf(user), id=row["id"],
+        next_state="0" if row["enabled"] else "1", toggle="暂停" if row["enabled"] else "启用") for row in rules)
+    history = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        local_time(row["applied_at"]), h(AUTOMATION_EVENTS[row["event_kind"]]),
+        h(row["email"] + " → " + row["category_name"])) for row in recent)
+    alert = '<div class="alert">{}</div>'.format(h(error)) if error else ''
+    content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>自动分类</h1>{alert}
+<p>当联系人首次打开、点击邮件或确认退订时，把联系人加入指定分类。规则只处理创建后新发生的事件，不会追溯旧记录，也不会自动发送邮件。</p>
+<p class="muted">打开和点击是请求观测值，可能由图片代理或安全扫描触发；退订会继续停止该联系人的排队邮件。</p>
+<form method="post" action="/automations/add">{csrf}<div class="campaign-grid"><label>触发行为<select name="event_kind" required>{options}</select></label><label>添加到分类<input name="category_name" maxlength="80" required placeholder="例如：点击过产品邮件"></label></div><button class="button" type="submit">创建规则</button></form></section>
+<section class="list-section"><h2>我的规则</h2><div class="table-wrap"><table><thead><tr><th>触发行为</th><th>添加分类</th><th>状态</th><th>触发次数</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table></div></section>
+<section class="list-section"><h2>最近触发记录</h2><div class="table-wrap"><table><thead><tr><th>时间</th><th>行为</th><th>联系人与分类</th></tr></thead><tbody>{history}</tbody></table></div></section>'''.format(
+        alert=alert, csrf=csrf(user), options=options,
+        rows=rows or '<tr><td colspan="5">还没有自动分类规则。</td></tr>',
+        history=history or '<tr><td colspan="3">还没有新行为触发规则。</td></tr>')
+    return page("自动分类", content, user)
 
 
 def templates_page(user, error="", selected_id=0, selected_version=None, preview_contact_id=0, precheck=False):
@@ -696,6 +728,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/":
             self._send(200, dashboard(user=self.current_user))
+        elif path == "/automations":
+            self._send(200, automations_page(self.current_user))
         elif path == "/campaigns":
             query = parse_qs(urlparse(self.path).query)
             self._send(200, campaigns_page(self.current_user,
@@ -865,6 +899,20 @@ class Handler(BaseHTTPRequestHandler):
                 add_suppression(DB_PATH, form.getfirst("email", ""), owner_email=self.current_user)
                 self._redirect("/")
                 return
+            if path == "/automations/add":
+                save_automation_rule(DB_PATH, self.current_user, form.getfirst("event_kind", ""),
+                                     form.getfirst("category_name", ""))
+                self._redirect("/automations")
+                return
+            if path == "/automations/toggle":
+                set_automation_rule(DB_PATH, self.current_user, int(form.getfirst("id", "0")),
+                                    form.getfirst("enabled", "") == "1")
+                self._redirect("/automations")
+                return
+            if path == "/automations/delete":
+                delete_automation_rule(DB_PATH, self.current_user, int(form.getfirst("id", "0")))
+                self._redirect("/automations")
+                return
             if path == "/templates/save":
                 template_id, _ = save_template(DB_PATH, self.current_user, form.getfirst("name", ""),
                                                form.getfirst("subject", ""), form.getfirst("body_text", ""),
@@ -994,6 +1042,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path.startswith("/contacts"):
                 self._send(400, contacts_page(self.current_user, str(exc)))
+                return
+            if path.startswith("/automations"):
+                self._send(400, automations_page(self.current_user, str(exc)))
                 return
             if path == "/account" and oauth_login.configured(SETTINGS):
                 self._send(400, account_page(self.current_user, str(exc)))

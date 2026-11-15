@@ -66,6 +66,31 @@ class HttpFlowTests(unittest.TestCase):
         finally:
             server.SETTINGS["SESSION_SECRET"] = old_secret
 
+    def test_automation_rules_are_owner_scoped_and_do_not_send(self):
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        with mock.patch.object(core, "_smtp_submit") as submit:
+            form = urlencode({"csrf": server.CSRF_TOKEN, "event_kind": "click", "category_name": "已点击"})
+            status, response_headers, _ = self.request("POST", "/automations/add", form, headers)
+            self.assertEqual((status, response_headers["Location"]), (303, "/automations"))
+            submit.assert_not_called()
+        status, _, page = self.request("GET", "/automations")
+        self.assertEqual(status, 200)
+        self.assertIn("已点击".encode("utf-8"), page)
+        self.assertEqual(self.request("POST", "/automations/add", form, headers)[0], 400)
+        other_rule = core.save_automation_rule(server.DB_PATH, "other@example.com", "open", "私有分类")
+        toggle = urlencode({"csrf": server.CSRF_TOKEN, "id": other_rule, "enabled": "0"})
+        self.assertEqual(self.request("POST", "/automations/toggle", toggle, headers)[0], 400)
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT enabled FROM automation_rules WHERE id=?", (other_rule,)).fetchone()[0], 1)
+        own_toggle = urlencode({"csrf": server.CSRF_TOKEN, "id": "1", "enabled": "0"})
+        self.assertEqual(self.request("POST", "/automations/toggle", own_toggle, headers)[0], 303)
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT enabled FROM automation_rules WHERE id=1").fetchone()[0], 0)
+        remove = urlencode({"csrf": server.CSRF_TOKEN, "id": "1"})
+        self.assertEqual(self.request("POST", "/automations/delete", remove, headers)[0], 303)
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM automation_rules WHERE owner_email='__legacy_admin__'").fetchone()[0], 0)
+
     def test_template_upload_preview_requires_explicit_start(self):
         status, _, template = self.request("GET", "/template.xlsx")
         self.assertEqual(status, 200)
