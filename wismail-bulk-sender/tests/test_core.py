@@ -208,7 +208,28 @@ class CampaignTests(unittest.TestCase):
         core.init_db(old_path)
         with core.connect(old_path) as db:
             self.assertEqual(db.execute("SELECT owner_email FROM batches WHERE id=1").fetchone()[0], "__legacy_admin__")
+            self.assertEqual(db.execute("SELECT reply_to FROM batches WHERE id=1").fetchone()[0], "")
             self.assertEqual(db.execute("SELECT owner_email FROM suppressions").fetchone()[0], "*")
+
+    def test_reply_address_is_same_domain_and_used_in_submitted_message(self):
+        batch = core.create_draft(self.db_path, "回复测试", [(1, "buyer@example.com", "报价", "正文")])
+        for invalid in ("other@outside.test", "bad\r\nBcc:attacker@example.test", "bad,one@example.test"):
+            with self.assertRaisesRegex(ValueError, "回复地址"):
+                core.schedule_batch(self.db_path, batch, "now", 60, reply_to=invalid,
+                                    sender_email="sender@example.test")
+        with core.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT state FROM batches WHERE id=?", (batch,)).fetchone()[0], "draft")
+        core.schedule_batch(self.db_path, batch, "now", 60, reply_to="REPLIES@example.test",
+                            sender_email="sender@example.test")
+        with core.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT reply_to FROM batches WHERE id=?", (batch,)).fetchone()[0],
+                             "replies@example.test")
+        with mock.patch.object(core.smtplib, "SMTP") as smtp_class:
+            smtp_class.return_value.send_message.return_value = {}
+            self.assertTrue(core.dispatch_one(self.db_path, SETTINGS))
+        message = smtp_class.return_value.send_message.call_args[0][0]
+        self.assertEqual(message["From"], "sender@example.test")
+        self.assertEqual(message["Reply-To"], "replies@example.test")
 
     def test_worker_uses_each_mailbox_authorization(self):
         key = Fernet.generate_key().decode("ascii")

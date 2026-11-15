@@ -4,6 +4,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from urllib.parse import urlencode
 from http.server import HTTPServer
 
@@ -118,6 +119,24 @@ class HttpFlowTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/batches/{}/copy".format(other), form, headers)[0], 404)
         with core.connect(server.DB_PATH) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM batches").fetchone()[0], 3)
+
+    def test_start_batch_saves_reply_address_and_rejects_other_domain(self):
+        batch = core.create_draft(server.DB_PATH, "回复地址", [(1, "buyer@example.com", "主题", "正文")])
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        account = {"SMTP_HOST": "smtp.example.test", "SMTP_USER": "sender@example.test",
+                   "SMTP_PASSWORD": "test-secret", "SMTP_FROM": "sender@example.test"}
+        form = {"csrf": server.CSRF_TOKEN, "immediate": "1", "interval": "120",
+                "reply_to": "replies@outside.test"}
+        with mock.patch.object(server, "mailbox_settings", return_value=account):
+            self.assertEqual(self.request("POST", "/batches/{}/start".format(batch),
+                                          urlencode(form), headers)[0], 400)
+            form["reply_to"] = "replies@example.test"
+            status, result_headers, _ = self.request("POST", "/batches/{}/start".format(batch),
+                                                     urlencode(form), headers)
+        self.assertEqual((status, result_headers["Location"]), (303, "/batches/1"))
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT reply_to,state FROM batches WHERE id=?", (batch,)).fetchone()[:],
+                             ("replies@example.test", "active"))
 
     def test_copy_template_route_uses_selected_version(self):
         original, _ = core.save_template(server.DB_PATH, "__legacy_admin__", "原模板", "旧主题", "正文")

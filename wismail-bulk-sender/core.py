@@ -35,6 +35,7 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 20 * 1024 * 1024
 MAX_ROWS = 1000
 EMAIL_RE = re.compile(r"^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$")
+REPLY_ADDRESS_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$")
 MESSAGE_ID_RE = re.compile(r"<[^<>\s]+>")
 NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 HEADERS = {
@@ -75,6 +76,7 @@ def init_db(path):
           created_at TEXT NOT NULL,
           start_at TEXT,
           interval_seconds INTEGER,
+          reply_to TEXT NOT NULL DEFAULT '',
           track_open INTEGER NOT NULL DEFAULT 0,
           track_click INTEGER NOT NULL DEFAULT 0
         );
@@ -197,6 +199,8 @@ def init_db(path):
         batch_columns = [item["name"] for item in db.execute("PRAGMA table_info(batches)")]
         if "owner_email" not in batch_columns:
             db.execute("ALTER TABLE batches ADD COLUMN owner_email TEXT NOT NULL DEFAULT '__legacy_admin__'")
+        if "reply_to" not in batch_columns:
+            db.execute("ALTER TABLE batches ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''")
         for column in ("track_open", "track_click"):
             if column not in batch_columns:
                 db.execute("ALTER TABLE batches ADD COLUMN {} INTEGER NOT NULL DEFAULT 0".format(column))
@@ -831,9 +835,19 @@ def verify_mailbox_auth(owner_email, smtp_password, imap_password, settings):
 
 
 def schedule_batch(path, batch_id, start_local, interval_seconds, offset_hours=8,
-                   track_open=False, track_click=False):
+                   track_open=False, track_click=False, reply_to="", sender_email=""):
     if not 60 <= interval_seconds <= 86400:
         raise ValueError("发送间隔需为 60 秒至 24 小时")
+    reply_to = str(reply_to or "").strip().lower()
+    sender_email = str(sender_email or "").strip().lower()
+    if reply_to:
+        local = reply_to.rsplit("@", 1)[0] if "@" in reply_to else ""
+        valid = (len(reply_to) <= 254 and REPLY_ADDRESS_RE.fullmatch(reply_to) and
+                 not local.startswith(".") and not local.endswith(".") and ".." not in local and
+                 EMAIL_RE.fullmatch(sender_email) and
+                 reply_to.rsplit("@", 1)[1] == sender_email.rsplit("@", 1)[1])
+        if not valid:
+            raise ValueError("回复地址需为发件邮箱同域的有效邮箱地址")
     if start_local == "now":
         start = utcnow()
     else:
@@ -854,8 +868,8 @@ def schedule_batch(path, batch_id, start_local, interval_seconds, offset_hours=8
         for index, row in enumerate(rows):
             due = iso(start + dt.timedelta(seconds=index * interval_seconds))
             db.execute("UPDATE messages SET status='queued',scheduled_at=?,next_attempt_at=? WHERE id=?", (due, due, row["id"]))
-        db.execute("UPDATE batches SET state='active',start_at=?,interval_seconds=?,track_open=?,track_click=? WHERE id=?",
-                   (iso(start), interval_seconds, int(bool(track_open)), int(bool(track_click)), batch_id))
+        db.execute("UPDATE batches SET state='active',start_at=?,interval_seconds=?,track_open=?,track_click=?,reply_to=? WHERE id=?",
+                   (iso(start), interval_seconds, int(bool(track_open)), int(bool(track_click)), reply_to, batch_id))
 
 
 def set_batch_state(path, batch_id, state):
@@ -1012,6 +1026,8 @@ def _smtp_submit(row, settings):
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = row["recipient_email"]
+    if "reply_to" in row.keys() and row["reply_to"]:
+        msg["Reply-To"] = row["reply_to"]
     msg["Subject"] = row["subject"]
     msg["Date"] = email.utils.format_datetime(utcnow())
     message_id = "<{}@{}>".format(uuid.uuid4().hex, sender.rsplit("@", 1)[1])
@@ -1069,7 +1085,7 @@ def dispatch_one(path, settings):
         offset = int(settings.get("UTC_OFFSET_HOURS", 8))
         local_day = (now + dt.timedelta(hours=offset)).date()
         day_start = dt.datetime.combine(local_day, dt.time()).replace(tzinfo=dt.timezone.utc) - dt.timedelta(hours=offset)
-        candidates = db.execute("""SELECT m.*,b.owner_email,b.track_open,b.track_click FROM messages m JOIN batches b ON b.id=m.batch_id
+        candidates = db.execute("""SELECT m.*,b.owner_email,b.track_open,b.track_click,b.reply_to FROM messages m JOIN batches b ON b.id=m.batch_id
                             WHERE m.status='queued' AND b.state='active' AND m.next_attempt_at<=?
                             ORDER BY m.next_attempt_at,m.id LIMIT 100""", (iso(now),)).fetchall()
         row, sender_settings = None, None
