@@ -1,5 +1,7 @@
 import base64
+import csv
 import http.client
+import io
 import os
 import tempfile
 import threading
@@ -209,6 +211,38 @@ class HttpFlowTests(unittest.TestCase):
             rows = db.execute("SELECT subject,status FROM messages ORDER BY row_number").fetchall()
         self.assertEqual([(row["subject"], row["status"]) for row in rows],
                          [("Subject A", "draft"), ("Subject B", "draft")])
+
+    def test_ab_preview_and_creation_keep_same_groups_without_sending(self):
+        owner = "__legacy_admin__"
+        for number in range(4):
+            core.save_contact(server.DB_PATH, owner, {"email": "buyer{}@example.test".format(number)})
+        first, _ = core.save_template(server.DB_PATH, owner, "A", "Subject A", "Text A")
+        second, _ = core.save_template(server.DB_PATH, owner, "B", "Subject B", "Text B")
+        form = {"csrf": server.CSRF_TOKEN, "name": "A/B 实验", "template_id": [str(first), str(second)],
+                "ab_mode": "1", "mode": "preview"}
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        status, _, page = self.request("POST", "/campaigns", urlencode(form, doseq=True), headers)
+        self.assertEqual(status, 200)
+        self.assertIn("A/B 对比".encode("utf-8"), page)
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM batches").fetchone()[0], 0)
+        form["mode"] = "create"
+        status, response_headers, _ = self.request("POST", "/campaigns", urlencode(form, doseq=True), headers)
+        self.assertEqual((status, response_headers["Location"]), (303, "/batches/1"))
+        with core.connect(server.DB_PATH) as db:
+            batch = db.execute("SELECT ab_mode,state FROM batches WHERE id=1").fetchone()
+            variants = db.execute("SELECT variant,status FROM messages WHERE batch_id=1").fetchall()
+        self.assertEqual(tuple(batch), (1, "draft"))
+        self.assertEqual(sorted(row["variant"] for row in variants), ["A", "A", "B", "B"])
+        self.assertTrue(all(row["status"] == "draft" for row in variants))
+        status, _, detail = self.request("GET", "/batches/1")
+        self.assertEqual(status, 200)
+        self.assertIn("A/B 对比".encode("utf-8"), detail)
+        self.assertIn("观测点击率".encode("utf-8"), detail)
+        status, _, exported = self.request("GET", "/batches/1/export.csv")
+        self.assertEqual(status, 200)
+        records = list(csv.DictReader(io.StringIO(exported.decode("utf-8-sig"))))
+        self.assertEqual(sorted(row["A/B组"] for row in records), ["A", "A", "B", "B"])
 
     def test_public_tracking_routes_require_valid_token_and_record_once(self):
         old_secret = server.SETTINGS["SESSION_SECRET"]

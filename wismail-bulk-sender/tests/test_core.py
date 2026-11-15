@@ -209,6 +209,7 @@ class CampaignTests(unittest.TestCase):
         with core.connect(old_path) as db:
             self.assertEqual(db.execute("SELECT owner_email FROM batches WHERE id=1").fetchone()[0], "__legacy_admin__")
             self.assertEqual(db.execute("SELECT reply_to FROM batches WHERE id=1").fetchone()[0], "")
+            self.assertEqual(db.execute("SELECT ab_mode FROM batches WHERE id=1").fetchone()[0], 0)
             self.assertEqual(db.execute("SELECT owner_email FROM suppressions").fetchone()[0], "*")
 
     def test_reply_address_is_same_domain_and_used_in_submitted_message(self):

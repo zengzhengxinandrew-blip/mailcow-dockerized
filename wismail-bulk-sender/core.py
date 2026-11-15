@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import html
 import json
+import math
 import os
 import re
 import smtplib
@@ -77,6 +78,7 @@ def init_db(path):
           start_at TEXT,
           interval_seconds INTEGER,
           reply_to TEXT NOT NULL DEFAULT '',
+          ab_mode INTEGER NOT NULL DEFAULT 0,
           track_open INTEGER NOT NULL DEFAULT 0,
           track_click INTEGER NOT NULL DEFAULT 0
         );
@@ -90,6 +92,7 @@ def init_db(path):
           template_id INTEGER,
           template_name TEXT NOT NULL DEFAULT '',
           template_version INTEGER,
+          variant TEXT NOT NULL DEFAULT '',
           status TEXT NOT NULL DEFAULT 'draft',
           scheduled_at TEXT,
           next_attempt_at TEXT,
@@ -201,12 +204,16 @@ def init_db(path):
             db.execute("ALTER TABLE batches ADD COLUMN owner_email TEXT NOT NULL DEFAULT '__legacy_admin__'")
         if "reply_to" not in batch_columns:
             db.execute("ALTER TABLE batches ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''")
+        if "ab_mode" not in batch_columns:
+            db.execute("ALTER TABLE batches ADD COLUMN ab_mode INTEGER NOT NULL DEFAULT 0")
         for column in ("track_open", "track_click"):
             if column not in batch_columns:
                 db.execute("ALTER TABLE batches ADD COLUMN {} INTEGER NOT NULL DEFAULT 0".format(column))
         message_columns = [item["name"] for item in db.execute("PRAGMA table_info(messages)")]
         if "body_html" not in message_columns:
             db.execute("ALTER TABLE messages ADD COLUMN body_html TEXT NOT NULL DEFAULT ''")
+        if "variant" not in message_columns:
+            db.execute("ALTER TABLE messages ADD COLUMN variant TEXT NOT NULL DEFAULT ''")
         for column in ("opened_at", "clicked_at"):
             if column not in message_columns:
                 db.execute("ALTER TABLE messages ADD COLUMN {} TEXT".format(column))
@@ -336,7 +343,7 @@ def parse_upload(filename, data):
     return messages
 
 
-def create_draft(path, name, messages, owner_email="__legacy_admin__"):
+def create_draft(path, name, messages, owner_email="__legacy_admin__", ab_mode=False):
     with connect(path) as db:
         blocked = []
         for message in messages:
@@ -348,14 +355,14 @@ def create_draft(path, name, messages, owner_email="__legacy_admin__"):
                 blocked.append("第 {} 行：{} 的联系人状态禁止发送".format(row_number, recipient))
         if blocked:
             raise ValueError("上传检查未通过：\n" + "\n".join(blocked[:30]))
-        cur = db.execute("INSERT INTO batches(owner_email,name,state,created_at) VALUES (?,?,?,?)",
-                         (owner_email, name[:120] or "未命名批次", "draft", iso(utcnow())))
+        cur = db.execute("INSERT INTO batches(owner_email,name,state,created_at,ab_mode) VALUES (?,?,?,?,?)",
+                         (owner_email, name[:120] or "未命名批次", "draft", iso(utcnow()), int(bool(ab_mode))))
         batch_id = cur.lastrowid
         db.executemany("""INSERT INTO messages(batch_id,row_number,recipient_email,subject,body,body_html,
-                           template_id,template_name,template_version) VALUES (?,?,?,?,?,?,?,?,?)""",
+                           template_id,template_name,template_version,variant) VALUES (?,?,?,?,?,?,?,?,?,?)""",
                        [(batch_id,) + tuple(row[:4]) + (row[4] if len(row) > 4 else "",
                         row[5] if len(row) > 5 else None, row[6] if len(row) > 6 else "",
-                        row[7] if len(row) > 7 else None) for row in messages])
+                        row[7] if len(row) > 7 else None, row[8] if len(row) > 8 else "") for row in messages])
     return batch_id
 
 
@@ -418,6 +425,37 @@ def report_data(path, owner_email, start_date, end_date, offset_hours=8):
     return {"totals": totals, "days": sorted(days.items(), reverse=True),
             "months": sorted(months.items(), reverse=True),
             "batches": sorted(batches.values(), key=lambda item: (-item["submitted"], item["id"]))}
+
+
+def ab_click_guidance(groups, state, track_click, latest_submitted_at, now=None):
+    """Give a conservative, non-automatic A/B click comparison."""
+    if not track_click:
+        return None, "未启用点击记录；可以比较提交、退信和回复，暂不提供点击建议。"
+    if state != "completed":
+        return None, "任务尚未完成，待两组发送结束后再比较。"
+    if len(groups) != 2 or any(group["submitted"] < 30 for group in groups):
+        return None, "每组至少需要 30 封已提交邮件，当前不提供建议。"
+    now = now or utcnow()
+    if not latest_submitted_at or parse_iso(latest_submitted_at) > now - dt.timedelta(hours=24):
+        return None, "最后一封提交后需观察至少 24 小时，当前不提供建议。"
+
+    def wilson(clicks, submitted):
+        if not 0 <= clicks <= submitted:
+            raise ValueError("A/B 点击统计无效")
+        z = 1.96
+        proportion = clicks / submitted
+        denominator = 1 + z * z / submitted
+        center = (proportion + z * z / (2 * submitted)) / denominator
+        radius = z * math.sqrt(proportion * (1 - proportion) / submitted + z * z / (4 * submitted * submitted)) / denominator
+        return center - radius, center + radius
+
+    first = wilson(groups[0]["clicked"], groups[0]["submitted"])
+    second = wilson(groups[1]["clicked"], groups[1]["submitted"])
+    if first[0] > second[1]:
+        return "A", "A 组的观测点击率区间高于 B 组；后续任务可优先考虑 A 模板。"
+    if second[0] > first[1]:
+        return "B", "B 组的观测点击率区间高于 A 组；后续任务可优先考虑 B 模板。"
+    return None, "两组观测点击率差异仍不明确；暂不建议选定模板。"
 
 
 VARIABLE_RE = re.compile(r"\{\{([^{}]+)\}\}")
@@ -538,6 +576,7 @@ def select_campaign_contacts(path, owner_email, filters=None):
 
 
 def prepare_contact_campaign(path, owner_email, template_ids, filters=None):
+    filters = dict(filters or {})
     ids = template_ids if isinstance(template_ids, (list, tuple)) else [template_ids]
     try:
         ids = [int(value) for value in ids]
@@ -545,17 +584,31 @@ def prepare_contact_campaign(path, owner_email, template_ids, filters=None):
         raise ValueError("请选择有效的邮件模板")
     if not 1 <= len(ids) <= 5 or any(value < 1 for value in ids) or len(set(ids)) != len(ids):
         raise ValueError("请按顺序选择 1 至 5 个不同的邮件模板")
+    ab_mode = str(filters.get("ab_mode", "")).lower() in ("1", "true")
+    if ab_mode and len(ids) != 2:
+        raise ValueError("A/B 对比必须恰好选择 2 个模板")
     templates = [get_template(path, owner_email, template_id) for template_id in ids]
     contacts = select_campaign_contacts(path, owner_email, filters)
+    if ab_mode and len(contacts) < 2:
+        raise ValueError("A/B 对比至少需要 2 位可发送联系人")
+    variants = {}
+    if ab_mode:
+        seed = json.dumps([owner_email, ids, filters.get("name", "")], ensure_ascii=False)
+        ranked = sorted(range(len(contacts)), key=lambda index: hashlib.sha256(
+            (seed + "\0" + contacts[index]["email"]).encode("utf-8")).digest())
+        variants = {index: position % 2 for position, index in enumerate(ranked)}
     messages = []
-    for number, contact in enumerate(contacts, 1):
-        template = templates[(number - 1) % len(templates)]
+    for index, contact in enumerate(contacts):
+        number = index + 1
+        template_index = variants[index] if ab_mode else index % len(templates)
+        template = templates[template_index]
         try:
             subject, text, body_html = render_template(template, contact)
         except ValueError as exc:
             raise ValueError("{}：{}".format(contact["email"], exc))
         messages.append((number, contact["email"], subject, text, body_html,
-                         template["id"], template["name"], template["version"]))
+                         template["id"], template["name"], template["version"],
+                         "AB"[template_index] if ab_mode else ""))
     return messages
 
 
@@ -564,7 +617,8 @@ def create_contact_campaign(path, owner_email, name, template_id, category="", f
     if category:
         filters["include_category"] = category
     messages = prepare_contact_campaign(path, owner_email, template_id, filters)
-    return create_draft(path, name, messages, owner_email)
+    ab_mode = str(filters.get("ab_mode", "")).lower() in ("1", "true")
+    return create_draft(path, name, messages, owner_email, ab_mode)
 
 
 def send_template_test(path, owner_email, template_id, contact_id, recipient, settings):

@@ -113,6 +113,42 @@ class TemplateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不存在"):
             core.prepare_contact_campaign(self.path, "b@example.com", [first])
 
+    def test_ab_assignments_are_balanced_stable_and_saved(self):
+        owner = "a@example.com"
+        for number in range(7):
+            core.save_contact(self.path, owner, {"email": "buyer{}@example.test".format(number)})
+        first, _ = core.save_template(self.path, owner, "A", "Subject A", "Text A", "<p>A</p>")
+        second, _ = core.save_template(self.path, owner, "B", "Subject B", "Text B", "<p>B</p>")
+        filters = {"ab_mode": "1", "name": "实验一"}
+        preview = core.prepare_contact_campaign(self.path, owner, [first, second], filters)
+        self.assertEqual(preview, core.prepare_contact_campaign(self.path, owner, [first, second], filters))
+        self.assertEqual(sorted(row[8] for row in preview), ["A"] * 4 + ["B"] * 3)
+        batch = core.create_contact_campaign(self.path, owner, "实验一", [first, second], filters=filters)
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT ab_mode FROM batches WHERE id=?", (batch,)).fetchone()[0], 1)
+            rows = db.execute("SELECT recipient_email,template_id,variant FROM messages WHERE batch_id=? ORDER BY row_number",
+                              (batch,)).fetchall()
+        self.assertEqual([(row["recipient_email"], row["variant"]) for row in rows],
+                         [(row[1], row[8]) for row in preview])
+        self.assertTrue(all(row["template_id"] == (first if row["variant"] == "A" else second)
+                            for row in rows))
+        with self.assertRaisesRegex(ValueError, "恰好选择 2"):
+            core.prepare_contact_campaign(self.path, owner, [first], filters)
+
+    def test_ab_click_guidance_waits_for_data_and_is_conservative(self):
+        now = core.utcnow()
+        old = core.iso(now - dt.timedelta(hours=25))
+        recent = core.iso(now - dt.timedelta(hours=2))
+        strong = [{"submitted": 50, "clicked": 30}, {"submitted": 50, "clicked": 5}]
+        self.assertIsNone(core.ab_click_guidance(strong, "active", True, old, now)[0])
+        self.assertIsNone(core.ab_click_guidance(strong, "completed", True, recent, now)[0])
+        self.assertIsNone(core.ab_click_guidance(strong, "completed", False, old, now)[0])
+        self.assertEqual(core.ab_click_guidance(strong, "completed", True, old, now)[0], "A")
+        close = [{"submitted": 50, "clicked": 10}, {"submitted": 50, "clicked": 8}]
+        self.assertIsNone(core.ab_click_guidance(close, "completed", True, old, now)[0])
+        small = [{"submitted": 20, "clicked": 15}, {"submitted": 20, "clicked": 1}]
+        self.assertIsNone(core.ab_click_guidance(small, "completed", True, old, now)[0])
+
     def test_copy_batch_reuses_content_but_resets_delivery_and_checks_blocks(self):
         owner = "a@example.com"
         original = core.create_draft(self.path, "原任务", [
@@ -243,7 +279,7 @@ class TemplateTests(unittest.TestCase):
         with core.connect(old_path) as db:
             columns = [row["name"] for row in db.execute("PRAGMA table_info(messages)")]
             self.assertTrue({"body_html", "template_id", "template_name", "template_version",
-                             "opened_at", "clicked_at"}.issubset(columns))
+                             "opened_at", "clicked_at", "variant"}.issubset(columns))
 
 
 if __name__ == "__main__":
