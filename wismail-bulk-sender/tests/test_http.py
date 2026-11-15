@@ -136,6 +136,17 @@ class HttpFlowTests(unittest.TestCase):
         with core.connect(server.DB_PATH) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM templates").fetchone()[0], 3)
 
+    def test_template_editor_asset_and_source_fallback(self):
+        status, _, page = self.request("GET", "/templates")
+        self.assertEqual(status, 200)
+        self.assertIn(b'data-editor-default="visual"', page)
+        self.assertIn(b'src="editor.js"', page)
+        self.assertIn(b'name="body_html"', page)
+        status, headers, script = self.request("GET", "/editor.js")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/javascript; charset=utf-8")
+        self.assertIn(b"cleanHtml", script)
+
     def test_report_and_event_exports_use_existing_results(self):
         batch = core.create_draft(server.DB_PATH, "=报价", [(1, "buyer@example.com", "报价", "正文")])
         with core.connect(server.DB_PATH) as db:
