@@ -181,7 +181,8 @@ class TemplateTests(unittest.TestCase):
         core.init_db(old_path)
         with core.connect(old_path) as db:
             columns = [row["name"] for row in db.execute("PRAGMA table_info(messages)")]
-            self.assertTrue({"body_html", "template_id", "template_name", "template_version"}.issubset(columns))
+            self.assertTrue({"body_html", "template_id", "template_name", "template_version",
+                             "opened_at", "clicked_at"}.issubset(columns))
 
 
 if __name__ == "__main__":

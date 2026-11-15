@@ -10,6 +10,7 @@ import email
 import email.policy
 import io
 import imaplib
+import ipaddress
 import hashlib
 import hmac
 import html
@@ -23,6 +24,8 @@ import threading
 import uuid
 import zipfile
 from email.message import EmailMessage
+from html.parser import HTMLParser
+from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
 from cryptography.fernet import Fernet
@@ -71,7 +74,9 @@ def init_db(path):
           state TEXT NOT NULL DEFAULT 'draft',
           created_at TEXT NOT NULL,
           start_at TEXT,
-          interval_seconds INTEGER
+          interval_seconds INTEGER,
+          track_open INTEGER NOT NULL DEFAULT 0,
+          track_click INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS messages (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,6 +94,8 @@ def init_db(path):
           attempt_count INTEGER NOT NULL DEFAULT 0,
           last_attempt_at TEXT,
           submitted_at TEXT,
+          opened_at TEXT,
+          clicked_at TEXT,
           replied_at TEXT,
           bounced_at TEXT,
           message_id TEXT UNIQUE,
@@ -190,9 +197,17 @@ def init_db(path):
         batch_columns = [item["name"] for item in db.execute("PRAGMA table_info(batches)")]
         if "owner_email" not in batch_columns:
             db.execute("ALTER TABLE batches ADD COLUMN owner_email TEXT NOT NULL DEFAULT '__legacy_admin__'")
+        for column in ("track_open", "track_click"):
+            if column not in batch_columns:
+                db.execute("ALTER TABLE batches ADD COLUMN {} INTEGER NOT NULL DEFAULT 0".format(column))
         message_columns = [item["name"] for item in db.execute("PRAGMA table_info(messages)")]
         if "body_html" not in message_columns:
             db.execute("ALTER TABLE messages ADD COLUMN body_html TEXT NOT NULL DEFAULT ''")
+        for column in ("opened_at", "clicked_at"):
+            if column not in message_columns:
+                db.execute("ALTER TABLE messages ADD COLUMN {} TEXT".format(column))
+        db.execute("CREATE INDEX IF NOT EXISTS idx_messages_opened_at ON messages(opened_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_messages_clicked_at ON messages(clicked_at)")
         for column, definition in (("template_id", "INTEGER"),
                                    ("template_name", "TEXT NOT NULL DEFAULT ''"),
                                    ("template_version", "INTEGER")):
@@ -347,17 +362,20 @@ def report_data(path, owner_email, start_date, end_date, offset_hours=8):
     offset = dt.timedelta(hours=offset_hours)
     lower = iso((dt.datetime.combine(start_date, dt.time()) - offset).replace(tzinfo=dt.timezone.utc))
     upper = iso((dt.datetime.combine(end_date + dt.timedelta(days=1), dt.time()) - offset).replace(tzinfo=dt.timezone.utc))
-    fields = {"submitted": "submitted_at", "failed": "last_attempt_at",
-              "bounced": "bounced_at", "replied": "replied_at"}
+    fields = {"submitted": "submitted_at", "opened": "opened_at", "clicked": "clicked_at",
+              "failed": "last_attempt_at", "bounced": "bounced_at", "replied": "replied_at"}
     with connect(path) as db:
-        rows = db.execute("""SELECT m.batch_id,b.name,m.status,m.submitted_at,m.last_attempt_at,
-                                   m.bounced_at,m.replied_at FROM messages m JOIN batches b ON b.id=m.batch_id
+        rows = db.execute("""SELECT m.batch_id,b.name,m.status,m.submitted_at,m.opened_at,m.clicked_at,
+                                   m.last_attempt_at,m.bounced_at,m.replied_at
+                            FROM messages m JOIN batches b ON b.id=m.batch_id
                             WHERE b.owner_email=? AND (
                               (m.submitted_at>=? AND m.submitted_at<?) OR
+                              (m.opened_at>=? AND m.opened_at<?) OR
+                              (m.clicked_at>=? AND m.clicked_at<?) OR
                               (m.last_attempt_at>=? AND m.last_attempt_at<?) OR
                               (m.bounced_at>=? AND m.bounced_at<?) OR
                               (m.replied_at>=? AND m.replied_at<?))""",
-                          (owner_email,) + (lower, upper) * 4).fetchall()
+                          (owner_email,) + (lower, upper) * 6).fetchall()
     def empty():
         return {key: 0 for key in fields}
     totals, days, months, batches = empty(), {}, {}, {}
@@ -453,10 +471,12 @@ def select_campaign_contacts(path, owner_email, filters=None):
         raise ValueError("包含分类和排除分类不能相同")
     try:
         sent_days = int(filters.get("exclude_sent_days", 0) or 0)
+        opened_days = int(filters.get("opened_days", 0) or 0)
+        clicked_days = int(filters.get("clicked_days", 0) or 0)
     except (TypeError, ValueError):
-        raise ValueError("重复联系排除天数无效")
-    if not 0 <= sent_days <= 365:
-        raise ValueError("重复联系排除天数需为 0 至 365")
+        raise ValueError("行为筛选天数无效")
+    if any(not 0 <= value <= 365 for value in (sent_days, opened_days, clicked_days)):
+        raise ValueError("行为筛选天数需为 0 至 365")
     query = """SELECT c.* FROM contacts c WHERE c.owner_email=? AND c.status='subscribed' AND c.deleted_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM suppressions s WHERE s.recipient_email=c.email AND s.owner_email IN (c.owner_email,'*'))"""
     params = [owner_email]
@@ -476,6 +496,12 @@ def select_campaign_contacts(path, owner_email, filters=None):
         query += """ AND NOT EXISTS (SELECT 1 FROM messages m JOIN batches b ON b.id=m.batch_id
                      WHERE b.owner_email=c.owner_email AND lower(m.recipient_email)=c.email AND m.submitted_at>=?)"""
         params.append(iso(utcnow() - dt.timedelta(days=sent_days)))
+    for days, column in ((opened_days, "opened_at"), (clicked_days, "clicked_at")):
+        if days:
+            query += """ AND EXISTS (SELECT 1 FROM messages m JOIN batches b ON b.id=m.batch_id
+                         WHERE b.owner_email=c.owner_email AND lower(m.recipient_email)=c.email
+                         AND m.{}>=?)""".format(column)
+            params.append(iso(utcnow() - dt.timedelta(days=days)))
     with connect(path) as db:
         contacts = db.execute(query + " ORDER BY c.id LIMIT ?", params + [MAX_ROWS + 1]).fetchall()
     if not contacts or len(contacts) > MAX_ROWS:
@@ -780,7 +806,8 @@ def verify_mailbox_auth(owner_email, smtp_password, imap_password, settings):
                 pass
 
 
-def schedule_batch(path, batch_id, start_local, interval_seconds, offset_hours=8):
+def schedule_batch(path, batch_id, start_local, interval_seconds, offset_hours=8,
+                   track_open=False, track_click=False):
     if not 60 <= interval_seconds <= 86400:
         raise ValueError("发送间隔需为 60 秒至 24 小时")
     if start_local == "now":
@@ -797,12 +824,14 @@ def schedule_batch(path, batch_id, start_local, interval_seconds, offset_hours=8
         batch = db.execute("SELECT state FROM batches WHERE id=?", (batch_id,)).fetchone()
         if not batch or batch["state"] != "draft":
             raise ValueError("这个批次已启动或不存在")
-        rows = db.execute("SELECT id FROM messages WHERE batch_id=? ORDER BY row_number", (batch_id,)).fetchall()
+        rows = db.execute("SELECT id,body_html FROM messages WHERE batch_id=? ORDER BY row_number", (batch_id,)).fetchall()
+        if (track_open or track_click) and any(not row["body_html"] for row in rows):
+            raise ValueError("打开/点击跟踪只支持全部邮件均有 HTML 正文的批次")
         for index, row in enumerate(rows):
             due = iso(start + dt.timedelta(seconds=index * interval_seconds))
             db.execute("UPDATE messages SET status='queued',scheduled_at=?,next_attempt_at=? WHERE id=?", (due, due, row["id"]))
-        db.execute("UPDATE batches SET state='active',start_at=?,interval_seconds=? WHERE id=?",
-                   (iso(start), interval_seconds, batch_id))
+        db.execute("UPDATE batches SET state='active',start_at=?,interval_seconds=?,track_open=?,track_click=? WHERE id=?",
+                   (iso(start), interval_seconds, int(bool(track_open)), int(bool(track_click)), batch_id))
 
 
 def set_batch_state(path, batch_id, state):
@@ -821,6 +850,139 @@ def cancel_batch(path, batch_id):
         db.execute("UPDATE messages SET status='cancelled' WHERE batch_id=? AND status='queued'", (batch_id,))
 
 
+def tracking_ready(settings):
+    return (settings.get("OAUTH_BASE_URL", "").startswith("https://") and
+            len(settings.get("SESSION_SECRET", "")) >= 32)
+
+
+def _safe_click_target(target):
+    if (not isinstance(target, str) or len(target) > 2048 or "\\" in target or
+            any(char.isspace() or ord(char) < 32 or ord(char) > 126 for char in target)):
+        return False
+    try:
+        parsed = urlparse(target)
+        host = (parsed.hostname or "").rstrip(".").lower()
+        port = parsed.port
+        if parsed.scheme.lower() not in ("http", "https") or not host or "@" in parsed.netloc or port == 0:
+            return False
+        if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+            return False
+        try:
+            return ipaddress.ip_address(host).is_global
+        except ValueError:
+            return "." in host
+    except ValueError:
+        return False
+
+
+def tracking_token(message_id, kind, secret, target=""):
+    if (kind not in ("o", "c") or not secret or (kind == "c" and not _safe_click_target(target))
+            or (kind == "o" and target)):
+        raise ValueError("跟踪链接无效")
+    payload = json.dumps([int(message_id), kind, target], separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(secret.encode("utf-8"), ("track:" + encoded).encode("ascii"), hashlib.sha256).hexdigest()
+    return encoded + "." + signature
+
+
+def verify_tracking_token(token, kind, secret):
+    if not secret or len(token) > 4096 or not re.fullmatch(r"[A-Za-z0-9_-]+\.[0-9a-f]{64}", token):
+        raise ValueError("跟踪链接无效")
+    encoded, signature = token.rsplit(".", 1)
+    expected = hmac.new(secret.encode("utf-8"), ("track:" + encoded).encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError("跟踪链接无效")
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise ValueError("跟踪链接无效")
+    if (not isinstance(payload, list) or len(payload) != 3 or type(payload[0]) is not int or payload[0] < 1
+            or payload[1] != kind or (kind == "c" and not _safe_click_target(payload[2]))
+            or (kind == "o" and payload[2] != "")):
+        raise ValueError("跟踪链接无效")
+    return payload[0], payload[2]
+
+
+def _tracking_url(settings, kind, message_id, target=""):
+    base = settings["OAUTH_BASE_URL"].rstrip("/") + settings.get("URL_PREFIX", "").rstrip("/")
+    token = tracking_token(message_id, kind, settings["SESSION_SECRET"], target)
+    return base + "/track/" + kind + "/" + token + (".gif" if kind == "o" else "")
+
+
+class _TrackedHtml(HTMLParser):
+    def __init__(self, settings, message_id):
+        super(_TrackedHtml, self).__init__(convert_charrefs=False)
+        self.settings, self.message_id, self.parts = settings, message_id, []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a" or not any(key.lower() == "href" and _safe_click_target(value) for key, value in attrs):
+            self.parts.append(self.get_starttag_text())
+            return
+        pieces = []
+        for key, value in attrs:
+            if key.lower() == "href" and _safe_click_target(value):
+                value = _tracking_url(self.settings, "c", self.message_id, value)
+            pieces.append(" " + key + ("" if value is None else '="{}"'.format(html.escape(value, quote=True))))
+        self.parts.append("<" + tag + "".join(pieces) + ">")
+
+    def handle_startendtag(self, tag, attrs):
+        self.parts.append(self.get_starttag_text())
+
+    def handle_endtag(self, tag):
+        self.parts.append("</" + tag + ">")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def handle_entityref(self, name):
+        self.parts.append("&" + name + ";")
+
+    def handle_charref(self, name):
+        self.parts.append("&#" + name + ";")
+
+    def handle_comment(self, data):
+        self.parts.append("<!--" + data + "-->")
+
+    def handle_decl(self, decl):
+        self.parts.append("<!" + decl + ">")
+
+
+def tracked_html(body_html, message_id, settings, track_open, track_click):
+    if track_click:
+        parser = _TrackedHtml(settings, message_id)
+        parser.feed(body_html)
+        parser.close()
+        body_html = "".join(parser.parts)
+    if track_open:
+        pixel = '<img src="{}" width="1" height="1" alt="" style="display:none">'.format(
+            html.escape(_tracking_url(settings, "o", message_id), quote=True))
+        if re.search(r"</body\s*>", body_html, flags=re.I):
+            body_html = re.sub(r"</body\s*>", lambda match: pixel + match.group(0), body_html, count=1, flags=re.I)
+        else:
+            body_html += pixel
+    return body_html
+
+
+def record_tracking_event(path, message_id, kind):
+    if kind not in ("o", "c"):
+        return False
+    field, flag = ("opened_at", "track_open") if kind == "o" else ("clicked_at", "track_click")
+    with connect(path) as db:
+        row = db.execute("""SELECT m.status,m.opened_at,m.clicked_at,b.track_open,b.track_click FROM messages m
+                            JOIN batches b ON b.id=m.batch_id WHERE m.id=?""", (message_id,)).fetchone()
+        if not row or not row[flag] or row["status"] not in ("sending", "submitted"):
+            return False
+        if row[field]:
+            return True
+        now = iso(utcnow())
+        changed = db.execute("UPDATE messages SET {}=? WHERE id=? AND {} IS NULL".format(field, field),
+                             (now, message_id)).rowcount
+        if changed:
+            db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,?,?,?)",
+                       (message_id, "open" if kind == "o" else "click", now, "观测到首次打开" if kind == "o" else "观测到首次点击"))
+    return True
+
+
 def _smtp_submit(row, settings):
     sender = settings["SMTP_FROM"]
     msg = EmailMessage()
@@ -834,7 +996,10 @@ def _smtp_submit(row, settings):
     msg.set_content(row["body"] + ("\n\n不再接收此类邮件：" + link if link else ""))
     if "body_html" in row.keys() and row["body_html"]:
         footer = ('<p>不再接收此类邮件：<a href="{0}">退订</a></p>'.format(html.escape(link, quote=True)) if link else '')
-        msg.add_alternative(row["body_html"] + footer, subtype="html")
+        content = row["body_html"]
+        if "id" in row.keys() and tracking_ready(settings) and (row["track_open"] or row["track_click"]):
+            content = tracked_html(content, row["id"], settings, row["track_open"], row["track_click"])
+        msg.add_alternative(content + footer, subtype="html")
     if link:
         msg["List-Unsubscribe"] = "<{}>".format(link)
     port = int(settings["SMTP_PORT"])
@@ -880,7 +1045,7 @@ def dispatch_one(path, settings):
         offset = int(settings.get("UTC_OFFSET_HOURS", 8))
         local_day = (now + dt.timedelta(hours=offset)).date()
         day_start = dt.datetime.combine(local_day, dt.time()).replace(tzinfo=dt.timezone.utc) - dt.timedelta(hours=offset)
-        candidates = db.execute("""SELECT m.*,b.owner_email FROM messages m JOIN batches b ON b.id=m.batch_id
+        candidates = db.execute("""SELECT m.*,b.owner_email,b.track_open,b.track_click FROM messages m JOIN batches b ON b.id=m.batch_id
                             WHERE m.status='queued' AND b.state='active' AND m.next_attempt_at<=?
                             ORDER BY m.next_attempt_at,m.id LIMIT 100""", (iso(now),)).fetchall()
         row, sender_settings = None, None

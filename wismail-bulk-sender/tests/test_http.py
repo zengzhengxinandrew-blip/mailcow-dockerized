@@ -149,6 +149,43 @@ class HttpFlowTests(unittest.TestCase):
         self.assertEqual([(row["subject"], row["status"]) for row in rows],
                          [("Subject A", "draft"), ("Subject B", "draft")])
 
+    def test_public_tracking_routes_require_valid_token_and_record_once(self):
+        old_secret = server.SETTINGS["SESSION_SECRET"]
+        server.SETTINGS["SESSION_SECRET"] = "tracking-test-secret-with-at-least-32-characters"
+        try:
+            batch = core.create_draft(server.DB_PATH, "tracked", [(1, "buyer@example.com", "Hi", "Text", "<p>HTML</p>")])
+            core.schedule_batch(server.DB_PATH, batch, "now", 60, track_open=True, track_click=True)
+            with core.connect(server.DB_PATH) as db:
+                db.execute("UPDATE messages SET status='submitted',submitted_at=? WHERE batch_id=?",
+                           (core.iso(core.utcnow()), batch))
+                message_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (batch,)).fetchone()[0]
+            secret = server.SETTINGS["SESSION_SECRET"]
+            open_token = core.tracking_token(message_id, "o", secret)
+            click_token = core.tracking_token(message_id, "c", secret, "https://example.com/offer")
+            def public_get(path):
+                conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+                conn.request("GET", path)
+                response = conn.getresponse()
+                result = response.status, dict(response.getheaders()), response.read()
+                conn.close()
+                return result
+            for _ in range(2):
+                status, headers, body = public_get("/track/o/" + open_token + ".gif")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["Content-Type"], "image/gif")
+                self.assertTrue(body.startswith(b"GIF"))
+            status, headers, _ = public_get("/track/c/" + click_token)
+            self.assertEqual(status, 303)
+            self.assertEqual(headers["Location"], "https://example.com/offer")
+            self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+            tampered = open_token[:-1] + ("0" if open_token[-1] != "0" else "1")
+            self.assertEqual(public_get("/track/o/" + tampered + ".gif")[0], 404)
+            with core.connect(server.DB_PATH) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM delivery_events WHERE kind='open'").fetchone()[0], 1)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM delivery_events WHERE kind='click'").fetchone()[0], 1)
+        finally:
+            server.SETTINGS["SESSION_SECRET"] = old_secret
+
 
 if __name__ == "__main__":
     unittest.main()

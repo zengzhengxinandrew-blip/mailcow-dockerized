@@ -25,7 +25,8 @@ from core import (MAX_UPLOAD_BYTES, Worker, add_suppression, cancel_batch, conne
                   parse_contacts_upload, parse_upload, prepare_contact_campaign, render_template, report_data,
                   save_template, send_template_test,
                   revoke_mailbox_auth, save_contact, save_mailbox_auth, schedule_batch,
-                  set_batch_state, set_contact_deleted, set_contact_status, utcnow, verify_mailbox_auth)
+                  set_batch_state, set_contact_deleted, set_contact_status, tracking_ready,
+                  record_tracking_event, verify_tracking_token, utcnow, verify_mailbox_auth)
 from core import unsubscribe_token, verify_unsubscribe_token
 import oauth_login
 from template_xlsx import build_template
@@ -65,6 +66,7 @@ STATUS = {
     "needs_review": "需人工核对", "cancelled": "已取消", "suppressed": "不再联系",
 }
 STATE = {"draft": "待确认", "active": "发送中", "paused": "已暂停", "completed": "已完成", "cancelled": "已取消"}
+TRACKING_PIXEL = base64.b64decode("R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=")
 
 
 def h(value):
@@ -107,11 +109,13 @@ def csrf(user="__legacy_admin__"):
 
 
 def summary_for(db, batch_id):
-    rows = db.execute("SELECT status,submitted_at,replied_at,bounced_at FROM messages WHERE batch_id=?", (batch_id,)).fetchall()
+    rows = db.execute("SELECT status,submitted_at,opened_at,clicked_at,replied_at,bounced_at FROM messages WHERE batch_id=?", (batch_id,)).fetchall()
     return {
         "total": len(rows),
         "queued": sum(x["status"] == "queued" for x in rows),
         "submitted": sum(bool(x["submitted_at"]) for x in rows),
+        "opened": sum(bool(x["opened_at"]) for x in rows),
+        "clicked": sum(bool(x["clicked_at"]) for x in rows),
         "failed": sum(x["status"] in ("failed", "needs_review") for x in rows),
         "suppressed": sum(x["status"] == "suppressed" for x in rows),
         "replied": sum(bool(x["replied_at"]) for x in rows),
@@ -136,8 +140,8 @@ def report_period(start, end):
 def reports_page(user, start="", end=""):
     first, last = report_period(start, end)
     data = report_data(DB_PATH, user, first, last, int(SETTINGS["UTC_OFFSET_HOURS"]))
-    labels = (("submitted", "SMTP 已接受"), ("failed", "发送失败/待核对"),
-              ("bounced", "检测到退信"), ("replied", "检测到回复"))
+    labels = (("submitted", "SMTP 已接受"), ("opened", "观测到打开"), ("clicked", "观测到点击"),
+              ("failed", "发送失败/待核对"), ("bounced", "检测到退信"), ("replied", "检测到回复"))
     summary = ''.join('<div class="stat"><strong>{}</strong><span>{}</span></div>'.format(data["totals"][key], label)
                       for key, label in labels)
     def cells(row):
@@ -149,7 +153,7 @@ def reports_page(user, start="", end=""):
     headings = '<tr><th>维度</th>' + ''.join('<th>{}</th>'.format(label) for _, label in labels) + '</tr>'
     query = 'start={}&amp;end={}'.format(first.isoformat(), last.isoformat())
     content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>统计报表</h1>
-<p>以下数字按所选时区内的事件发生日期统计。SMTP 已接受只代表发信服务器收件；退信和回复依赖 IMAP 检测。失败是当前仍处于失败或待核对状态、且最后一次尝试落在所选日期内的邮件。</p>
+<p>以下数字按所选时区内的事件发生日期统计。SMTP 已接受只代表发信服务器收件；退信和回复依赖 IMAP 检测。打开与点击是带签名链接的首次请求，可能来自图片代理或安全扫描，不代表真人阅读。失败是当前仍处于失败或待核对状态、且最后一次尝试落在所选日期内的邮件。</p>
 <form method="get" action="/reports" class="report-filter"><label>开始日期<input type="date" name="start" value="{start}" required></label><label>结束日期<input type="date" name="end" value="{end}" required></label><button class="button" type="submit">查看报表</button></form>
 <p><a class="text-link" href="/reports/export.csv?{query}">导出报表 CSV ↗</a> <button type="button" class="button secondary print-button" onclick="window.print()">打印或保存 PDF</button></p></section>
 <section class="stats report-stats">{summary}</section>
@@ -157,13 +161,13 @@ def reports_page(user, start="", end=""):
 <section class="panel report-table"><h2>按月份</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{months}</tbody></table></div></section>
 <section class="panel report-table"><h2>按批次</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{batches}</tbody></table></div></section>'''.format(
         start=first.isoformat(), end=last.isoformat(), query=query, summary=summary, headings=headings,
-        days=day_rows or '<tr><td colspan="5">暂无记录</td></tr>',
-        months=month_rows or '<tr><td colspan="5">暂无记录</td></tr>',
-        batches=batch_rows or '<tr><td colspan="5">暂无记录</td></tr>')
+        days=day_rows or '<tr><td colspan="7">暂无记录</td></tr>',
+        months=month_rows or '<tr><td colspan="7">暂无记录</td></tr>',
+        batches=batch_rows or '<tr><td colspan="7">暂无记录</td></tr>')
     return page("统计报表", content, user)
 
 
-EVENT_LABELS = {"attempt": "提交尝试", "submitted": "SMTP 已接受", "retry": "等待重试",
+EVENT_LABELS = {"attempt": "提交尝试", "submitted": "SMTP 已接受", "open": "观测到打开", "click": "观测到点击", "retry": "等待重试",
                 "failed": "发送失败", "needs_review": "需人工核对", "bounce": "检测到退信", "reply": "检测到回复"}
 
 
@@ -321,13 +325,16 @@ def campaigns_page(user, values=None, preview=None, error=""):
 <label>排除分类<select name="exclude_category"><option value="">不排除分类</option>{exclude_categories}</select></label>
 <label>邮箱包含字符<input name="email_contains" maxlength="100" value="{email_contains}" placeholder="例如：@example.com"></label>
 <label>邮箱不包含字符<input name="email_excludes" maxlength="100" value="{email_excludes}" placeholder="例如：test"></label>
-<label>排除最近已提交的联系人（天）<input type="number" name="exclude_sent_days" min="0" max="365" value="{exclude_sent_days}"></label></div>
+<label>排除最近已提交的联系人（天）<input type="number" name="exclude_sent_days" min="0" max="365" value="{exclude_sent_days}"></label>
+<label>最近观测到打开（天，0 为不限）<input type="number" name="opened_days" min="0" max="365" value="{opened_days}"></label>
+<label>最近观测到点击（天，0 为不限）<input type="number" name="clicked_days" min="0" max="365" value="{clicked_days}"></label></div>
 <p class="muted">系统始终排除退订、投诉、无效、回收站和不再联系名单。这里的“已提交”指 SMTP 接受过该邮箱的邮件，不代表最终投递。</p>
 <div class="actions"><button class="button secondary" type="submit" name="mode" value="preview">预览筛选</button><button class="button" type="submit" name="mode" value="create">创建待确认批次</button></div></form></section>{preview}'''.format(
         alert=alert, csrf=csrf(user), name=h(values.get("name", "")), templates=template_options or '<p>还没有模板。请先创建邮件模板。</p>',
         include_categories=category_options("include_category"), exclude_categories=category_options("exclude_category"),
         email_contains=h(values.get("email_contains", "")), email_excludes=h(values.get("email_excludes", "")),
-        exclude_sent_days=h(values.get("exclude_sent_days", "0")), preview=preview_html)
+        exclude_sent_days=h(values.get("exclude_sent_days", "0")),
+        opened_days=h(values.get("opened_days", "0")), clicked_days=h(values.get("clicked_days", "0")), preview=preview_html)
     return page("创建联系人任务", content, user)
 
 
@@ -340,6 +347,8 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
         stats = summary_for(db, batch_id)
         template_stats = db.execute("""SELECT template_name,template_version,COUNT(*) AS total,
                SUM(CASE WHEN submitted_at IS NOT NULL THEN 1 ELSE 0 END) AS submitted,
+               SUM(CASE WHEN opened_at IS NOT NULL THEN 1 ELSE 0 END) AS opened,
+               SUM(CASE WHEN clicked_at IS NOT NULL THEN 1 ELSE 0 END) AS clicked,
                SUM(CASE WHEN bounced_at IS NOT NULL THEN 1 ELSE 0 END) AS bounced,
                SUM(CASE WHEN replied_at IS NOT NULL THEN 1 ELSE 0 END) AS replied
                FROM messages WHERE batch_id=? AND template_id IS NOT NULL
@@ -355,6 +364,7 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
         controls = '''<section class="panel launch"><div><div class="eyebrow">检查完成</div><h2>设置发送计划</h2><p class="muted">启动前请抽查正文、报价与收件人。开始后按顺序逐封发送。</p></div>
 <form method="post" action="/batches/{id}/start">{csrf}<div class="form-grid"><div><label for="start">开始时间（UTC{offset:+d}）</label><input type="datetime-local" id="start" name="start" value="{default}"><label><input type="checkbox" name="immediate" value="1"> 立即开始</label></div>
 <div><label for="interval">每封间隔（秒）</label><input type="number" id="interval" name="interval" min="{minimum}" max="86400" value="120" required></div></div>
+<p class="muted">仅 HTML 邮件可启用。图片代理与安全扫描也可能触发记录。</p><label><input type="checkbox" name="track_open" value="1"> 记录首次打开请求</label><label><input type="checkbox" name="track_click" value="1"> 记录首次链接点击</label>
 <button class="button" type="submit">确认并开始排队</button></form></section>'''.format(
             id=batch_id, csrf=csrf(user), offset=offset, default=default_time, minimum=h(SETTINGS["MIN_INTERVAL_SECONDS"]))
     elif batch["state"] in ("active", "paused"):
@@ -365,6 +375,7 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
             id=batch_id, action=action, csrf=csrf(user), label=label)
     stat_html = "".join('<div class="stat"><strong>{}</strong><span>{}</span></div>'.format(stats[key], label) for key, label in
                         (("total", "总邮件"), ("queued", "待发送"), ("submitted", "已提交"),
+                         ("opened", "观测打开"), ("clicked", "观测点击"),
                          ("failed", "失败或待核对"), ("suppressed", "不再联系"),
                          ("bounced", "检测到退信"), ("replied", "检测到回复")))
     row_html = []
@@ -375,6 +386,10 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
             flags.append('<span class="pill failed">退信</span>')
         if row["replied_at"]:
             flags.append('<span class="pill replied">已回复</span>')
+        if row["opened_at"]:
+            flags.append('<span class="pill replied">观测打开</span>')
+        if row["clicked_at"]:
+            flags.append('<span class="pill replied">观测点击</span>')
         row_html.append('''<tr><td class="row-no">{no}</td><td><strong>{email}</strong><div class="muted">{subject}</div>{template}<details><summary>查看正文</summary><pre>{body}</pre></details></td>
 <td><span class="pill {raw_status}">{status}</span> {flags}</td><td>{scheduled}</td><td>{submitted}</td><td class="error-text">{error}</td></tr>'''.format(
             no=row["row_number"], email=h(row["recipient_email"]), subject=h(row["subject"]),
@@ -384,24 +399,28 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
             scheduled=local_time(row["scheduled_at"]), submitted=local_time(row["submitted_at"]),
             error=h(row["last_error"] or "—")))
     account = mailbox_settings(DB_PATH, user, SETTINGS)
+    tracking_state = (" · 记录打开：{} · 记录点击：{}".format("开" if batch["track_open"] else "关",
+                                                      "开" if batch["track_click"] else "关")
+                      if batch["state"] != "draft" else "")
     event_rows = ''.join('''<tr><td>{time}</td><td>{number}</td><td>{kind}</td><td>{code}</td><td>{detail}</td><td>{suggestion}</td></tr>'''.format(
         time=local_time(item["observed_at"]), number=item["row_number"],
         kind=h(EVENT_LABELS.get(item["kind"], item["kind"])), code=h(item["smtp_code"] or "—"),
         detail=h(item["detail"]), suggestion=h(event_suggestion(item["kind"], item["smtp_code"]))) for item in events)
     template_summary = ''
     if template_stats:
-        template_rows = ''.join('<tr><td>{} · v{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        template_rows = ''.join('<tr><td>{} · v{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
             h(item["template_name"]), h(item["template_version"]), item["total"], item["submitted"],
-            item["bounced"], item["replied"]) for item in template_stats)
-        template_summary = '''<section class="list-section"><h2>轮用模板结果</h2><p class="muted">已提交只代表 SMTP 接受；退信和回复依赖 IMAP 记录。</p>
-<div class="table-wrap"><table><thead><tr><th>模板</th><th>总邮件</th><th>已提交</th><th>退信</th><th>回复</th></tr></thead><tbody>{}</tbody></table></div></section>'''.format(template_rows)
-    content = '''<nav class="back"><a href="/">← 返回批次列表</a></nav><section class="batch-head"><div><div class="eyebrow">批次 #{id} · {state}</div><h1>{name}</h1><p class="muted">创建于 {created} · 发件账号 {sender}</p></div><a class="text-link" href="/batches/{id}/export.csv">导出明细 CSV ↗</a></section>
+            item["opened"], item["clicked"], item["bounced"], item["replied"]) for item in template_stats)
+        template_summary = '''<section class="list-section"><h2>轮用模板结果</h2><p class="muted">打开/点击为首次请求观测值，可能包含代理或安全扫描；已提交只代表 SMTP 接受。</p>
+<div class="table-wrap"><table><thead><tr><th>模板</th><th>总邮件</th><th>已提交</th><th>观测打开</th><th>观测点击</th><th>退信</th><th>回复</th></tr></thead><tbody>{}</tbody></table></div></section>'''.format(template_rows)
+    content = '''<nav class="back"><a href="/">← 返回批次列表</a></nav><section class="batch-head"><div><div class="eyebrow">批次 #{id} · {state}</div><h1>{name}</h1><p class="muted">创建于 {created} · 发件账号 {sender}{tracking_state}</p></div><a class="text-link" href="/batches/{id}/export.csv">导出明细 CSV ↗</a></section>
 {alert}<section class="stats">{stats}</section>{controls}{template_summary}<section class="list-section"><div class="section-heading"><h2>逐封结果</h2><span class="muted">已提交表示发信服务器已接受，不代表进入收件箱。</span></div>
 <div class="table-wrap"><table><thead><tr><th>行</th><th>邮件</th><th>状态</th><th>计划时间</th><th>提交时间</th><th>原因</th></tr></thead><tbody>{rows}</tbody></table></div></section>
 <section class="list-section"><div class="section-heading"><h2>发送日志</h2><a class="text-link" href="/batches/{id}/events.csv">导出全部日志 CSV ↗</a></div><p class="muted">显示最近 30 条；部署此功能后产生的新事件才会记录。SMTP 返回码及建议仅供排查，具体原因以服务器返回信息为准。</p>
 <div class="table-wrap"><table><thead><tr><th>时间</th><th>行</th><th>事件</th><th>SMTP 码</th><th>详情</th><th>建议</th></tr></thead><tbody>{events}</tbody></table></div></section>'''.format(
         id=batch_id, state=STATE.get(batch["state"], batch["state"]), name=h(batch["name"]),
         created=local_time(batch["created_at"]), sender=h(account["SMTP_FROM"] if account else "未配置"),
+        tracking_state=h(tracking_state),
         alert=alert, stats=stat_html, controls=controls, template_summary=template_summary, rows="".join(row_html),
         events=event_rows or '<tr><td colspan="6">暂无新日志，既有邮件仍可查看逐封状态。</td></tr>')
     return page(batch["name"], content, user)
@@ -453,7 +472,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "same-origin")
+        if not extra or "Referrer-Policy" not in extra:
+            self.send_header("Referrer-Policy", "same-origin")
         if extra:
             for key, value in extra.items():
                 self.send_header(key, value)
@@ -504,6 +524,24 @@ class Handler(BaseHTTPRequestHandler):
         path = self._route_path()
         if path is None:
             self._send(404, "页面不存在")
+            return
+        tracking = re.fullmatch(r"/track/(o|c)/([A-Za-z0-9_-]+\.[0-9a-f]{64})(\.gif)?", path)
+        if tracking:
+            kind, token, extension = tracking.groups()
+            if (kind == "o") != bool(extension):
+                self._send(404, "链接无效")
+                return
+            try:
+                message_id, destination = verify_tracking_token(token, kind, SETTINGS["SESSION_SECRET"])
+                if not record_tracking_event(DB_PATH, message_id, kind):
+                    raise ValueError("链接无效")
+            except ValueError:
+                self._send(404, "链接无效")
+                return
+            if kind == "o":
+                self._send(200, TRACKING_PIXEL, "image/gif", {"Referrer-Policy": "no-referrer"})
+            else:
+                self._send(303, b"", extra={"Location": destination, "Referrer-Policy": "no-referrer"})
             return
         if path == "/unsubscribe":
             token = parse_qs(urlparse(self.path).query).get("token", [""])[0]
@@ -565,13 +603,13 @@ class Handler(BaseHTTPRequestHandler):
                     data = report_data(DB_PATH, self.current_user, first, last, int(SETTINGS["UTC_OFFSET_HOURS"]))
                     output = io.StringIO()
                     writer = csv.writer(output)
-                    writer.writerow(["维度", "日期/批次", "SMTP 已接受", "发送失败/待核对", "检测到退信", "检测到回复"])
+                    writer.writerow(["维度", "日期/批次", "SMTP 已接受", "观测到打开", "观测到点击", "发送失败/待核对", "检测到退信", "检测到回复"])
                     for kind, rows in (("日期", data["days"]), ("月份", data["months"])):
                         for label, values in rows:
-                            writer.writerow([kind, label] + [values[key] for key in ("submitted", "failed", "bounced", "replied")])
+                            writer.writerow([kind, label] + [values[key] for key in ("submitted", "opened", "clicked", "failed", "bounced", "replied")])
                     for values in data["batches"]:
                         writer.writerow(["批次", csv_safe(values["name"])] +
-                                        [values[key] for key in ("submitted", "failed", "bounced", "replied")])
+                                        [values[key] for key in ("submitted", "opened", "clicked", "failed", "bounced", "replied")])
                     self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
                                {"Content-Disposition": 'attachment; filename="wismail-reports.csv"'})
             except ValueError as exc:
@@ -645,14 +683,14 @@ class Handler(BaseHTTPRequestHandler):
                 with connect(DB_PATH) as db:
                     batch = db.execute("SELECT id FROM batches WHERE id=? AND owner_email=?", (batch_id, self.current_user)).fetchone()
                     rows = db.execute("""SELECT row_number,recipient_email,subject,template_name,template_version,
-                                               status,scheduled_at,submitted_at,bounced_at,replied_at,last_error
+                                               status,scheduled_at,submitted_at,opened_at,clicked_at,bounced_at,replied_at,last_error
                                         FROM messages WHERE batch_id=? ORDER BY row_number""", (batch_id,)).fetchall() if batch else None
                 if rows is None:
                     self._send(404, "批次不存在")
                     return
                 output = io.StringIO()
                 writer = csv.writer(output)
-                writer.writerow(["表格行号", "收件邮箱", "邮件主题", "模板名称", "模板版本", "状态", "计划时间(UTC)", "提交时间(UTC)", "退信时间(UTC)", "回复时间(UTC)", "原因"])
+                writer.writerow(["表格行号", "收件邮箱", "邮件主题", "模板名称", "模板版本", "状态", "计划时间(UTC)", "提交时间(UTC)", "首次打开请求(UTC)", "首次点击(UTC)", "退信时间(UTC)", "回复时间(UTC)", "原因"])
                 for row in rows:
                     writer.writerow([csv_safe(value) for value in row])
                 self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
@@ -730,7 +768,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/campaigns":
                 values = {key: form.getfirst(key, "") for key in
                           ("name", "include_category", "exclude_category", "email_contains",
-                           "email_excludes", "exclude_sent_days")}
+                           "email_excludes", "exclude_sent_days", "opened_days", "clicked_days")}
                 values["template_ids"] = form.getlist("template_id")
                 try:
                     if form.getfirst("mode", "") == "preview":
@@ -799,8 +837,13 @@ class Handler(BaseHTTPRequestHandler):
                 interval = int(form.getfirst("interval", "0"))
                 if interval < int(SETTINGS["MIN_INTERVAL_SECONDS"]):
                     raise ValueError("发送间隔小于服务器允许的最短间隔")
+                track_open = form.getfirst("track_open", "") == "1"
+                track_click = form.getfirst("track_click", "") == "1"
+                if (track_open or track_click) and not tracking_ready(SETTINGS):
+                    raise ValueError("跟踪需要 HTTPS 网站地址和至少 32 位的签名密钥")
                 start = "now" if form.getfirst("immediate", "") == "1" else form.getfirst("start", "")
-                schedule_batch(DB_PATH, batch_id, start, interval, int(SETTINGS["UTC_OFFSET_HOURS"]))
+                schedule_batch(DB_PATH, batch_id, start, interval, int(SETTINGS["UTC_OFFSET_HOURS"]),
+                               track_open, track_click)
             elif action == "pause":
                 set_batch_state(DB_PATH, batch_id, "paused")
             elif action == "resume":
