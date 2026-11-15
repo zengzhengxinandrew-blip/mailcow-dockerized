@@ -123,6 +123,41 @@ def summary_for(db, batch_id):
     }
 
 
+def batch_flow_html(batch, rows):
+    counts = {status: sum(row["status"] == status for row in rows)
+              for status in ("draft", "queued", "sending", "submitted", "failed",
+                             "needs_review", "suppressed", "cancelled")}
+    processed = sum(counts[status] for status in ("submitted", "failed", "needs_review", "suppressed", "cancelled"))
+    total = len(rows)
+    percent = round(100 * processed / total) if total else 0
+    latest_submit = max((row["submitted_at"] for row in rows if row["submitted_at"]), default=None)
+    state = batch["state"]
+    if state == "draft":
+        plan = "尚未启动；核对内容后设置发送时间和速度。"
+    else:
+        plan = "计划起点 {}；每封间隔 {} 秒；当前排队 {} 封，其中待重试 {} 封。".format(
+            local_time(batch["start_at"]), batch["interval_seconds"], counts["queued"],
+            sum(row["status"] == "queued" and row["attempt_count"] > 0 for row in rows))
+    smtp = "已提交 {} 封；失败 {} 封；需人工核对 {} 封；正在提交 {} 封。最近提交：{}。".format(
+        counts["submitted"], counts["failed"], counts["needs_review"], counts["sending"],
+        local_time(latest_submit))
+    feedback = "检测到退信 {} 封、回复 {} 封；观测打开 {} 封、点击 {} 封。".format(
+        sum(bool(row["bounced_at"]) for row in rows), sum(bool(row["replied_at"]) for row in rows),
+        sum(bool(row["opened_at"]) for row in rows), sum(bool(row["clicked_at"]) for row in rows))
+    steps = (("草稿检查", "创建于 {}；共 {} 封。".format(local_time(batch["created_at"]), total)),
+             ("计划排队", plan), ("SMTP 提交", smtp), ("后续反馈", feedback))
+    current = 0 if state == "draft" else (1 if state == "paused" else (2 if state == "active" else 3))
+    items = "".join('''<li class="flow-step {kind}"><span class="flow-number">{number}</span>
+<div><strong>{title}</strong><p>{detail}</p></div></li>'''.format(
+        kind="current" if index == current else "", number=index + 1, title=title, detail=h(detail))
+        for index, (title, detail) in enumerate(steps))
+    return '''<section class="panel batch-flow" aria-label="发送流程"><div class="flow-heading"><div><h2>发送流程</h2><p class="muted">批次状态：{state}。已处理包含提交、失败、需核对、不再联系和取消；提交仅表示发信服务器接受。</p></div>
+<strong>{processed}/{total} · {percent}%</strong></div><progress value="{processed}" max="{maximum}">{percent}%</progress>
+<ol class="flow-steps">{items}</ol><p class="muted">退信和回复取决于 IMAP 检测；打开和点击仅在启用跟踪时显示观测值。发送时间可能因邮箱和批次限速而晚于计划。</p></section>'''.format(
+        state=h(STATE.get(state, state)), processed=processed, total=total, percent=percent,
+        maximum=max(total, 1), items=items)
+
+
 def report_period(start, end):
     today = (utcnow() + dt.timedelta(hours=int(SETTINGS["UTC_OFFSET_HOURS"]))).date()
     if not start and not end:
@@ -462,14 +497,15 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
             title='A/B 对比' if batch["ab_mode"] else '轮用模板结果', intro=intro,
             guidance=guidance, rows=template_rows)
     content = '''<nav class="back"><a href="/">← 返回批次列表</a></nav><section class="batch-head"><div><div class="eyebrow">批次 #{id} · {state}</div><h1>{name}</h1><p class="muted">创建于 {created} · 发件账号 {sender}{tracking_state}</p></div><a class="text-link" href="/batches/{id}/export.csv">导出明细 CSV ↗</a></section>
-{alert}<section class="stats">{stats}</section>{controls}{copy_controls}{template_summary}<section class="list-section"><div class="section-heading"><h2>逐封结果</h2><span class="muted">已提交表示发信服务器已接受，不代表进入收件箱。</span></div>
+{alert}<section class="stats">{stats}</section>{flow}{controls}{copy_controls}{template_summary}<section class="list-section"><div class="section-heading"><h2>逐封结果</h2><span class="muted">已提交表示发信服务器已接受，不代表进入收件箱。</span></div>
 <div class="table-wrap"><table><thead><tr><th>行</th><th>邮件</th><th>状态</th><th>计划时间</th><th>提交时间</th><th>原因</th></tr></thead><tbody>{rows}</tbody></table></div></section>
 <section class="list-section"><div class="section-heading"><h2>发送日志</h2><a class="text-link" href="/batches/{id}/events.csv">导出全部日志 CSV ↗</a></div><p class="muted">显示最近 30 条；部署此功能后产生的新事件才会记录。SMTP 返回码及建议仅供排查，具体原因以服务器返回信息为准。</p>
 <div class="table-wrap"><table><thead><tr><th>时间</th><th>行</th><th>事件</th><th>SMTP 码</th><th>详情</th><th>建议</th></tr></thead><tbody>{events}</tbody></table></div></section>'''.format(
         id=batch_id, state=STATE.get(batch["state"], batch["state"]), name=h(batch["name"]),
         created=local_time(batch["created_at"]), sender=h(account["SMTP_FROM"] if account else "未配置"),
         tracking_state=h(tracking_state + reply_state + hourly_state),
-        alert=alert, stats=stat_html, controls=controls, copy_controls=copy_controls,
+        alert=alert, stats=stat_html, flow=batch_flow_html(batch, rows),
+        controls=controls, copy_controls=copy_controls,
         template_summary=template_summary, rows="".join(row_html),
         events=event_rows or '<tr><td colspan="6">暂无新日志，既有邮件仍可查看逐封状态。</td></tr>')
     return page(batch["name"], content, user)

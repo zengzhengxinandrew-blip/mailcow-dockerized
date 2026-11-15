@@ -208,6 +208,35 @@ class HttpFlowTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/batches/{}/events.csv".format(other))[0], 404)
         self.assertEqual(self.request("GET", "/reports?start=2026-11-16&end=2026-11-15")[0], 400)
 
+    def test_batch_flow_shows_progress_without_claiming_delivery(self):
+        batch = core.create_draft(server.DB_PATH, "发送流程", [
+            (number, "buyer{}@example.test".format(number), "主题", "正文") for number in range(1, 5)])
+        status, _, draft = self.request("GET", "/batches/{}".format(batch))
+        self.assertEqual(status, 200)
+        self.assertIn("发送流程".encode("utf-8"), draft)
+        self.assertIn(b"0/4", draft)
+        self.assertIn("尚未启动".encode("utf-8"), draft)
+        now = core.iso(core.utcnow())
+        with core.connect(server.DB_PATH) as db:
+            db.execute("UPDATE batches SET state='active',start_at=?,interval_seconds=120 WHERE id=?", (now, batch))
+            db.execute("UPDATE messages SET status='queued',scheduled_at=? WHERE batch_id=?", (now, batch))
+            db.execute("UPDATE messages SET status='submitted',submitted_at=? WHERE batch_id=? AND row_number=1", (now, batch))
+            db.execute("UPDATE messages SET status='failed' WHERE batch_id=? AND row_number=2", (batch,))
+            db.execute("UPDATE messages SET status='needs_review' WHERE batch_id=? AND row_number=3", (batch,))
+        status, _, active = self.request("GET", "/batches/{}".format(batch))
+        self.assertEqual(status, 200)
+        self.assertIn(b"3/4", active)
+        self.assertIn("需人工核对 1 封".encode("utf-8"), active)
+        self.assertIn("当前排队 1 封".encode("utf-8"), active)
+        self.assertNotIn("投递成功".encode("utf-8"), active)
+        with core.connect(server.DB_PATH) as db:
+            db.execute("UPDATE batches SET state='cancelled' WHERE id=?", (batch,))
+            db.execute("UPDATE messages SET status='cancelled' WHERE batch_id=? AND status='queued'", (batch,))
+        status, _, cancelled = self.request("GET", "/batches/{}".format(batch))
+        self.assertEqual(status, 200)
+        self.assertIn(b"4/4", cancelled)
+        self.assertIn("批次状态：已取消".encode("utf-8"), cancelled)
+
     def test_campaign_preview_does_not_create_or_send(self):
         owner = "__legacy_admin__"
         for address in ("first@example.com", "second@example.com"):
