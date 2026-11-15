@@ -355,6 +355,24 @@ def create_draft(path, name, messages, owner_email="__legacy_admin__"):
     return batch_id
 
 
+def copy_batch(path, owner_email, source_id, name):
+    """Copy the original content into a new draft, then recheck sending blocks."""
+    with connect(path) as db:
+        source = db.execute("SELECT name FROM batches WHERE id=? AND owner_email=?",
+                            (source_id, owner_email)).fetchone()
+        if not source:
+            raise ValueError("批次不存在")
+        rows = db.execute("""SELECT row_number,recipient_email,subject,body,body_html,
+                                   template_id,template_name,template_version
+                            FROM messages WHERE batch_id=? ORDER BY row_number""", (source_id,)).fetchall()
+    if not rows:
+        raise ValueError("原批次没有可复制的邮件")
+    if len(rows) > MAX_ROWS:
+        raise ValueError("原批次超过单批邮件上限")
+    messages = [tuple(row) for row in rows]
+    return create_draft(path, name.strip() or source["name"] + "（副本）", messages, owner_email)
+
+
 def report_data(path, owner_email, start_date, end_date, offset_hours=8):
     """Counts distinct messages by the local date of each observed event."""
     if start_date > end_date or (end_date - start_date).days >= 366:

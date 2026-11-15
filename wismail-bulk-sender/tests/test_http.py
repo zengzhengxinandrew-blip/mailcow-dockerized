@@ -105,6 +105,20 @@ class HttpFlowTests(unittest.TestCase):
         self.assertEqual(batch["state"], "draft")
         self.assertEqual(tuple(message), (1, "draft", "Hello Buyer", "<p>Buyer</p>"))
 
+    def test_copy_batch_route_creates_draft_and_rejects_other_owner(self):
+        source = core.create_draft(server.DB_PATH, "旧任务", [(1, "buyer@example.com", "主题", "正文")])
+        form = urlencode({"csrf": server.CSRF_TOKEN, "name": "再次发送前检查"})
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        status, response_headers, _ = self.request("POST", "/batches/{}/copy".format(source), form, headers)
+        self.assertEqual((status, response_headers["Location"]), (303, "/batches/2"))
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT state FROM batches WHERE id=2").fetchone()[0], "draft")
+        other = core.create_draft(server.DB_PATH, "他人任务", [(1, "other@example.com", "标题", "正文")],
+                                  "other@example.com")
+        self.assertEqual(self.request("POST", "/batches/{}/copy".format(other), form, headers)[0], 404)
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM batches").fetchone()[0], 3)
+
     def test_report_and_event_exports_use_existing_results(self):
         batch = core.create_draft(server.DB_PATH, "=报价", [(1, "buyer@example.com", "报价", "正文")])
         with core.connect(server.DB_PATH) as db:

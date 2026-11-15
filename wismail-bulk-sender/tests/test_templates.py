@@ -97,6 +97,33 @@ class TemplateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不存在"):
             core.prepare_contact_campaign(self.path, "b@example.com", [first])
 
+    def test_copy_batch_reuses_content_but_resets_delivery_and_checks_blocks(self):
+        owner = "a@example.com"
+        original = core.create_draft(self.path, "原任务", [
+            (1, "first@example.com", "标题", "正文", "<p>正文</p>", 12, "模板", 3),
+            (2, "second@example.com", "标题二", "正文二")], owner)
+        core.schedule_batch(self.path, original, "now", 60, track_open=False)
+        with core.connect(self.path) as db:
+            db.execute("UPDATE messages SET status='submitted',submitted_at=?,attempt_count=2 WHERE batch_id=? AND row_number=1",
+                       (core.iso(core.utcnow()), original))
+        copied = core.copy_batch(self.path, owner, original, "复制任务")
+        with core.connect(self.path) as db:
+            batch = db.execute("SELECT * FROM batches WHERE id=?", (copied,)).fetchone()
+            rows = db.execute("SELECT * FROM messages WHERE batch_id=? ORDER BY row_number", (copied,)).fetchall()
+        self.assertEqual((batch["name"], batch["state"], batch["start_at"], batch["track_open"]),
+                         ("复制任务", "draft", None, 0))
+        self.assertEqual((rows[0]["subject"], rows[0]["body_html"], rows[0]["template_version"]),
+                         ("标题", "<p>正文</p>", 3))
+        self.assertEqual((rows[0]["status"], rows[0]["submitted_at"], rows[0]["attempt_count"]),
+                         ("draft", None, 0))
+        with self.assertRaisesRegex(ValueError, "批次不存在"):
+            core.copy_batch(self.path, "b@example.com", original, "越权")
+        core.add_suppression(self.path, "second@example.com", owner_email=owner)
+        with self.assertRaisesRegex(ValueError, "不再联系名单"):
+            core.copy_batch(self.path, owner, original, "应被拒绝")
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM batches").fetchone()[0], 2)
+
     def test_template_page_renders_escaped_content(self):
         old = server.DB_PATH
         server.DB_PATH = self.path

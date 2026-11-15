@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 from cryptography.fernet import Fernet
 
-from core import (MAX_UPLOAD_BYTES, Worker, add_suppression, cancel_batch, connect, create_draft,
+from core import (MAX_UPLOAD_BYTES, Worker, add_suppression, cancel_batch, connect, copy_batch, create_draft,
                   create_contact_campaign, get_template, import_contacts, init_db, mailbox_settings,
                   parse_contacts_upload, parse_upload, prepare_contact_campaign, render_template, report_data,
                   save_template, send_template_test,
@@ -373,6 +373,9 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
         controls = '''<div class="actions"><form method="post" action="/batches/{id}/{action}">{csrf}<button class="button secondary">{label}</button></form>
 <form method="post" action="/batches/{id}/cancel">{csrf}<button class="button subtle" onclick="return confirm('取消后，待发送邮件不会再发出。确定取消？')">取消剩余邮件</button></form></div>'''.format(
             id=batch_id, action=action, csrf=csrf(user), label=label)
+    copy_controls = '''<section class="panel"><h2>复制为新任务</h2><p class="muted">复制收件人、主题和正文为待确认草稿；不会沿用发送时间、发送状态或跟踪设置。复制时重新检查退订、投诉、无效地址、回收站和不再联系名单；如有禁止发送的地址，复制将被拒绝，可重新筛选联系人创建任务。</p>
+<form method="post" action="/batches/{id}/copy">{csrf}<label>新批次名称</label><input name="name" maxlength="120" value="{name}" required><button class="button secondary" type="submit">复制并检查</button></form></section>'''.format(
+        id=batch_id, csrf=csrf(user), name=h(batch["name"] + "（副本）"))
     stat_html = "".join('<div class="stat"><strong>{}</strong><span>{}</span></div>'.format(stats[key], label) for key, label in
                         (("total", "总邮件"), ("queued", "待发送"), ("submitted", "已提交"),
                          ("opened", "观测打开"), ("clicked", "观测点击"),
@@ -414,14 +417,15 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
         template_summary = '''<section class="list-section"><h2>轮用模板结果</h2><p class="muted">打开/点击为首次请求观测值，可能包含代理或安全扫描；已提交只代表 SMTP 接受。</p>
 <div class="table-wrap"><table><thead><tr><th>模板</th><th>总邮件</th><th>已提交</th><th>观测打开</th><th>观测点击</th><th>退信</th><th>回复</th></tr></thead><tbody>{}</tbody></table></div></section>'''.format(template_rows)
     content = '''<nav class="back"><a href="/">← 返回批次列表</a></nav><section class="batch-head"><div><div class="eyebrow">批次 #{id} · {state}</div><h1>{name}</h1><p class="muted">创建于 {created} · 发件账号 {sender}{tracking_state}</p></div><a class="text-link" href="/batches/{id}/export.csv">导出明细 CSV ↗</a></section>
-{alert}<section class="stats">{stats}</section>{controls}{template_summary}<section class="list-section"><div class="section-heading"><h2>逐封结果</h2><span class="muted">已提交表示发信服务器已接受，不代表进入收件箱。</span></div>
+{alert}<section class="stats">{stats}</section>{controls}{copy_controls}{template_summary}<section class="list-section"><div class="section-heading"><h2>逐封结果</h2><span class="muted">已提交表示发信服务器已接受，不代表进入收件箱。</span></div>
 <div class="table-wrap"><table><thead><tr><th>行</th><th>邮件</th><th>状态</th><th>计划时间</th><th>提交时间</th><th>原因</th></tr></thead><tbody>{rows}</tbody></table></div></section>
 <section class="list-section"><div class="section-heading"><h2>发送日志</h2><a class="text-link" href="/batches/{id}/events.csv">导出全部日志 CSV ↗</a></div><p class="muted">显示最近 30 条；部署此功能后产生的新事件才会记录。SMTP 返回码及建议仅供排查，具体原因以服务器返回信息为准。</p>
 <div class="table-wrap"><table><thead><tr><th>时间</th><th>行</th><th>事件</th><th>SMTP 码</th><th>详情</th><th>建议</th></tr></thead><tbody>{events}</tbody></table></div></section>'''.format(
         id=batch_id, state=STATE.get(batch["state"], batch["state"]), name=h(batch["name"]),
         created=local_time(batch["created_at"]), sender=h(account["SMTP_FROM"] if account else "未配置"),
         tracking_state=h(tracking_state),
-        alert=alert, stats=stat_html, controls=controls, template_summary=template_summary, rows="".join(row_html),
+        alert=alert, stats=stat_html, controls=controls, copy_controls=copy_controls,
+        template_summary=template_summary, rows="".join(row_html),
         events=event_rows or '<tr><td colspan="6">暂无新日志，既有邮件仍可查看逐封状态。</td></tr>')
     return page(batch["name"], content, user)
 
@@ -820,7 +824,7 @@ class Handler(BaseHTTPRequestHandler):
                 batch_id = create_draft(DB_PATH, form.getfirst("name", ""), messages, self.current_user)
                 self._redirect("/batches/{}".format(batch_id))
                 return
-            match = re.match(r"^/batches/(\d+)/(start|pause|resume|cancel)$", path)
+            match = re.match(r"^/batches/(\d+)/(start|pause|resume|cancel|copy)$", path)
             if not match:
                 self._send(404, "操作不存在")
                 return
@@ -829,6 +833,10 @@ class Handler(BaseHTTPRequestHandler):
                 owned = db.execute("SELECT 1 FROM batches WHERE id=? AND owner_email=?", (batch_id, self.current_user)).fetchone()
             if not owned:
                 self._send(404, "批次不存在")
+                return
+            if action == "copy":
+                new_id = copy_batch(DB_PATH, self.current_user, batch_id, form.getfirst("name", ""))
+                self._redirect("/batches/{}".format(new_id))
                 return
             if action == "start":
                 account = mailbox_settings(DB_PATH, self.current_user, SETTINGS)
