@@ -83,6 +83,28 @@ class HttpFlowTests(unittest.TestCase):
         with core.connect(server.DB_PATH) as db:
             self.assertEqual(db.execute("SELECT status FROM messages").fetchone()["status"], "draft")
 
+    def test_contact_template_campaign_stays_draft(self):
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        contact = urlencode({"csrf": server.CSRF_TOKEN, "email": "buyer@example.com", "name": "Buyer", "categories": "德国"})
+        self.assertEqual(self.request("POST", "/contacts/add", contact, headers)[0], 303)
+        template = urlencode({"csrf": server.CSRF_TOKEN, "name": "问候", "subject": "Hello {{姓名}}",
+                              "body_text": "To {{邮箱}}", "body_html": "<p>{{姓名}}</p>"})
+        status, result_headers, _ = self.request("POST", "/templates/save", template, headers)
+        self.assertEqual(status, 303)
+        self.assertEqual(result_headers["Location"], "/templates?id=1")
+        status, _, page = self.request("GET", "/templates?id=1&contact_id=1")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Hello Buyer", page)
+        campaign = urlencode({"csrf": server.CSRF_TOKEN, "name": "德国问候", "template_id": "1", "category": "德国"})
+        status, result_headers, _ = self.request("POST", "/campaigns/from-contacts", campaign, headers)
+        self.assertEqual(status, 303)
+        self.assertEqual(result_headers["Location"], "/batches/1")
+        with core.connect(server.DB_PATH) as db:
+            batch = db.execute("SELECT state FROM batches").fetchone()
+            message = db.execute("SELECT row_number,status,subject,body_html FROM messages").fetchone()
+        self.assertEqual(batch["state"], "draft")
+        self.assertEqual(tuple(message), (1, "draft", "Hello Buyer", "<p>Buyer</p>"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ import io
 import imaplib
 import hashlib
 import hmac
+import html
 import json
 import os
 import re
@@ -144,10 +145,38 @@ def init_db(path):
           category_id INTEGER NOT NULL REFERENCES contact_categories(id) ON DELETE CASCADE,
           PRIMARY KEY(contact_id,category_id)
         );
+        CREATE TABLE IF NOT EXISTS templates (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          owner_email TEXT NOT NULL,
+          name TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS template_versions (
+          template_id INTEGER NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+          version INTEGER NOT NULL,
+          subject TEXT NOT NULL,
+          body_text TEXT NOT NULL,
+          body_html TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(template_id,version)
+        );
+        CREATE TABLE IF NOT EXISTS template_test_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          template_id INTEGER NOT NULL REFERENCES templates(id),
+          owner_email TEXT NOT NULL,
+          recipient_email TEXT NOT NULL,
+          status TEXT NOT NULL,
+          detail TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
         """)
         batch_columns = [item["name"] for item in db.execute("PRAGMA table_info(batches)")]
         if "owner_email" not in batch_columns:
             db.execute("ALTER TABLE batches ADD COLUMN owner_email TEXT NOT NULL DEFAULT '__legacy_admin__'")
+        message_columns = [item["name"] for item in db.execute("PRAGMA table_info(messages)")]
+        if "body_html" not in message_columns:
+            db.execute("ALTER TABLE messages ADD COLUMN body_html TEXT NOT NULL DEFAULT ''")
         suppression_columns = [item["name"] for item in db.execute("PRAGMA table_info(suppressions)")]
         if "owner_email" not in suppression_columns:
             db.execute("ALTER TABLE suppressions RENAME TO suppressions_legacy")
@@ -267,7 +296,8 @@ def parse_upload(filename, data):
 def create_draft(path, name, messages, owner_email="__legacy_admin__"):
     with connect(path) as db:
         blocked = []
-        for row_number, recipient, _, _ in messages:
+        for message in messages:
+            row_number, recipient = message[:2]
             if db.execute("SELECT 1 FROM suppressions WHERE recipient_email=? AND owner_email IN (?, '*')",
                           (recipient.lower(), owner_email)).fetchone():
                 blocked.append("第 {} 行：{} 已在不再联系名单".format(row_number, recipient))
@@ -278,9 +308,116 @@ def create_draft(path, name, messages, owner_email="__legacy_admin__"):
         cur = db.execute("INSERT INTO batches(owner_email,name,state,created_at) VALUES (?,?,?,?)",
                          (owner_email, name[:120] or "未命名批次", "draft", iso(utcnow())))
         batch_id = cur.lastrowid
-        db.executemany("INSERT INTO messages(batch_id,row_number,recipient_email,subject,body) VALUES (?,?,?,?,?)",
-                       [(batch_id,) + row for row in messages])
+        db.executemany("INSERT INTO messages(batch_id,row_number,recipient_email,subject,body,body_html) VALUES (?,?,?,?,?,?)",
+                       [(batch_id,) + tuple(row[:4]) + (row[4] if len(row) > 4 else "",) for row in messages])
     return batch_id
+
+
+VARIABLE_RE = re.compile(r"\{\{([^{}]+)\}\}")
+
+
+def save_template(path, owner_email, name, subject, body_text, body_html="", template_id=None):
+    name, subject, body_text, body_html = [str(value or "").strip() for value in (name, subject, body_text, body_html)]
+    if not name or len(name) > 120 or not subject or len(subject) > 998 or "\n" in subject:
+        raise ValueError("模板名称或主题无效")
+    if not body_text or len(body_text) > 100000 or len(body_html) > 200000:
+        raise ValueError("请填写纯文本正文，且不要超过长度限制")
+    now = iso(utcnow())
+    with connect(path) as db:
+        if template_id:
+            row = db.execute("SELECT id FROM templates WHERE id=? AND owner_email=?", (template_id, owner_email)).fetchone()
+            if not row:
+                raise ValueError("模板不存在")
+            db.execute("UPDATE templates SET name=?,updated_at=? WHERE id=?", (name, now, template_id))
+        else:
+            template_id = db.execute("INSERT INTO templates(owner_email,name,created_at,updated_at) VALUES (?,?,?,?)",
+                                     (owner_email, name, now, now)).lastrowid
+        version = db.execute("SELECT COALESCE(MAX(version),0)+1 AS n FROM template_versions WHERE template_id=?",
+                             (template_id,)).fetchone()["n"]
+        db.execute("INSERT INTO template_versions(template_id,version,subject,body_text,body_html,created_at) VALUES (?,?,?,?,?,?)",
+                   (template_id, version, subject, body_text, body_html, now))
+    return template_id, version
+
+
+def get_template(path, owner_email, template_id, version=None):
+    with connect(path) as db:
+        row = db.execute("""SELECT t.id,t.name,v.version,v.subject,v.body_text,v.body_html,v.created_at
+                            FROM templates t JOIN template_versions v ON v.template_id=t.id
+                            WHERE t.id=? AND t.owner_email=? AND v.version=COALESCE(?,
+                            (SELECT MAX(version) FROM template_versions WHERE template_id=t.id))""",
+                         (template_id, owner_email, version)).fetchone()
+    if not row:
+        raise ValueError("模板不存在")
+    return dict(row)
+
+
+def render_template(template, contact):
+    fields = {"邮箱": contact["email"], "姓名": contact["name"], "性别": contact["gender"],
+              "生日": contact["birthday"], "手机": contact["phone"], "地区": contact["region"]}
+    fields.update({"变量" + str(i): json.loads(contact["custom_json"]).get("custom_" + str(i), "")
+                   for i in range(1, 11)})
+    def replace(match, escape=False):
+        key = match.group(1).strip()
+        if key not in fields or not fields[key]:
+            raise ValueError("模板变量未填写：" + key)
+        value = str(fields[key])
+        return html.escape(value, quote=True) if escape else value
+    subject = VARIABLE_RE.sub(lambda match: replace(match), template["subject"])
+    if "\r" in subject or "\n" in subject or len(subject) > 998:
+        raise ValueError("展开后的邮件主题无效")
+    text = VARIABLE_RE.sub(lambda match: replace(match), template["body_text"])
+    body_html = VARIABLE_RE.sub(lambda match: replace(match, True), template["body_html"])
+    return subject, text, body_html
+
+
+def create_contact_campaign(path, owner_email, name, template_id, category=""):
+    template = get_template(path, owner_email, template_id)
+    query = """SELECT c.* FROM contacts c WHERE c.owner_email=? AND c.status='subscribed' AND c.deleted_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM suppressions s WHERE s.recipient_email=c.email AND s.owner_email IN (c.owner_email,'*'))"""
+    params = [owner_email]
+    if category:
+        query += " AND EXISTS (SELECT 1 FROM contact_category_links l JOIN contact_categories g ON g.id=l.category_id WHERE l.contact_id=c.id AND g.owner_email=? AND g.name=?)"
+        params += [owner_email, category]
+    with connect(path) as db:
+        contacts = db.execute(query + " ORDER BY c.id LIMIT ?", params + [MAX_ROWS + 1]).fetchall()
+    if not contacts or len(contacts) > MAX_ROWS:
+        raise ValueError("筛选结果为空或超过每批 1000 人")
+    messages = []
+    for number, contact in enumerate(contacts, 1):
+        try:
+            subject, text, body_html = render_template(template, contact)
+        except ValueError as exc:
+            raise ValueError("{}：{}".format(contact["email"], exc))
+        messages.append((number, contact["email"], subject, text, body_html))
+    return create_draft(path, name, messages, owner_email)
+
+
+def send_template_test(path, owner_email, template_id, contact_id, recipient, settings):
+    account = mailbox_settings(path, owner_email, settings)
+    if not account or not all(account.get(key) for key in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM")):
+        raise ValueError("请先配置发件授权")
+    recipient = recipient.strip().lower()
+    if recipient != account["SMTP_FROM"].lower():
+        raise ValueError("测试邮件只能发送给当前发件邮箱")
+    with connect(path) as db:
+        contact = db.execute("SELECT * FROM contacts WHERE id=? AND owner_email=?", (contact_id, owner_email)).fetchone()
+    if not contact:
+        raise ValueError("请选择用于变量预览的联系人")
+    subject, text, body_html = render_template(get_template(path, owner_email, template_id), contact)
+    row = {"owner_email": owner_email, "recipient_email": recipient, "subject": "[测试] " + subject,
+           "body": text, "body_html": body_html}
+    try:
+        detail = _smtp_submit(row, account)
+        status = "submitted"
+    except Exception as exc:
+        status = "failed"
+        detail = str(exc).replace(account["SMTP_PASSWORD"], "[redacted]")[:300]
+    with connect(path) as db:
+        db.execute("INSERT INTO template_test_logs(template_id,owner_email,recipient_email,status,detail,created_at) VALUES (?,?,?,?,?,?)",
+                   (template_id, owner_email, recipient, status, detail, iso(utcnow())))
+    if status == "failed":
+        raise ValueError("测试邮件提交失败，请查看测试记录")
+    return detail
 
 
 def add_suppression(path, recipient, reason="手动添加", owner_email="__legacy_admin__"):
@@ -525,13 +662,16 @@ def verify_mailbox_auth(owner_email, smtp_password, imap_password, settings):
 def schedule_batch(path, batch_id, start_local, interval_seconds, offset_hours=8):
     if not 60 <= interval_seconds <= 86400:
         raise ValueError("发送间隔需为 60 秒至 24 小时")
-    try:
-        local = dt.datetime.strptime(start_local, "%Y-%m-%dT%H:%M")
-    except ValueError:
-        raise ValueError("发送时间格式无效")
-    start = (local - dt.timedelta(hours=offset_hours)).replace(tzinfo=dt.timezone.utc)
-    if start < utcnow() - dt.timedelta(minutes=1):
-        raise ValueError("开始时间不能早于当前时间")
+    if start_local == "now":
+        start = utcnow()
+    else:
+        try:
+            local = dt.datetime.strptime(start_local, "%Y-%m-%dT%H:%M")
+        except ValueError:
+            raise ValueError("发送时间格式无效")
+        start = (local - dt.timedelta(hours=offset_hours)).replace(tzinfo=dt.timezone.utc)
+        if start < utcnow() - dt.timedelta(minutes=1):
+            raise ValueError("开始时间不能早于当前时间")
     with connect(path) as db:
         batch = db.execute("SELECT state FROM batches WHERE id=?", (batch_id,)).fetchone()
         if not batch or batch["state"] != "draft":
@@ -571,6 +711,9 @@ def _smtp_submit(row, settings):
     msg["Message-ID"] = message_id
     link = unsubscribe_url(settings, row["owner_email"], row["recipient_email"]) if "owner_email" in row.keys() else ""
     msg.set_content(row["body"] + ("\n\n不再接收此类邮件：" + link if link else ""))
+    if "body_html" in row.keys() and row["body_html"]:
+        footer = ('<p>不再接收此类邮件：<a href="{0}">退订</a></p>'.format(html.escape(link, quote=True)) if link else '')
+        msg.add_alternative(row["body_html"] + footer, subtype="html")
     if link:
         msg["List-Unsubscribe"] = "<{}>".format(link)
     port = int(settings["SMTP_PORT"])
@@ -632,6 +775,11 @@ def dispatch_one(path, settings):
             sent_today = db.execute("""SELECT COUNT(*) AS n FROM messages m JOIN batches b ON b.id=m.batch_id
                                        WHERE b.owner_email=? AND m.submitted_at>=?""", (owner, iso(day_start))).fetchone()["n"]
             if sent_today >= int(settings.get("DAILY_LIMIT", 100)):
+                continue
+            hour_start = iso(now - dt.timedelta(hours=1))
+            sent_hour = db.execute("""SELECT COUNT(*) AS n FROM messages m JOIN batches b ON b.id=m.batch_id
+                                      WHERE b.owner_email=? AND m.submitted_at>=?""", (owner, hour_start)).fetchone()["n"]
+            if sent_hour >= int(settings.get("HOURLY_LIMIT", 20)):
                 continue
             row, sender_settings = candidate, account
             break

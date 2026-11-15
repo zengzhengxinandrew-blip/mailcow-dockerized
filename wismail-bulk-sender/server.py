@@ -21,7 +21,8 @@ from urllib.parse import parse_qs, urlparse
 from cryptography.fernet import Fernet
 
 from core import (MAX_UPLOAD_BYTES, Worker, add_suppression, cancel_batch, connect, create_draft,
-                  import_contacts, init_db, mailbox_settings, parse_contacts_upload, parse_upload,
+                  create_contact_campaign, get_template, import_contacts, init_db, mailbox_settings,
+                  parse_contacts_upload, parse_upload, render_template, save_template, send_template_test,
                   revoke_mailbox_auth, save_contact, save_mailbox_auth, schedule_batch,
                   set_batch_state, set_contact_deleted, set_contact_status, utcnow, verify_mailbox_auth)
 from core import unsubscribe_token, verify_unsubscribe_token
@@ -46,6 +47,7 @@ SETTINGS = {
     "IMAP_USER": os.getenv("WISMAIL_IMAP_USER", ""),
     "IMAP_PASSWORD": os.getenv("WISMAIL_IMAP_PASSWORD", ""),
     "DAILY_LIMIT": os.getenv("WISMAIL_DAILY_LIMIT", "100"),
+    "HOURLY_LIMIT": os.getenv("WISMAIL_HOURLY_LIMIT", "20"),
     "MIN_INTERVAL_SECONDS": os.getenv("WISMAIL_MIN_INTERVAL_SECONDS", "60"),
     "UTC_OFFSET_HOURS": os.getenv("WISMAIL_UTC_OFFSET_HOURS", "8"),
     "CREDENTIAL_KEY": os.getenv("WISMAIL_CREDENTIAL_KEY", ""),
@@ -87,7 +89,7 @@ def page(title, content, user=""):
     account_link = ('<span class="top-meta">{}</span><a class="top-account" href="/account">发件授权</a>'
                     '<a class="top-account" href="/logout">退出</a>'.format(h(user)) if oauth_login.configured(SETTINGS) and user
                     else '<span class="top-meta">外贸邮件工作台 / V2</span>')
-    account_link = '<a class="top-account" href="/contacts">联系人</a>' + account_link
+    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a>' + account_link
     markup = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Wismail</title>
 <link rel="stylesheet" href="/static.css"></head><body>
@@ -139,13 +141,13 @@ def dashboard(error="", user="__legacy_admin__"):
 <label for="name">批次名称</label><input id="name" name="name" maxlength="120" placeholder="例如：11 月德国客户报价跟进" required>
 <label for="file">已填好的邮件文件</label><input id="file" name="file" type="file" accept=".xlsx,.csv" required>
 <button class="button" type="submit">上传并检查</button></form></section>
-<section class="panel side"><div class="panel-title"><span class="step">02</span><h2>检查后再发送</h2></div><ol class="process"><li>检查邮箱、主题、正文和重复邮件</li><li>逐封预览，设置开始时间与发送间隔</li><li>启动后查看提交、失败、退信和回复</li></ol><div class="config">{status}<small>默认每日上限 {limit} 封，最短发送间隔 {interval} 秒。退信和回复需要配置 IMAP。</small></div></section></div>
+<section class="panel side"><div class="panel-title"><span class="step">02</span><h2>检查后再发送</h2></div><ol class="process"><li>检查邮箱、主题、正文和重复邮件</li><li>逐封预览，设置开始时间与发送间隔</li><li>启动后查看提交、失败、退信和回复</li></ol><div class="config">{status}<small>每日上限 {limit} 封，每小时上限 {hourly} 封，最短发送间隔 {interval} 秒。退信和回复需要配置 IMAP。</small></div></section></div>
 <section class="list-section"><div class="section-heading"><h2>发送批次</h2><span class="muted">最近 50 个</span></div><div class="batch-list">{batches}</div></section>
 <section class="panel suppression"><div><div class="eyebrow">发送保护</div><h2>不再联系名单 <small>共 {suppression_count} 个</small></h2><p class="muted">客户要求停止联系时，先将邮箱加入这里。已排队但未发送的邮件也会被跳过。</p></div>
 <div><form method="post" action="/suppressions">{csrf}<label for="suppression-email">添加邮箱</label><div class="inline-form"><input id="suppression-email" type="email" name="email" placeholder="buyer@example.com" required><button class="button" type="submit">加入名单</button></div></form>
 <div class="suppression-list">{suppressions}</div></div></section>'''.format(
         alert=alert, csrf=csrf(user), status=status, limit=h(SETTINGS["DAILY_LIMIT"]),
-        interval=h(SETTINGS["MIN_INTERVAL_SECONDS"]),
+        interval=h(SETTINGS["MIN_INTERVAL_SECONDS"]), hourly=h(SETTINGS["HOURLY_LIMIT"]),
         batches="".join(cards) if cards else '<div class="empty">还没有发送批次。下载模板，填好第一批邮件后上传。</div>',
         suppression_count=suppression_count,
         suppressions="".join('<div><span>{}</span><small>{}</small></div>'.format(h(x["recipient_email"]), local_time(x["created_at"])) for x in suppressions) if suppressions else '<p class="muted">名单为空</p>')
@@ -189,6 +191,44 @@ def contacts_page(user, error="", search="", status="", category="", recycle=Fal
     return page("联系人", content, user)
 
 
+def templates_page(user, error="", selected_id=0, selected_version=None, preview_contact_id=0):
+    with connect(DB_PATH) as db:
+        templates = db.execute("SELECT * FROM templates WHERE owner_email=? ORDER BY updated_at DESC,id DESC", (user,)).fetchall()
+        contacts = db.execute("SELECT id,email,name FROM contacts WHERE owner_email=? AND status='subscribed' AND deleted_at IS NULL ORDER BY id DESC LIMIT 200", (user,)).fetchall()
+        categories = db.execute("SELECT name FROM contact_categories WHERE owner_email=? ORDER BY name", (user,)).fetchall()
+        versions = db.execute("SELECT version,created_at FROM template_versions WHERE template_id=? ORDER BY version DESC", (selected_id,)).fetchall() if selected_id else []
+        tests = db.execute("SELECT status,created_at FROM template_test_logs WHERE template_id=? AND owner_email=? ORDER BY id DESC LIMIT 10", (selected_id, user)).fetchall() if selected_id else []
+        contact = db.execute("SELECT * FROM contacts WHERE id=? AND owner_email=?", (preview_contact_id, user)).fetchone() if preview_contact_id else None
+    selected = get_template(DB_PATH, user, selected_id, selected_version) if selected_id else None
+    list_html = ''.join('<li><a href="/templates?id={id}">{name} · v{version}</a></li>'.format(
+        id=row["id"], name=h(row["name"]), version=h(get_template(DB_PATH, user, row["id"])["version"])) for row in templates)
+    version_html = ''.join('<a href="/templates?id={}&version={}">v{} · {}</a> '.format(selected_id, row["version"], row["version"], local_time(row["created_at"])) for row in versions)
+    contact_options = ''.join('<option value="{}" {}>{}</option>'.format(row["id"], 'selected' if preview_contact_id == row["id"] else '', h(row["email"])) for row in contacts)
+    category_options = ''.join('<option value="{0}">{0}</option>'.format(h(row["name"])) for row in categories)
+    test_logs = ''.join('<li>{} · {}</li>'.format(local_time(row["created_at"]), h(row["status"])) for row in tests)
+    account = mailbox_settings(DB_PATH, user, SETTINGS)
+    test_recipient = account.get("SMTP_FROM", "") if account else (user if "@" in user else "")
+    preview = ''
+    if selected and contact:
+        try:
+            subject, text, body_html = render_template(selected, contact)
+            preview = '<section class="panel"><h2>变量预览 · {}</h2><strong>{}</strong><pre>{}</pre><details><summary>HTML 源码预览</summary><pre>{}</pre></details></section>'.format(
+                h(contact["email"]), h(subject), h(text), h(body_html))
+        except ValueError as exc:
+            preview = '<div class="alert">{}</div>'.format(h(exc))
+    alert = '<div class="alert">{}</div>'.format(h(error)) if error else ''
+    content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>邮件模板</h1>{alert}<p>模板按邮箱账号隔离；每次保存产生新版本，已创建的批次保留当时的邮件内容。</p><ul>{list_html}</ul><a href="/templates">新建模板</a></section>
+<section class="panel"><h2>{heading}</h2><form method="post" action="/templates/save">{csrf}<input type="hidden" name="id" value="{id}"><label>模板名称</label><input name="name" maxlength="120" value="{name}" required><label>主题</label><input name="subject" maxlength="998" value="{subject}" required><label>纯文本正文</label><textarea name="body_text" rows="9" required>{text}</textarea><label>HTML 正文（可选）</label><textarea name="body_html" rows="9">{html}</textarea><p>可用变量：{{{{邮箱}}}}、{{{{姓名}}}}、{{{{性别}}}}、{{{{生日}}}}、{{{{手机}}}}、{{{{地区}}}}、{{{{变量1}}}} 至 {{{{变量10}}}}。缺值时停止创建批次。</p><button class="button" type="submit">保存为新版本</button></form><p>历史版本：{versions}</p></section>
+{preview}<section class="panel"><h2>预览与创建批次</h2><p>先保存模板，再选一个联系人预览变量；创建批次后仍需在批次页面明确启动发送。</p><form method="get" action="/templates"><input type="hidden" name="id" value="{id}"><select name="contact_id"><option value="">选择预览联系人</option>{contacts}</select><button type="submit">预览</button></form><form method="post" action="/campaigns/from-contacts">{csrf}<input type="hidden" name="template_id" value="{id}"><label>批次名称</label><input name="name" maxlength="120" required><label>联系人分类</label><select name="category"><option value="">全部可发送联系人</option>{categories}</select><button class="button" type="submit" {disabled}>创建待确认批次</button></form></section>
+<section class="panel"><h2>发送测试</h2><p>这是一次真实 SMTP 提交，只允许发到你自己的发件邮箱。请先核对模板内容和收件邮箱。</p><form method="post" action="/templates/test">{csrf}<input type="hidden" name="template_id" value="{id}"><label>测试收件邮箱</label><input type="email" name="recipient" value="{test_recipient}" required><label>用于变量展开的联系人</label><select name="contact_id" required><option value="">请选择</option>{contacts}</select><label><input type="checkbox" name="confirm_test" value="1" required> 我确认发送这一封测试邮件</label><button type="submit" {disabled}>发送测试</button></form><p>最近测试记录：</p><ul>{test_logs}</ul></section>'''.format(
+        alert=alert, list_html=list_html, heading='编辑模板' if selected else '新建模板', csrf=csrf(user),
+        id=selected_id or '', name=h(selected["name"] if selected else ''), subject=h(selected["subject"] if selected else ''),
+        text=h(selected["body_text"] if selected else ''), html=h(selected["body_html"] if selected else ''),
+        versions=version_html, preview=preview, contacts=contact_options, categories=category_options,
+        disabled='' if selected else 'disabled', test_recipient=h(test_recipient), test_logs=test_logs)
+    return page("邮件模板", content, user)
+
+
 def batch_page(batch_id, error="", user="__legacy_admin__"):
     with connect(DB_PATH) as db:
         batch = db.execute("SELECT * FROM batches WHERE id=? AND owner_email=?", (batch_id, user)).fetchone()
@@ -202,7 +242,7 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
     controls = ""
     if batch["state"] == "draft":
         controls = '''<section class="panel launch"><div><div class="eyebrow">检查完成</div><h2>设置发送计划</h2><p class="muted">启动前请抽查正文、报价与收件人。开始后按顺序逐封发送。</p></div>
-<form method="post" action="/batches/{id}/start">{csrf}<div class="form-grid"><div><label for="start">开始时间（UTC{offset:+d}）</label><input type="datetime-local" id="start" name="start" value="{default}" required></div>
+<form method="post" action="/batches/{id}/start">{csrf}<div class="form-grid"><div><label for="start">开始时间（UTC{offset:+d}）</label><input type="datetime-local" id="start" name="start" value="{default}"><label><input type="checkbox" name="immediate" value="1"> 立即开始</label></div>
 <div><label for="interval">每封间隔（秒）</label><input type="number" id="interval" name="interval" min="{minimum}" max="86400" value="120" required></div></div>
 <button class="button" type="submit">确认并开始排队</button></form></section>'''.format(
             id=batch_id, csrf=csrf(user), offset=offset, default=default_time, minimum=h(SETTINGS["MIN_INTERVAL_SECONDS"]))
@@ -384,6 +424,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/":
             self._send(200, dashboard(user=self.current_user))
+        elif path == "/templates":
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                body = templates_page(self.current_user,
+                                      selected_id=int(query.get("id", ["0"])[0] or "0"),
+                                      selected_version=int(query["version"][0]) if query.get("version") else None,
+                                      preview_contact_id=int(query.get("contact_id", ["0"])[0] or "0"))
+            except ValueError:
+                self._send(404, "模板不存在")
+                return
+            self._send(200, body)
         elif path == "/contacts":
             query = parse_qs(urlparse(self.path).query)
             self._send(200, contacts_page(self.current_user, search=query.get("q", [""])[0],
@@ -493,6 +544,25 @@ class Handler(BaseHTTPRequestHandler):
                 add_suppression(DB_PATH, form.getfirst("email", ""), owner_email=self.current_user)
                 self._redirect("/")
                 return
+            if path == "/templates/save":
+                template_id, _ = save_template(DB_PATH, self.current_user, form.getfirst("name", ""),
+                                               form.getfirst("subject", ""), form.getfirst("body_text", ""),
+                                               form.getfirst("body_html", ""), int(form.getfirst("id", "0") or "0"))
+                self._redirect("/templates?id={}".format(template_id))
+                return
+            if path == "/campaigns/from-contacts":
+                batch_id = create_contact_campaign(DB_PATH, self.current_user, form.getfirst("name", ""),
+                                                   int(form.getfirst("template_id", "0")), form.getfirst("category", ""))
+                self._redirect("/batches/{}".format(batch_id))
+                return
+            if path == "/templates/test":
+                if form.getfirst("confirm_test", "") != "1":
+                    raise ValueError("请明确确认发送测试邮件")
+                template_id = int(form.getfirst("template_id", "0"))
+                send_template_test(DB_PATH, self.current_user, template_id,
+                                   int(form.getfirst("contact_id", "0")), form.getfirst("recipient", ""), SETTINGS)
+                self._redirect("/templates?id={}".format(template_id))
+                return
             if path == "/contacts/add":
                 save_contact(DB_PATH, self.current_user, {key: form.getfirst(key, "") for key in ("email", "name", "categories")})
                 self._redirect("/contacts")
@@ -538,7 +608,8 @@ class Handler(BaseHTTPRequestHandler):
                 interval = int(form.getfirst("interval", "0"))
                 if interval < int(SETTINGS["MIN_INTERVAL_SECONDS"]):
                     raise ValueError("发送间隔小于服务器允许的最短间隔")
-                schedule_batch(DB_PATH, batch_id, form.getfirst("start", ""), interval, int(SETTINGS["UTC_OFFSET_HOURS"]))
+                start = "now" if form.getfirst("immediate", "") == "1" else form.getfirst("start", "")
+                schedule_batch(DB_PATH, batch_id, start, interval, int(SETTINGS["UTC_OFFSET_HOURS"]))
             elif action == "pause":
                 set_batch_state(DB_PATH, batch_id, "paused")
             elif action == "resume":
@@ -547,6 +618,9 @@ class Handler(BaseHTTPRequestHandler):
                 cancel_batch(DB_PATH, batch_id)
             self._redirect("/batches/{}".format(batch_id))
         except (ValueError, KeyError) as exc:
+            if path in ("/templates/save", "/templates/test", "/campaigns/from-contacts"):
+                self._send(400, templates_page(self.current_user, str(exc)))
+                return
             if path.startswith("/contacts"):
                 self._send(400, contacts_page(self.current_user, str(exc)))
                 return
@@ -577,7 +651,7 @@ def main():
             raise SystemExit("WISMAIL_CREDENTIAL_KEY 格式无效；请使用 Fernet.generate_key() 生成")
     elif not ADMIN_PASSWORD or len(ADMIN_PASSWORD) < 12:
         raise SystemExit("请设置至少 12 位的 WISMAIL_ADMIN_PASSWORD")
-    if int(SETTINGS["DAILY_LIMIT"]) < 1 or int(SETTINGS["MIN_INTERVAL_SECONDS"]) < 1:
+    if int(SETTINGS["DAILY_LIMIT"]) < 1 or int(SETTINGS["HOURLY_LIMIT"]) < 1 or int(SETTINGS["MIN_INTERVAL_SECONDS"]) < 1:
         raise SystemExit("发信上限和发送间隔必须为正数")
     init_db(DB_PATH)
     worker = Worker(DB_PATH, SETTINGS)
