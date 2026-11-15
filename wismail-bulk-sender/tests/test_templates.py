@@ -52,6 +52,51 @@ class TemplateTests(unittest.TestCase):
         with core.connect(self.path) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM batches").fetchone()[0], 0)
 
+    def test_campaign_filters_exclusions_and_literal_email_characters(self):
+        owner = "a@example.com"
+        for address, category in (("sale_1@example.com", "德国"), ("saleX1@example.com", "德国"),
+                                  ("sale_2@example.com", "德国,排除"), ("sale_3@example.com", "德国")):
+            core.save_contact(self.path, owner, {"email": address, "categories": category})
+        core.save_contact(self.path, "b@example.com", {"email": "sale_4@example.com", "categories": "德国"})
+        with core.connect(self.path) as db:
+            db.execute("UPDATE contacts SET status='unsubscribed' WHERE owner_email=? AND email=?",
+                       (owner, "sale_3@example.com"))
+        contacts = core.select_campaign_contacts(self.path, owner,
+                                                  {"include_category": "德国", "exclude_category": "排除",
+                                                   "email_contains": "sale_", "email_excludes": "nomatch"})
+        self.assertEqual([row["email"] for row in contacts], ["sale_1@example.com"])
+
+    def test_recently_submitted_contact_is_excluded(self):
+        owner = "a@example.com"
+        for address in ("old@example.com", "new@example.com"):
+            core.save_contact(self.path, owner, {"email": address})
+        batch = core.create_draft(self.path, "older", [(1, "old@example.com", "Hello", "Body")], owner)
+        with core.connect(self.path) as db:
+            db.execute("UPDATE messages SET status='submitted',submitted_at=? WHERE batch_id=?",
+                       (core.iso(core.utcnow()), batch))
+        contacts = core.select_campaign_contacts(self.path, owner, {"exclude_sent_days": "30"})
+        self.assertEqual([row["email"] for row in contacts], ["new@example.com"])
+
+    def test_multiple_templates_rotate_and_keep_snapshot(self):
+        owner = "a@example.com"
+        for address in ("a@example.test", "b@example.test", "c@example.test"):
+            core.save_contact(self.path, owner, {"email": address})
+        first, _ = core.save_template(self.path, owner, "模板 A", "主题 A", "正文 A")
+        second, _ = core.save_template(self.path, owner, "模板 B", "主题 B", "正文 B")
+        batch = core.create_contact_campaign(self.path, owner, "轮流发送", [first, second])
+        with core.connect(self.path) as db:
+            rows = db.execute("SELECT row_number,subject,template_name,template_version FROM messages WHERE batch_id=? ORDER BY row_number",
+                              (batch,)).fetchall()
+        self.assertEqual([(row["subject"], row["template_name"]) for row in rows],
+                         [("主题 A", "模板 A"), ("主题 B", "模板 B"), ("主题 A", "模板 A")])
+        self.assertEqual([row["template_version"] for row in rows], [1, 1, 1])
+        core.save_template(self.path, owner, "模板 A", "新版", "新版正文", template_id=first)
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT subject FROM messages WHERE batch_id=? ORDER BY row_number LIMIT 1",
+                                        (batch,)).fetchone()[0], "主题 A")
+        with self.assertRaisesRegex(ValueError, "不存在"):
+            core.prepare_contact_campaign(self.path, "b@example.com", [first])
+
     def test_template_page_renders_escaped_content(self):
         old = server.DB_PATH
         server.DB_PATH = self.path
@@ -135,7 +180,8 @@ class TemplateTests(unittest.TestCase):
                 replied_at TEXT, bounced_at TEXT, message_id TEXT, last_error TEXT)""")
         core.init_db(old_path)
         with core.connect(old_path) as db:
-            self.assertIn("body_html", [row["name"] for row in db.execute("PRAGMA table_info(messages)")])
+            columns = [row["name"] for row in db.execute("PRAGMA table_info(messages)")]
+            self.assertTrue({"body_html", "template_id", "template_name", "template_version"}.issubset(columns))
 
 
 if __name__ == "__main__":

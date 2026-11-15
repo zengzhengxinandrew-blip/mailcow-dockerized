@@ -80,6 +80,9 @@ def init_db(path):
           recipient_email TEXT NOT NULL,
           subject TEXT NOT NULL,
           body TEXT NOT NULL,
+          template_id INTEGER,
+          template_name TEXT NOT NULL DEFAULT '',
+          template_version INTEGER,
           status TEXT NOT NULL DEFAULT 'draft',
           scheduled_at TEXT,
           next_attempt_at TEXT,
@@ -190,6 +193,11 @@ def init_db(path):
         message_columns = [item["name"] for item in db.execute("PRAGMA table_info(messages)")]
         if "body_html" not in message_columns:
             db.execute("ALTER TABLE messages ADD COLUMN body_html TEXT NOT NULL DEFAULT ''")
+        for column, definition in (("template_id", "INTEGER"),
+                                   ("template_name", "TEXT NOT NULL DEFAULT ''"),
+                                   ("template_version", "INTEGER")):
+            if column not in message_columns:
+                db.execute("ALTER TABLE messages ADD COLUMN {} {}".format(column, definition))
         suppression_columns = [item["name"] for item in db.execute("PRAGMA table_info(suppressions)")]
         if "owner_email" not in suppression_columns:
             db.execute("ALTER TABLE suppressions RENAME TO suppressions_legacy")
@@ -324,8 +332,11 @@ def create_draft(path, name, messages, owner_email="__legacy_admin__"):
         cur = db.execute("INSERT INTO batches(owner_email,name,state,created_at) VALUES (?,?,?,?)",
                          (owner_email, name[:120] or "未命名批次", "draft", iso(utcnow())))
         batch_id = cur.lastrowid
-        db.executemany("INSERT INTO messages(batch_id,row_number,recipient_email,subject,body,body_html) VALUES (?,?,?,?,?,?)",
-                       [(batch_id,) + tuple(row[:4]) + (row[4] if len(row) > 4 else "",) for row in messages])
+        db.executemany("""INSERT INTO messages(batch_id,row_number,recipient_email,subject,body,body_html,
+                           template_id,template_name,template_version) VALUES (?,?,?,?,?,?,?,?,?)""",
+                       [(batch_id,) + tuple(row[:4]) + (row[4] if len(row) > 4 else "",
+                        row[5] if len(row) > 5 else None, row[6] if len(row) > 6 else "",
+                        row[7] if len(row) > 7 else None) for row in messages])
     return batch_id
 
 
@@ -426,25 +437,79 @@ def render_template(template, contact):
     return subject, text, body_html
 
 
-def create_contact_campaign(path, owner_email, name, template_id, category=""):
-    template = get_template(path, owner_email, template_id)
+def _like_literal(value):
+    return "%" + value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def select_campaign_contacts(path, owner_email, filters=None):
+    filters = dict(filters or {})
+    included = str(filters.get("include_category", "") or "").strip()
+    excluded = str(filters.get("exclude_category", "") or "").strip()
+    contains = str(filters.get("email_contains", "") or "").strip().lower()
+    excludes = str(filters.get("email_excludes", "") or "").strip().lower()
+    if any(len(value) > 100 for value in (included, excluded, contains, excludes)):
+        raise ValueError("筛选条件不能超过 100 个字符")
+    if included and included == excluded:
+        raise ValueError("包含分类和排除分类不能相同")
+    try:
+        sent_days = int(filters.get("exclude_sent_days", 0) or 0)
+    except (TypeError, ValueError):
+        raise ValueError("重复联系排除天数无效")
+    if not 0 <= sent_days <= 365:
+        raise ValueError("重复联系排除天数需为 0 至 365")
     query = """SELECT c.* FROM contacts c WHERE c.owner_email=? AND c.status='subscribed' AND c.deleted_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM suppressions s WHERE s.recipient_email=c.email AND s.owner_email IN (c.owner_email,'*'))"""
     params = [owner_email]
-    if category:
+    if included:
         query += " AND EXISTS (SELECT 1 FROM contact_category_links l JOIN contact_categories g ON g.id=l.category_id WHERE l.contact_id=c.id AND g.owner_email=? AND g.name=?)"
-        params += [owner_email, category]
+        params += [owner_email, included]
+    if excluded:
+        query += " AND NOT EXISTS (SELECT 1 FROM contact_category_links l JOIN contact_categories g ON g.id=l.category_id WHERE l.contact_id=c.id AND g.owner_email=? AND g.name=?)"
+        params += [owner_email, excluded]
+    if contains:
+        query += " AND c.email LIKE ? ESCAPE '\\'"
+        params.append(_like_literal(contains))
+    if excludes:
+        query += " AND c.email NOT LIKE ? ESCAPE '\\'"
+        params.append(_like_literal(excludes))
+    if sent_days:
+        query += """ AND NOT EXISTS (SELECT 1 FROM messages m JOIN batches b ON b.id=m.batch_id
+                     WHERE b.owner_email=c.owner_email AND lower(m.recipient_email)=c.email AND m.submitted_at>=?)"""
+        params.append(iso(utcnow() - dt.timedelta(days=sent_days)))
     with connect(path) as db:
         contacts = db.execute(query + " ORDER BY c.id LIMIT ?", params + [MAX_ROWS + 1]).fetchall()
     if not contacts or len(contacts) > MAX_ROWS:
         raise ValueError("筛选结果为空或超过每批 1000 人")
+    return contacts
+
+
+def prepare_contact_campaign(path, owner_email, template_ids, filters=None):
+    ids = template_ids if isinstance(template_ids, (list, tuple)) else [template_ids]
+    try:
+        ids = [int(value) for value in ids]
+    except (TypeError, ValueError):
+        raise ValueError("请选择有效的邮件模板")
+    if not 1 <= len(ids) <= 5 or any(value < 1 for value in ids) or len(set(ids)) != len(ids):
+        raise ValueError("请按顺序选择 1 至 5 个不同的邮件模板")
+    templates = [get_template(path, owner_email, template_id) for template_id in ids]
+    contacts = select_campaign_contacts(path, owner_email, filters)
     messages = []
     for number, contact in enumerate(contacts, 1):
+        template = templates[(number - 1) % len(templates)]
         try:
             subject, text, body_html = render_template(template, contact)
         except ValueError as exc:
             raise ValueError("{}：{}".format(contact["email"], exc))
-        messages.append((number, contact["email"], subject, text, body_html))
+        messages.append((number, contact["email"], subject, text, body_html,
+                         template["id"], template["name"], template["version"]))
+    return messages
+
+
+def create_contact_campaign(path, owner_email, name, template_id, category="", filters=None):
+    filters = dict(filters or {})
+    if category:
+        filters["include_category"] = category
+    messages = prepare_contact_campaign(path, owner_email, template_id, filters)
     return create_draft(path, name, messages, owner_email)
 
 

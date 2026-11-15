@@ -126,6 +126,29 @@ class HttpFlowTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/batches/{}/events.csv".format(other))[0], 404)
         self.assertEqual(self.request("GET", "/reports?start=2026-11-16&end=2026-11-15")[0], 400)
 
+    def test_campaign_preview_does_not_create_or_send(self):
+        owner = "__legacy_admin__"
+        for address in ("first@example.com", "second@example.com"):
+            core.save_contact(server.DB_PATH, owner, {"email": address, "categories": "德国"})
+        first, _ = core.save_template(server.DB_PATH, owner, "A", "Subject A", "Text A")
+        second, _ = core.save_template(server.DB_PATH, owner, "B", "Subject B", "Text B")
+        form = {"csrf": server.CSRF_TOKEN, "name": "轮流", "template_id": [str(first), str(second)],
+                "include_category": "德国", "exclude_sent_days": "0", "mode": "preview"}
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        status, _, body = self.request("POST", "/campaigns", urlencode(form, doseq=True), headers)
+        self.assertEqual(status, 200)
+        self.assertIn("2 位联系人".encode("utf-8"), body)
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM batches").fetchone()[0], 0)
+        form["mode"] = "create"
+        status, result_headers, _ = self.request("POST", "/campaigns", urlencode(form, doseq=True), headers)
+        self.assertEqual(status, 303)
+        self.assertEqual(result_headers["Location"], "/batches/1")
+        with core.connect(server.DB_PATH) as db:
+            rows = db.execute("SELECT subject,status FROM messages ORDER BY row_number").fetchall()
+        self.assertEqual([(row["subject"], row["status"]) for row in rows],
+                         [("Subject A", "draft"), ("Subject B", "draft")])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,7 +22,8 @@ from cryptography.fernet import Fernet
 
 from core import (MAX_UPLOAD_BYTES, Worker, add_suppression, cancel_batch, connect, create_draft,
                   create_contact_campaign, get_template, import_contacts, init_db, mailbox_settings,
-                  parse_contacts_upload, parse_upload, render_template, report_data, save_template, send_template_test,
+                  parse_contacts_upload, parse_upload, prepare_contact_campaign, render_template, report_data,
+                  save_template, send_template_test,
                   revoke_mailbox_auth, save_contact, save_mailbox_auth, schedule_batch,
                   set_batch_state, set_contact_deleted, set_contact_status, utcnow, verify_mailbox_auth)
 from core import unsubscribe_token, verify_unsubscribe_token
@@ -89,7 +90,7 @@ def page(title, content, user=""):
     account_link = ('<span class="top-meta">{}</span><a class="top-account" href="/account">发件授权</a>'
                     '<a class="top-account" href="/logout">退出</a>'.format(h(user)) if oauth_login.configured(SETTINGS) and user
                     else '<span class="top-meta">外贸邮件工作台 / V2</span>')
-    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/reports">统计报表</a>' + account_link
+    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/campaigns">创建任务</a><a class="top-account" href="/reports">统计报表</a>' + account_link
     markup = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Wismail</title>
 <link rel="stylesheet" href="/static.css"></head><body>
@@ -279,16 +280,55 @@ def templates_page(user, error="", selected_id=0, selected_version=None, preview
         except ValueError as exc:
             preview = '<div class="alert">{}</div>'.format(h(exc))
     alert = '<div class="alert">{}</div>'.format(h(error)) if error else ''
-    content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>邮件模板</h1>{alert}<p>模板按邮箱账号隔离；每次保存产生新版本，已创建的批次保留当时的邮件内容。</p><ul>{list_html}</ul><a href="/templates">新建模板</a></section>
+    content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>邮件模板</h1>{alert}<p>模板按邮箱账号隔离；每次保存产生新版本，已创建的批次保留当时的邮件内容。</p><ul>{list_html}</ul><a href="/templates">新建模板</a> {campaign_link}</section>
 <section class="panel"><h2>{heading}</h2><form method="post" action="/templates/save">{csrf}<input type="hidden" name="id" value="{id}"><label>模板名称</label><input name="name" maxlength="120" value="{name}" required><label>主题</label><input name="subject" maxlength="998" value="{subject}" required><label>纯文本正文</label><textarea name="body_text" rows="9" required>{text}</textarea><label>HTML 正文（可选）</label><textarea name="body_html" rows="9">{html}</textarea><p>可用变量：{{{{邮箱}}}}、{{{{姓名}}}}、{{{{性别}}}}、{{{{生日}}}}、{{{{手机}}}}、{{{{地区}}}}、{{{{变量1}}}} 至 {{{{变量10}}}}。缺值时停止创建批次。</p><button class="button" type="submit">保存为新版本</button></form><p>历史版本：{versions}</p></section>
 {preview}<section class="panel"><h2>预览与创建批次</h2><p>先保存模板，再选一个联系人预览变量；创建批次后仍需在批次页面明确启动发送。</p><form method="get" action="/templates"><input type="hidden" name="id" value="{id}"><select name="contact_id"><option value="">选择预览联系人</option>{contacts}</select><button type="submit">预览</button></form><form method="post" action="/campaigns/from-contacts">{csrf}<input type="hidden" name="template_id" value="{id}"><label>批次名称</label><input name="name" maxlength="120" required><label>联系人分类</label><select name="category"><option value="">全部可发送联系人</option>{categories}</select><button class="button" type="submit" {disabled}>创建待确认批次</button></form></section>
 <section class="panel"><h2>发送测试</h2><p>这是一次真实 SMTP 提交，只允许发到你自己的发件邮箱。请先核对模板内容和收件邮箱。</p><form method="post" action="/templates/test">{csrf}<input type="hidden" name="template_id" value="{id}"><label>测试收件邮箱</label><input type="email" name="recipient" value="{test_recipient}" required><label>用于变量展开的联系人</label><select name="contact_id" required><option value="">请选择</option>{contacts}</select><label><input type="checkbox" name="confirm_test" value="1" required> 我确认发送这一封测试邮件</label><button type="submit" {disabled}>发送测试</button></form><p>最近测试记录：</p><ul>{test_logs}</ul></section>'''.format(
         alert=alert, list_html=list_html, heading='编辑模板' if selected else '新建模板', csrf=csrf(user),
+        campaign_link=('· <a href="/campaigns?template_id={}">按条件创建任务</a>'.format(selected_id) if selected else ''),
         id=selected_id or '', name=h(selected["name"] if selected else ''), subject=h(selected["subject"] if selected else ''),
         text=h(selected["body_text"] if selected else ''), html=h(selected["body_html"] if selected else ''),
         versions=version_html, preview=preview, contacts=contact_options, categories=category_options,
         disabled='' if selected else 'disabled', test_recipient=h(test_recipient), test_logs=test_logs)
     return page("邮件模板", content, user)
+
+
+def campaigns_page(user, values=None, preview=None, error=""):
+    values = values if values is not None else {}
+    selected = set(str(value) for value in values.get("template_ids", []))
+    with connect(DB_PATH) as db:
+        templates = db.execute("""SELECT t.id,t.name,MAX(v.version) AS version FROM templates t
+                                  JOIN template_versions v ON v.template_id=t.id
+                                  WHERE t.owner_email=? GROUP BY t.id ORDER BY t.id""", (user,)).fetchall()
+        categories = db.execute("SELECT name FROM contact_categories WHERE owner_email=? ORDER BY name", (user,)).fetchall()
+    template_options = ''.join('<label class="campaign-option"><input type="checkbox" name="template_id" value="{}" {}> {} · v{}</label>'.format(
+        row["id"], 'checked' if str(row["id"]) in selected else '', h(row["name"]), row["version"]) for row in templates)
+    def category_options(key):
+        return ''.join('<option value="{0}" {1}>{0}</option>'.format(
+            h(row["name"]), 'selected' if row["name"] == values.get(key, "") else '') for row in categories)
+    preview_html = ''
+    if preview is not None:
+        rows = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+            h(item[1]), h(item[6]) + ' · v' + h(item[7]), h(item[2])) for item in preview[:10])
+        preview_html = '''<section class="panel"><h2>筛选预览 · {} 位联系人</h2><p>这里只检查并展示前 10 封，不会排队或发送。创建草稿后请在批次页再核对全部邮件。</p>
+<div class="table-wrap"><table><thead><tr><th>收件邮箱</th><th>轮用模板</th><th>主题</th></tr></thead><tbody>{}</tbody></table></div></section>'''.format(len(preview), rows)
+    alert = '<div class="alert">{}</div>'.format(h(error)) if error else ''
+    content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>创建联系人任务</h1>{alert}
+<p>仅选取当前账号下可发送、未删除且未退订的联系人；同一个邮箱在一个批次中只出现一次。多模板按下方显示顺序逐封轮流使用，创建时固定模板版本和正文。</p>
+<form method="post" action="/campaigns">{csrf}<label>批次名称</label><input name="name" maxlength="120" value="{name}" required>
+<h2>邮件模板</h2><p class="muted">选择 1 至 5 个；请先在“邮件模板”中保存模板。</p><div class="campaign-options">{templates}</div>
+<h2>联系人条件</h2><div class="campaign-grid"><label>包含分类<select name="include_category"><option value="">不限分类</option>{include_categories}</select></label>
+<label>排除分类<select name="exclude_category"><option value="">不排除分类</option>{exclude_categories}</select></label>
+<label>邮箱包含字符<input name="email_contains" maxlength="100" value="{email_contains}" placeholder="例如：@example.com"></label>
+<label>邮箱不包含字符<input name="email_excludes" maxlength="100" value="{email_excludes}" placeholder="例如：test"></label>
+<label>排除最近已提交的联系人（天）<input type="number" name="exclude_sent_days" min="0" max="365" value="{exclude_sent_days}"></label></div>
+<p class="muted">系统始终排除退订、投诉、无效、回收站和不再联系名单。这里的“已提交”指 SMTP 接受过该邮箱的邮件，不代表最终投递。</p>
+<div class="actions"><button class="button secondary" type="submit" name="mode" value="preview">预览筛选</button><button class="button" type="submit" name="mode" value="create">创建待确认批次</button></div></form></section>{preview}'''.format(
+        alert=alert, csrf=csrf(user), name=h(values.get("name", "")), templates=template_options or '<p>还没有模板。请先创建邮件模板。</p>',
+        include_categories=category_options("include_category"), exclude_categories=category_options("exclude_category"),
+        email_contains=h(values.get("email_contains", "")), email_excludes=h(values.get("email_excludes", "")),
+        exclude_sent_days=h(values.get("exclude_sent_days", "0")), preview=preview_html)
+    return page("创建联系人任务", content, user)
 
 
 def batch_page(batch_id, error="", user="__legacy_admin__"):
@@ -298,6 +338,12 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
             return None
         rows = db.execute("SELECT * FROM messages WHERE batch_id=? ORDER BY row_number", (batch_id,)).fetchall()
         stats = summary_for(db, batch_id)
+        template_stats = db.execute("""SELECT template_name,template_version,COUNT(*) AS total,
+               SUM(CASE WHEN submitted_at IS NOT NULL THEN 1 ELSE 0 END) AS submitted,
+               SUM(CASE WHEN bounced_at IS NOT NULL THEN 1 ELSE 0 END) AS bounced,
+               SUM(CASE WHEN replied_at IS NOT NULL THEN 1 ELSE 0 END) AS replied
+               FROM messages WHERE batch_id=? AND template_id IS NOT NULL
+               GROUP BY template_id,template_name,template_version ORDER BY template_id""", (batch_id,)).fetchall()
         events = db.execute("""SELECT e.kind,e.smtp_code,e.observed_at,e.detail,m.row_number
                                FROM delivery_events e JOIN messages m ON m.id=e.message_id
                                WHERE m.batch_id=? ORDER BY e.id DESC LIMIT 30""", (batch_id,)).fetchall()
@@ -329,9 +375,11 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
             flags.append('<span class="pill failed">退信</span>')
         if row["replied_at"]:
             flags.append('<span class="pill replied">已回复</span>')
-        row_html.append('''<tr><td class="row-no">{no}</td><td><strong>{email}</strong><div class="muted">{subject}</div><details><summary>查看正文</summary><pre>{body}</pre></details></td>
+        row_html.append('''<tr><td class="row-no">{no}</td><td><strong>{email}</strong><div class="muted">{subject}</div>{template}<details><summary>查看正文</summary><pre>{body}</pre></details></td>
 <td><span class="pill {raw_status}">{status}</span> {flags}</td><td>{scheduled}</td><td>{submitted}</td><td class="error-text">{error}</td></tr>'''.format(
             no=row["row_number"], email=h(row["recipient_email"]), subject=h(row["subject"]),
+            template=('<div class="muted">模板：{} · v{}</div>'.format(h(row["template_name"]), h(row["template_version"]))
+                      if row["template_name"] else ''),
             body=h(row["body"]), raw_status=h(row["status"]), status=h(status), flags=" ".join(flags),
             scheduled=local_time(row["scheduled_at"]), submitted=local_time(row["submitted_at"]),
             error=h(row["last_error"] or "—")))
@@ -340,14 +388,21 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
         time=local_time(item["observed_at"]), number=item["row_number"],
         kind=h(EVENT_LABELS.get(item["kind"], item["kind"])), code=h(item["smtp_code"] or "—"),
         detail=h(item["detail"]), suggestion=h(event_suggestion(item["kind"], item["smtp_code"]))) for item in events)
+    template_summary = ''
+    if template_stats:
+        template_rows = ''.join('<tr><td>{} · v{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+            h(item["template_name"]), h(item["template_version"]), item["total"], item["submitted"],
+            item["bounced"], item["replied"]) for item in template_stats)
+        template_summary = '''<section class="list-section"><h2>轮用模板结果</h2><p class="muted">已提交只代表 SMTP 接受；退信和回复依赖 IMAP 记录。</p>
+<div class="table-wrap"><table><thead><tr><th>模板</th><th>总邮件</th><th>已提交</th><th>退信</th><th>回复</th></tr></thead><tbody>{}</tbody></table></div></section>'''.format(template_rows)
     content = '''<nav class="back"><a href="/">← 返回批次列表</a></nav><section class="batch-head"><div><div class="eyebrow">批次 #{id} · {state}</div><h1>{name}</h1><p class="muted">创建于 {created} · 发件账号 {sender}</p></div><a class="text-link" href="/batches/{id}/export.csv">导出明细 CSV ↗</a></section>
-{alert}<section class="stats">{stats}</section>{controls}<section class="list-section"><div class="section-heading"><h2>逐封结果</h2><span class="muted">已提交表示发信服务器已接受，不代表进入收件箱。</span></div>
+{alert}<section class="stats">{stats}</section>{controls}{template_summary}<section class="list-section"><div class="section-heading"><h2>逐封结果</h2><span class="muted">已提交表示发信服务器已接受，不代表进入收件箱。</span></div>
 <div class="table-wrap"><table><thead><tr><th>行</th><th>邮件</th><th>状态</th><th>计划时间</th><th>提交时间</th><th>原因</th></tr></thead><tbody>{rows}</tbody></table></div></section>
 <section class="list-section"><div class="section-heading"><h2>发送日志</h2><a class="text-link" href="/batches/{id}/events.csv">导出全部日志 CSV ↗</a></div><p class="muted">显示最近 30 条；部署此功能后产生的新事件才会记录。SMTP 返回码及建议仅供排查，具体原因以服务器返回信息为准。</p>
 <div class="table-wrap"><table><thead><tr><th>时间</th><th>行</th><th>事件</th><th>SMTP 码</th><th>详情</th><th>建议</th></tr></thead><tbody>{events}</tbody></table></div></section>'''.format(
         id=batch_id, state=STATE.get(batch["state"], batch["state"]), name=h(batch["name"]),
         created=local_time(batch["created_at"]), sender=h(account["SMTP_FROM"] if account else "未配置"),
-        alert=alert, stats=stat_html, controls=controls, rows="".join(row_html),
+        alert=alert, stats=stat_html, controls=controls, template_summary=template_summary, rows="".join(row_html),
         events=event_rows or '<tr><td colspan="6">暂无新日志，既有邮件仍可查看逐封状态。</td></tr>')
     return page(batch["name"], content, user)
 
@@ -496,6 +551,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/":
             self._send(200, dashboard(user=self.current_user))
+        elif path == "/campaigns":
+            query = parse_qs(urlparse(self.path).query)
+            self._send(200, campaigns_page(self.current_user,
+                                           {"template_ids": query.get("template_id", [])}))
         elif path in ("/reports", "/reports/export.csv"):
             query = parse_qs(urlparse(self.path).query)
             try:
@@ -585,13 +644,15 @@ class Handler(BaseHTTPRequestHandler):
             elif match.group(2):
                 with connect(DB_PATH) as db:
                     batch = db.execute("SELECT id FROM batches WHERE id=? AND owner_email=?", (batch_id, self.current_user)).fetchone()
-                    rows = db.execute("SELECT row_number,recipient_email,subject,status,scheduled_at,submitted_at,bounced_at,replied_at,last_error FROM messages WHERE batch_id=? ORDER BY row_number", (batch_id,)).fetchall() if batch else None
+                    rows = db.execute("""SELECT row_number,recipient_email,subject,template_name,template_version,
+                                               status,scheduled_at,submitted_at,bounced_at,replied_at,last_error
+                                        FROM messages WHERE batch_id=? ORDER BY row_number""", (batch_id,)).fetchall() if batch else None
                 if rows is None:
                     self._send(404, "批次不存在")
                     return
                 output = io.StringIO()
                 writer = csv.writer(output)
-                writer.writerow(["表格行号", "收件邮箱", "邮件主题", "状态", "计划时间(UTC)", "提交时间(UTC)", "退信时间(UTC)", "回复时间(UTC)", "原因"])
+                writer.writerow(["表格行号", "收件邮箱", "邮件主题", "模板名称", "模板版本", "状态", "计划时间(UTC)", "提交时间(UTC)", "退信时间(UTC)", "回复时间(UTC)", "原因"])
                 for row in rows:
                     writer.writerow([csv_safe(value) for value in row])
                 self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
@@ -665,6 +726,25 @@ class Handler(BaseHTTPRequestHandler):
                 batch_id = create_contact_campaign(DB_PATH, self.current_user, form.getfirst("name", ""),
                                                    int(form.getfirst("template_id", "0")), form.getfirst("category", ""))
                 self._redirect("/batches/{}".format(batch_id))
+                return
+            if path == "/campaigns":
+                values = {key: form.getfirst(key, "") for key in
+                          ("name", "include_category", "exclude_category", "email_contains",
+                           "email_excludes", "exclude_sent_days")}
+                values["template_ids"] = form.getlist("template_id")
+                try:
+                    if form.getfirst("mode", "") == "preview":
+                        messages = prepare_contact_campaign(DB_PATH, self.current_user,
+                                                            values["template_ids"], values)
+                        self._send(200, campaigns_page(self.current_user, values, messages))
+                    elif form.getfirst("mode", "") == "create":
+                        batch_id = create_contact_campaign(DB_PATH, self.current_user,
+                                                           values["name"], values["template_ids"], filters=values)
+                        self._redirect("/batches/{}".format(batch_id))
+                    else:
+                        raise ValueError("请选择预览或创建批次")
+                except ValueError as exc:
+                    self._send(400, campaigns_page(self.current_user, values, error=str(exc)))
                 return
             if path == "/templates/test":
                 if form.getfirst("confirm_test", "") != "1":
