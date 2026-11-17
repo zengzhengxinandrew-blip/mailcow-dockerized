@@ -121,6 +121,49 @@ class TrackingTests(unittest.TestCase):
                                      JOIN contact_categories g ON g.id=l.category_id""").fetchone()[0]
             self.assertEqual(category, "已退订")
 
+    def test_behavior_rule_creates_one_owned_draft_without_sending(self):
+        owner = "sender@example.com"
+        core.save_contact(self.path, owner, {"email": "buyer@example.com", "name": "Buyer"})
+        template_id, _ = core.save_template(self.path, owner, "跟进", "您好 {{姓名}}", "谢谢 {{姓名}}")
+        rule = core.save_automation_rule(self.path, owner, "click", "已点击", template_id)
+        source = core.create_draft(self.path, "source", [(1, "buyer@example.com", "原主题", "原正文", "<p>原正文</p>")], owner)
+        core.schedule_batch(self.path, source, "now", 60, track_click=True)
+        with core.connect(self.path) as db:
+            db.execute("UPDATE messages SET status='submitted' WHERE batch_id=?", (source,))
+            message_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (source,)).fetchone()[0]
+        with mock.patch.object(core, "_smtp_submit") as submit:
+            self.assertTrue(core.record_tracking_event(self.path, message_id, "c"))
+            self.assertTrue(core.record_tracking_event(self.path, message_id, "c"))
+            submit.assert_not_called()
+        with core.connect(self.path) as db:
+            result = db.execute("""SELECT d.status,d.batch_id,b.owner_email,b.state,m.subject,m.body,m.status
+                                   FROM automation_drafts d JOIN batches b ON b.id=d.batch_id
+                                   JOIN messages m ON m.batch_id=b.id WHERE d.rule_id=?""", (rule,)).fetchall()
+            self.assertEqual(len(result), 1)
+            self.assertEqual((result[0]["status"], result[0]["owner_email"], result[0]["state"],
+                              result[0]["subject"], result[0]["body"]),
+                             ("draft", owner, "draft", "您好 Buyer", "谢谢 Buyer"))
+
+    def test_followup_rule_rejects_foreign_template_and_unsubscribe(self):
+        template_id, _ = core.save_template(self.path, "other@example.com", "私有", "主题", "正文")
+        with self.assertRaisesRegex(ValueError, "自己的"):
+            core.save_automation_rule(self.path, "owner@example.com", "open", "打开", template_id)
+        with self.assertRaisesRegex(ValueError, "退订"):
+            core.save_automation_rule(self.path, "other@example.com", "unsubscribe", "退订", template_id)
+
+    def test_suppressed_contact_gets_no_followup_draft(self):
+        owner = "sender@example.com"
+        core.save_contact(self.path, owner, {"email": "buyer@example.com"})
+        template_id, _ = core.save_template(self.path, owner, "跟进", "主题", "正文")
+        rule = core.save_automation_rule(self.path, owner, "open", "已打开", template_id)
+        with core.connect(self.path) as db:
+            db.execute("INSERT INTO suppressions(owner_email,recipient_email,reason,created_at) VALUES (?,?,?,?)",
+                       (owner, "buyer@example.com", "测试", core.iso(core.utcnow())))
+            core._apply_automation_event(db, owner, "buyer@example.com", "open", "open:1")
+        with core.connect(self.path) as db:
+            row = db.execute("SELECT status,batch_id FROM automation_drafts WHERE rule_id=?", (rule,)).fetchone()
+            self.assertEqual(tuple(row), ("skipped", None))
+
     def test_paused_rule_does_not_replay_old_click(self):
         owner = "sender@example.com"
         core.save_contact(self.path, owner, {"email": "buyer@example.com"})

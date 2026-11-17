@@ -91,6 +91,21 @@ class HttpFlowTests(unittest.TestCase):
         with core.connect(server.DB_PATH) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM automation_rules WHERE owner_email='__legacy_admin__'").fetchone()[0], 0)
 
+    def test_automation_form_accepts_owned_followup_template_only(self):
+        template_id, _ = core.save_template(server.DB_PATH, "__legacy_admin__", "跟进", "主题", "正文")
+        foreign_id, _ = core.save_template(server.DB_PATH, "other@example.com", "私有", "主题", "正文")
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        form = urlencode({"csrf": server.CSRF_TOKEN, "event_kind": "open", "category_name": "已打开",
+                          "followup_template_id": str(template_id)})
+        self.assertEqual(self.request("POST", "/automations/add", form, headers)[0], 303)
+        status, _, page = self.request("GET", "/automations")
+        self.assertEqual(status, 200)
+        self.assertIn("跟进".encode("utf-8"), page)
+        self.assertNotIn("私有".encode("utf-8"), page)
+        invalid = urlencode({"csrf": server.CSRF_TOKEN, "event_kind": "click", "category_name": "已点击",
+                             "followup_template_id": str(foreign_id)})
+        self.assertEqual(self.request("POST", "/automations/add", invalid, headers)[0], 400)
+
     def test_template_upload_preview_requires_explicit_start(self):
         status, _, template = self.request("GET", "/template.xlsx")
         self.assertEqual(status, 200)

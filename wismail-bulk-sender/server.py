@@ -301,26 +301,39 @@ def automations_page(user, error=""):
                                FROM automation_runs a JOIN automation_rules r ON r.id=a.rule_id
                                JOIN contacts c ON c.id=a.contact_id
                                WHERE r.owner_email=? ORDER BY a.applied_at DESC LIMIT 20""", (user,)).fetchall()
+        templates = db.execute("SELECT id,name FROM templates WHERE owner_email=? ORDER BY name,id", (user,)).fetchall()
+        draft_events = db.execute("""SELECT d.created_at,d.status,d.detail,d.batch_id,c.email
+                                     FROM automation_drafts d JOIN automation_rules r ON r.id=d.rule_id
+                                     JOIN contacts c ON c.id=d.contact_id WHERE r.owner_email=?
+                                     ORDER BY d.created_at DESC LIMIT 20""", (user,)).fetchall()
     options = ''.join('<option value="{}">{}</option>'.format(kind, h(label))
                       for kind, label in AUTOMATION_EVENTS.items())
-    rows = ''.join('''<tr><td>{event}</td><td>{category}</td><td>{state}</td><td>{runs}</td><td>
+    template_names = {row["id"]: row["name"] for row in templates}
+    template_options = ''.join('<option value="{}">{}</option>'.format(row["id"], h(row["name"])) for row in templates)
+    rows = ''.join('''<tr><td>{event}</td><td>{category}</td><td>{template}</td><td>{state}</td><td>{runs}</td><td>
 <form method="post" action="/automations/toggle">{csrf}<input type="hidden" name="id" value="{id}"><input type="hidden" name="enabled" value="{next_state}"><button type="submit">{toggle}</button></form>
 <form method="post" action="/automations/delete">{csrf}<input type="hidden" name="id" value="{id}"><button type="submit" onclick="return confirm('删除规则不会移除已添加的联系人分类。确定删除？')">删除</button></form></td></tr>'''.format(
         event=h(AUTOMATION_EVENTS[row["event_kind"]]), category=h(row["category_name"]),
+        template=h(template_names.get(row["followup_template_id"], "仅分类")),
         state="启用" if row["enabled"] else "暂停", runs=row["runs"], csrf=csrf(user), id=row["id"],
         next_state="0" if row["enabled"] else "1", toggle="暂停" if row["enabled"] else "启用") for row in rules)
     history = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
         local_time(row["applied_at"]), h(AUTOMATION_EVENTS[row["event_kind"]]),
         h(row["email"] + " → " + row["category_name"])) for row in recent)
+    draft_rows = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        local_time(row["created_at"]), h(row["email"]),
+        '<a href="/batches/{}">查看待确认草稿</a>'.format(row["batch_id"]) if row["batch_id"]
+        else '未生成：' + h(row["detail"])) for row in draft_events)
     alert = '<div class="alert">{}</div>'.format(h(error)) if error else ''
-    content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>自动分类</h1>{alert}
-<p>当联系人首次打开、点击邮件或确认退订时，把联系人加入指定分类。规则只处理创建后新发生的事件，不会追溯旧记录，也不会自动发送邮件。</p>
+    content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>行为规则</h1>{alert}
+<p>新发生的打开、点击或退订行为可以给联系人加分类。打开和点击还能生成使用所选模板的单人待确认草稿；须人工检查并启动，不会自动发送。</p>
 <p class="muted">打开和点击是请求观测值，可能由图片代理或安全扫描触发；退订会继续停止该联系人的排队邮件。</p>
-<form method="post" action="/automations/add">{csrf}<div class="campaign-grid"><label>触发行为<select name="event_kind" required>{options}</select></label><label>添加到分类<input name="category_name" maxlength="80" required placeholder="例如：点击过产品邮件"></label></div><button class="button" type="submit">创建规则</button></form></section>
-<section class="list-section"><h2>我的规则</h2><div class="table-wrap"><table><thead><tr><th>触发行为</th><th>添加分类</th><th>状态</th><th>触发次数</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table></div></section>
+<form method="post" action="/automations/add">{csrf}<div class="campaign-grid"><label>触发行为<select name="event_kind" required>{options}</select></label><label>添加到分类<input name="category_name" maxlength="80" required placeholder="例如：点击过产品邮件"></label><label>后续草稿模板（可选）<select name="followup_template_id"><option value="">不生成草稿</option>{template_options}</select></label></div><button class="button" type="submit">创建规则</button></form></section>
+<section class="list-section"><h2>我的规则</h2><div class="table-wrap"><table><thead><tr><th>触发行为</th><th>添加分类</th><th>草稿模板</th><th>状态</th><th>触发次数</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table></div></section>
+<section class="list-section"><h2>最近生成的草稿</h2><div class="table-wrap"><table><thead><tr><th>时间</th><th>联系人</th><th>结果</th></tr></thead><tbody>{draft_rows}</tbody></table></div></section>
 <section class="list-section"><h2>最近触发记录</h2><div class="table-wrap"><table><thead><tr><th>时间</th><th>行为</th><th>联系人与分类</th></tr></thead><tbody>{history}</tbody></table></div></section>'''.format(
-        alert=alert, csrf=csrf(user), options=options,
-        rows=rows or '<tr><td colspan="5">还没有自动分类规则。</td></tr>',
+        alert=alert, csrf=csrf(user), options=options, template_options=template_options,
+        rows=rows or '<tr><td colspan="6">还没有行为规则。</td></tr>', draft_rows=draft_rows or '<tr><td colspan="3">还没有草稿记录。</td></tr>',
         history=history or '<tr><td colspan="3">还没有新行为触发规则。</td></tr>')
     return page("自动分类", content, user)
 
@@ -901,7 +914,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/automations/add":
                 save_automation_rule(DB_PATH, self.current_user, form.getfirst("event_kind", ""),
-                                     form.getfirst("category_name", ""))
+                                     form.getfirst("category_name", ""), form.getfirst("followup_template_id", ""))
                 self._redirect("/automations")
                 return
             if path == "/automations/toggle":

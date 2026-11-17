@@ -170,6 +170,7 @@ def init_db(path):
           owner_email TEXT NOT NULL,
           event_kind TEXT NOT NULL,
           category_name TEXT NOT NULL,
+          followup_template_id INTEGER,
           enabled INTEGER NOT NULL DEFAULT 1,
           created_at TEXT NOT NULL,
           UNIQUE(owner_email,event_kind,category_name)
@@ -182,6 +183,16 @@ def init_db(path):
           PRIMARY KEY(rule_id,event_key)
         );
         CREATE INDEX IF NOT EXISTS idx_automation_runs_contact ON automation_runs(contact_id,applied_at);
+        CREATE TABLE IF NOT EXISTS automation_drafts (
+          rule_id INTEGER NOT NULL REFERENCES automation_rules(id) ON DELETE CASCADE,
+          event_key TEXT NOT NULL,
+          contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+          batch_id INTEGER REFERENCES batches(id) ON DELETE SET NULL,
+          status TEXT NOT NULL,
+          detail TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(rule_id,event_key)
+        );
         CREATE TABLE IF NOT EXISTS templates (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           owner_email TEXT NOT NULL,
@@ -226,6 +237,9 @@ def init_db(path):
             db.execute("ALTER TABLE batches ADD COLUMN hourly_limit INTEGER")
         if "ab_mode" not in batch_columns:
             db.execute("ALTER TABLE batches ADD COLUMN ab_mode INTEGER NOT NULL DEFAULT 0")
+        rule_columns = [item["name"] for item in db.execute("PRAGMA table_info(automation_rules)")]
+        if "followup_template_id" not in rule_columns:
+            db.execute("ALTER TABLE automation_rules ADD COLUMN followup_template_id INTEGER")
         for column in ("track_open", "track_click"):
             if column not in batch_columns:
                 db.execute("ALTER TABLE batches ADD COLUMN {} INTEGER NOT NULL DEFAULT 0".format(column))
@@ -752,23 +766,30 @@ def add_suppression(path, recipient, reason="手动添加", owner_email="__legac
 AUTOMATION_EVENTS = {"open": "观测打开", "click": "观测点击", "unsubscribe": "收件人退订"}
 
 
-def save_automation_rule(path, owner_email, event_kind, category_name):
+def save_automation_rule(path, owner_email, event_kind, category_name, followup_template_id=None):
     category_name = str(category_name or "").strip()
     if event_kind not in AUTOMATION_EVENTS:
         raise ValueError("请选择支持的触发行为")
     if not category_name or len(category_name) > 80 or re.search(r"[,，;；\x00-\x1f]", category_name):
         raise ValueError("分类名称需为 1 至 80 个字符，且不能包含逗号或分号")
+    followup_template_id = int(followup_template_id or 0) or None
+    if followup_template_id and event_kind == "unsubscribe":
+        raise ValueError("退订行为不能生成后续邮件草稿")
     with connect(path) as db:
-        db.execute("INSERT OR IGNORE INTO contact_categories(owner_email,name) VALUES (?,?)", (owner_email, category_name))
+        if followup_template_id and not db.execute(
+                "SELECT 1 FROM templates WHERE id=? AND owner_email=?", (followup_template_id, owner_email)).fetchone():
+            raise ValueError("只能选择自己的邮件模板")
         count = db.execute("SELECT COUNT(*) FROM automation_rules WHERE owner_email=?", (owner_email,)).fetchone()[0]
         if count >= 20:
             raise ValueError("每个账号最多创建 20 条自动分类规则")
         if db.execute("""SELECT 1 FROM automation_rules WHERE owner_email=? AND event_kind=? AND category_name=?""",
                       (owner_email, event_kind, category_name)).fetchone():
             raise ValueError("相同的自动分类规则已存在")
+        db.execute("INSERT OR IGNORE INTO contact_categories(owner_email,name) VALUES (?,?)", (owner_email, category_name))
         try:
-            return db.execute("""INSERT INTO automation_rules(owner_email,event_kind,category_name,created_at)
-                                 VALUES (?,?,?,?)""", (owner_email, event_kind, category_name, iso(utcnow()))).lastrowid
+            return db.execute("""INSERT INTO automation_rules(owner_email,event_kind,category_name,
+                                 followup_template_id,created_at) VALUES (?,?,?,?,?)""",
+                              (owner_email, event_kind, category_name, followup_template_id, iso(utcnow()))).lastrowid
         except sqlite3.IntegrityError:
             raise ValueError("相同的自动分类规则已存在")
 
@@ -789,14 +810,49 @@ def delete_automation_rule(path, owner_email, rule_id):
             raise ValueError("自动分类规则不存在")
 
 
+def _create_automation_draft(db, owner_email, contact, rule, event_key):
+    """Create one reviewable draft in the event transaction; never queue or send it."""
+    template_id = rule["followup_template_id"]
+    if not template_id:
+        return
+    template = db.execute("""SELECT t.id,t.name,v.version,v.subject,v.body_text,v.body_html
+                             FROM templates t JOIN template_versions v ON v.template_id=t.id
+                             WHERE t.id=? AND t.owner_email=? AND v.version=(
+                               SELECT MAX(version) FROM template_versions WHERE template_id=t.id)""",
+                          (template_id, owner_email)).fetchone()
+    reason = ""
+    if contact["status"] != "subscribed" or db.execute(
+            "SELECT 1 FROM suppressions WHERE recipient_email=? AND owner_email IN (?, '*')",
+            (contact["email"], owner_email)).fetchone():
+        reason = "联系人已退订或位于不再联系名单"
+    elif not template:
+        reason = "模板已不存在"
+    else:
+        try:
+            subject, body, body_html = render_template(template, contact)
+        except ValueError as exc:
+            reason = str(exc)[:300]
+    batch_id = None
+    if not reason:
+        batch_id = db.execute("INSERT INTO batches(owner_email,name,state,created_at) VALUES (?,?, 'draft',?)",
+                              (owner_email, ("自动草稿：" + rule["category_name"])[:120], iso(utcnow()))).lastrowid
+        db.execute("""INSERT INTO messages(batch_id,row_number,recipient_email,subject,body,body_html,
+                      template_id,template_name,template_version) VALUES (?,?,?,?,?,?,?,?,?)""",
+                   (batch_id, 1, contact["email"], subject, body, body_html,
+                    template["id"], template["name"], template["version"]))
+    db.execute("""INSERT INTO automation_drafts(rule_id,event_key,contact_id,batch_id,status,detail,created_at)
+                  VALUES (?,?,?,?,?,?,?)""", (rule["id"], event_key, contact["id"], batch_id,
+                                             "draft" if batch_id else "skipped", reason, iso(utcnow())))
+
+
 def _apply_automation_event(db, owner_email, recipient_email, event_kind, event_key):
-    contact = db.execute("""SELECT id FROM contacts WHERE owner_email=? AND email=? AND deleted_at IS NULL
+    contact = db.execute("""SELECT * FROM contacts WHERE owner_email=? AND email=? AND deleted_at IS NULL
                             AND (status='subscribed' OR ?='unsubscribe')""",
                          (owner_email, recipient_email.lower(), event_kind)).fetchone()
     if not contact:
         return 0
     applied = 0
-    rules = db.execute("""SELECT id,category_name FROM automation_rules
+    rules = db.execute("""SELECT id,category_name,followup_template_id FROM automation_rules
                           WHERE owner_email=? AND event_kind=? AND enabled=1""",
                        (owner_email, event_kind)).fetchall()
     for rule in rules:
@@ -811,6 +867,7 @@ def _apply_automation_event(db, owner_email, recipient_email, event_kind, event_
                                  (owner_email, rule["category_name"])).fetchone()["id"]
         db.execute("INSERT OR IGNORE INTO contact_category_links(contact_id,category_id) VALUES (?,?)",
                    (contact["id"], category_id))
+        _create_automation_draft(db, owner_email, contact, rule, event_key)
         applied += 1
     return applied
 
