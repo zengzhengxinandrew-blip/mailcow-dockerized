@@ -88,6 +88,7 @@ def init_db(path):
           batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
           row_number INTEGER NOT NULL,
           recipient_email TEXT NOT NULL,
+          sender_email TEXT NOT NULL DEFAULT '',
           subject TEXT NOT NULL,
           body TEXT NOT NULL,
           template_id INTEGER,
@@ -273,6 +274,8 @@ def init_db(path):
         message_columns = [item["name"] for item in db.execute("PRAGMA table_info(messages)")]
         if "body_html" not in message_columns:
             db.execute("ALTER TABLE messages ADD COLUMN body_html TEXT NOT NULL DEFAULT ''")
+        if "sender_email" not in message_columns:
+            db.execute("ALTER TABLE messages ADD COLUMN sender_email TEXT NOT NULL DEFAULT ''")
         if "variant" not in message_columns:
             db.execute("ALTER TABLE messages ADD COLUMN variant TEXT NOT NULL DEFAULT ''")
         for column in ("opened_at", "clicked_at"):
@@ -1281,10 +1284,14 @@ def remove_sender_alias(path, owner_email, alias_email):
         if not db.execute("DELETE FROM sender_aliases WHERE owner_email=? AND alias_email=?",
                           (owner_email, str(alias_email or "").strip().lower())).rowcount:
             raise ValueError("代发地址不存在")
+        db.execute("""UPDATE batches SET state='paused' WHERE owner_email=? AND state='active'
+                      AND id IN (SELECT batch_id FROM messages WHERE sender_email=? AND status='queued')""",
+                   (owner_email, str(alias_email or "").strip().lower()))
 
 
 def schedule_batch(path, batch_id, start_local, interval_seconds, offset_hours=8,
-                   track_open=False, track_click=False, reply_to="", sender_email="", hourly_limit=None):
+                   track_open=False, track_click=False, reply_to="", sender_email="", hourly_limit=None,
+                   sender_emails=None):
     if not 60 <= interval_seconds <= 86400:
         raise ValueError("发送间隔需为 60 秒至 24 小时")
     if hourly_limit not in (None, ""):
@@ -1298,12 +1305,17 @@ def schedule_batch(path, batch_id, start_local, interval_seconds, offset_hours=8
         hourly_limit = None
     reply_to = str(reply_to or "").strip().lower()
     sender_email = str(sender_email or "").strip().lower()
+    legacy_default = not sender_email and sender_emails is None
+    selected_senders = [str(item or "").strip().lower() for item in (sender_emails or [sender_email])]
+    if (not selected_senders or len(selected_senders) > 10 or len(selected_senders) != len(set(selected_senders)) or
+            (not legacy_default and any(not REPLY_ADDRESS_RE.fullmatch(item) for item in selected_senders))):
+        raise ValueError("请选择 1 至 10 个不重复的有效发件地址")
     if reply_to:
         local = reply_to.rsplit("@", 1)[0] if "@" in reply_to else ""
         valid = (len(reply_to) <= 254 and REPLY_ADDRESS_RE.fullmatch(reply_to) and
                  not local.startswith(".") and not local.endswith(".") and ".." not in local and
                  EMAIL_RE.fullmatch(sender_email) and
-                 reply_to.rsplit("@", 1)[1] == sender_email.rsplit("@", 1)[1])
+                 all(reply_to.rsplit("@", 1)[1] == item.rsplit("@", 1)[1] for item in selected_senders))
         if not valid:
             raise ValueError("回复地址需为发件邮箱同域的有效邮箱地址")
     if start_local == "now":
@@ -1317,15 +1329,23 @@ def schedule_batch(path, batch_id, start_local, interval_seconds, offset_hours=8
         if start < utcnow() - dt.timedelta(minutes=1):
             raise ValueError("开始时间不能早于当前时间")
     with connect(path) as db:
-        batch = db.execute("SELECT state FROM batches WHERE id=?", (batch_id,)).fetchone()
+        batch = db.execute("SELECT state,owner_email FROM batches WHERE id=?", (batch_id,)).fetchone()
         if not batch or batch["state"] != "draft":
             raise ValueError("这个批次已启动或不存在")
+        if sender_email and batch["owner_email"] != "__legacy_admin__" and sender_email != batch["owner_email"]:
+            raise ValueError("发件账号与批次所属账号不符")
+        allowed = {sender_email}
+        allowed.update(row[0] for row in db.execute("SELECT alias_email FROM sender_aliases WHERE owner_email=?",
+                                                     (batch["owner_email"],)))
+        if not set(selected_senders).issubset(allowed):
+            raise ValueError("发件地址未通过当前账号的代发验证")
         rows = db.execute("SELECT id,body_html FROM messages WHERE batch_id=? ORDER BY row_number", (batch_id,)).fetchall()
         if (track_open or track_click) and any(not row["body_html"] for row in rows):
             raise ValueError("打开/点击跟踪只支持全部邮件均有 HTML 正文的批次")
         for index, row in enumerate(rows):
             due = iso(start + dt.timedelta(seconds=index * interval_seconds))
-            db.execute("UPDATE messages SET status='queued',scheduled_at=?,next_attempt_at=? WHERE id=?", (due, due, row["id"]))
+            db.execute("UPDATE messages SET status='queued',scheduled_at=?,next_attempt_at=?,sender_email=? WHERE id=?",
+                       (due, due, selected_senders[index % len(selected_senders)], row["id"]))
         db.execute("UPDATE batches SET state='active',start_at=?,interval_seconds=?,track_open=?,track_click=?,reply_to=?,hourly_limit=? WHERE id=?",
                    (iso(start), interval_seconds, int(bool(track_open)), int(bool(track_click)), reply_to, hourly_limit, batch_id))
 
@@ -1484,7 +1504,8 @@ def record_tracking_event(path, message_id, kind):
 
 
 def _smtp_submit(row, settings):
-    sender = settings["SMTP_FROM"]
+    sender = (row["sender_email"] if "sender_email" in row.keys() and row["sender_email"]
+              else settings["SMTP_FROM"])
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = row["recipient_email"]

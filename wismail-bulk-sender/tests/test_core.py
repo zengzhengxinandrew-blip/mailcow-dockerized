@@ -302,6 +302,35 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(message["From"], "sender@example.test")
         self.assertEqual(message["Reply-To"], "replies@example.test")
 
+    def test_verified_sender_rotation_is_persisted_and_uses_one_smtp_login(self):
+        owner, alias = "sender@example.test", "sales@example.test"
+        with core.connect(self.db_path) as db:
+            db.execute("INSERT INTO sender_aliases(owner_email,alias_email,verified_at) VALUES (?,?,?)",
+                       (owner, alias, core.iso(core.utcnow())))
+        batch = core.create_draft(self.db_path, "轮换", [(1, "a@example.com", "A", "A"),
+                                                         (2, "b@example.com", "B", "B"),
+                                                         (3, "c@example.com", "C", "C")], owner)
+        with self.assertRaisesRegex(ValueError, "代发验证"):
+            core.schedule_batch(self.db_path, batch, "now", 60, sender_email=owner,
+                                sender_emails=[owner, "unverified@example.test"])
+        with self.assertRaisesRegex(ValueError, "回复地址"):
+            core.schedule_batch(self.db_path, batch, "now", 60, sender_email=owner,
+                                sender_emails=[owner, "sales@other.test"], reply_to="reply@example.test")
+        core.schedule_batch(self.db_path, batch, "now", 60, sender_email=owner,
+                            sender_emails=[owner, alias], reply_to="reply@example.test")
+        with core.connect(self.db_path) as db:
+            senders = [row[0] for row in db.execute("SELECT sender_email FROM messages WHERE batch_id=? ORDER BY row_number", (batch,))]
+            self.assertEqual(senders, [owner, alias, owner])
+        row = {"sender_email": alias, "recipient_email": "b@example.com", "subject": "B", "body": "B"}
+        with mock.patch.object(core.smtplib, "SMTP") as smtp_class:
+            smtp_class.return_value.send_message.return_value = {}
+            core._smtp_submit(row, SETTINGS)
+            self.assertEqual(smtp_class.return_value.send_message.call_args[1]["from_addr"], alias)
+            smtp_class.return_value.login.assert_called_once_with(owner, "test-secret")
+        core.remove_sender_alias(self.db_path, owner, alias)
+        with core.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT state FROM batches WHERE id=?", (batch,)).fetchone()[0], "paused")
+
     def test_worker_uses_each_mailbox_authorization(self):
         key = Fernet.generate_key().decode("ascii")
         settings = dict(SETTINGS, CREDENTIAL_KEY=key, MIN_INTERVAL_SECONDS="60")

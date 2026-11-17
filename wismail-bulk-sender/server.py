@@ -513,16 +513,24 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
     default_time = (utcnow() + dt.timedelta(hours=offset, minutes=5)).strftime("%Y-%m-%dT%H:%M")
     controls = ""
     if batch["state"] == "draft":
+        with connect(DB_PATH) as db:
+            aliases = db.execute("SELECT alias_email FROM sender_aliases WHERE owner_email=? ORDER BY alias_email", (user,)).fetchall()
+        draft_account = mailbox_settings(DB_PATH, user, SETTINGS)
+        base_sender = draft_account["SMTP_FROM"] if draft_account else user
+        sender_choices = '<label><input type="checkbox" name="sender_email" value="{}" checked> {}</label>'.format(h(base_sender), h(base_sender))
+        sender_choices += ''.join('<label><input type="checkbox" name="sender_email" value="{0}"> {0}</label>'.format(h(item["alias_email"])) for item in aliases)
         controls = '''<section class="panel launch"><div><div class="eyebrow">检查完成</div><h2>设置发送计划</h2><p class="muted">启动前请抽查正文、报价与收件人。开始后按顺序逐封发送。</p></div>
 <form method="post" action="/batches/{id}/start">{csrf}<div class="form-grid"><div><label for="start">开始时间（UTC{offset:+d}）</label><input type="datetime-local" id="start" name="start" value="{default}"><label><input type="checkbox" name="immediate" value="1"> 立即开始</label></div>
 <div><label for="interval">每封间隔（秒）</label><input type="number" id="interval" name="interval" min="{minimum}" max="86400" value="120" required></div></div>
 <label for="hourly-limit">本批次每小时上限（可选）</label><input type="number" id="hourly-limit" name="hourly_limit" min="1" max="{max_hourly}" placeholder="留空仅使用邮箱总上限"><p class="muted">按最近 60 分钟已提交的邮件计算；本批次上限和邮箱总上限同时生效。当前邮箱总上限为每小时 {global_hourly} 封。</p>
 <label for="reply-to">回复地址（可选）</label><input id="reply-to" type="email" name="reply_to" maxlength="254" placeholder="留空则回复到发件邮箱"><p class="muted">仅可填写与发件邮箱同域的地址。若回复送到其他邮箱，本账号的 IMAP 回复统计可能无法识别。</p>
+<label>轮用发件地址（按选择顺序逐封轮换）</label>{sender_choices}<p class="muted">代发地址将在启动前重新验证；所有邮件仍使用当前登录邮箱的 SMTP 授权和限速。回复地址如填写，必须与所有选中发件地址同域。</p>
 <p class="muted">仅 HTML 邮件可启用。图片代理与安全扫描也可能触发记录。</p><label><input type="checkbox" name="track_open" value="1"> 记录首次打开请求</label><label><input type="checkbox" name="track_click" value="1"> 记录首次链接点击</label>
 <button class="button" type="submit">确认并开始排队</button></form></section>'''.format(
             id=batch_id, csrf=csrf(user), offset=offset, default=default_time,
             minimum=h(SETTINGS["MIN_INTERVAL_SECONDS"]),
-            max_hourly=min(int(SETTINGS["HOURLY_LIMIT"]), 1000), global_hourly=h(SETTINGS["HOURLY_LIMIT"]))
+            max_hourly=min(int(SETTINGS["HOURLY_LIMIT"]), 1000), global_hourly=h(SETTINGS["HOURLY_LIMIT"]),
+            sender_choices=sender_choices)
     elif batch["state"] in ("active", "paused"):
         action = "pause" if batch["state"] == "active" else "resume"
         label = "暂停剩余邮件" if action == "pause" else "继续发送"
@@ -549,9 +557,10 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
             flags.append('<span class="pill replied">观测打开</span>')
         if row["clicked_at"]:
             flags.append('<span class="pill replied">观测点击</span>')
-        row_html.append('''<tr><td class="row-no">{no}</td><td><strong>{email}</strong><div class="muted">{subject}</div>{template}<details><summary>查看正文</summary><pre>{body}</pre></details></td>
+        row_html.append('''<tr><td class="row-no">{no}</td><td><strong>{email}</strong><div class="muted">{subject}</div><div class="muted">发件：{sender}</div>{template}<details><summary>查看正文</summary><pre>{body}</pre></details></td>
 <td><span class="pill {raw_status}">{status}</span> {flags}</td><td>{scheduled}</td><td>{submitted}</td><td class="error-text">{error}</td></tr>'''.format(
             no=row["row_number"], email=h(row["recipient_email"]), subject=h(row["subject"]),
+            sender=h(row["sender_email"] or user),
             template=('<div class="muted">模板：{} · v{}</div>'.format(h(row["template_name"]), h(row["template_version"]))
                       if row["template_name"] else ''),
             body=h(row["body"]), raw_status=h(row["status"]), status=h(status), flags=" ".join(flags),
@@ -615,7 +624,7 @@ def account_page(user, error="", success=False):
     imap_state = "已开启" if row and row["imap_password_enc"] else "未开启"
     alias_rows = ''.join('<li>{address} · 已验证 {time}<form method="post" action="/account/aliases/remove">{csrf}<input type="hidden" name="alias_email" value="{value}"><button type="submit">移除</button></form></li>'.format(
         address=h(item["alias_email"]), time=local_time(item["verified_at"]), csrf=csrf(user), value=h(item["alias_email"])) for item in aliases)
-    content = '''<nav class="back"><a href="/">← 返回发送批次</a></nav><section class="batch-head"><div><div class="eyebrow">邮箱授权</div><h1>让后台以你的邮箱发信</h1><p class="muted">当前登录：{user}。当前批次仍固定从这个邮箱发信；已获 mailcow 代发授权的地址可先在下方验证。</p></div></section>
+    content = '''<nav class="back"><a href="/">← 返回发送批次</a></nav><section class="batch-head"><div><div class="eyebrow">邮箱授权</div><h1>让后台以你的邮箱发信</h1><p class="muted">当前登录：{user}。此邮箱也可轮用已获 mailcow 授权的代发地址；所有邮件仍使用当前邮箱的 SMTP 登录和发送限额。</p></div></section>
 {alert}{confirmation}<div class="two-col"><section class="panel"><h2>配置应用密码</h2><p class="muted">请输入在邮箱设置中创建的应用密码。Wismail 会先测试登录，不会发送测试邮件；通过后加密保存，供定时任务使用。</p>
 <form method="post" action="/account">{csrf}<label for="smtp-password">SMTP 应用密码</label><input id="smtp-password" name="smtp_password" type="password" autocomplete="new-password" required>
 <label for="imap-password">IMAP 应用密码（可选）</label><input id="imap-password" name="imap_password" type="password" autocomplete="new-password">
@@ -624,7 +633,7 @@ def account_page(user, error="", success=False):
 <p class="muted">登录 Wismail 的密码只用于网页登录。后台定时发送需要独立的应用密码；该密码不会显示在页面或上传表格中。</p>
 <form method="post" action="/account/revoke">{csrf}<button class="button subtle" type="submit" onclick="return confirm('撤销授权后，正在排队的批次会暂停。确定撤销？')">撤销发件授权</button></form></section></div>
 <section class="panel"><h2>验证代发地址</h2><p>请先在 mailcow 为当前邮箱授予该地址的 send-as 权限。验证只执行 SMTP MAIL/RCPT 握手，不提交邮件内容；通过的地址暂不参与发送，后续可用于轮换。</p>
-<form method="post" action="/account/aliases/add">{csrf}<label>代发邮箱<input type="email" name="alias_email" required></label><button class="button" type="submit">验证并保存</button></form><ul>{alias_rows}</ul></section>'''.format(
+<form method="post" action="/account/aliases/add">{csrf}<label>代发邮箱<input type="email" name="alias_email" required></label><button class="button" type="submit">验证并保存</button></form><p class="muted">验证通过后可在待确认批次中勾选轮用。移除地址会暂停仍有该地址待发送邮件的批次。</p><ul>{alias_rows}</ul></section>'''.format(
         user=h(user), alert=alert, confirmation=confirmation, csrf=csrf(user), state=h(state),
         alias_rows=alias_rows,
         imap_state=h(imap_state), smtp_host=h(SETTINGS["SMTP_HOST"] or "未配置"),
@@ -1099,8 +1108,18 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("本批次每小时上限不能超过邮箱总上限")
                 else:
                     hourly_limit = None
+                senders = form.getlist("sender_email") or [account["SMTP_FROM"]]
+                if len(senders) > 10:
+                    raise ValueError("每批最多选择 10 个发件地址")
+                for sender in senders:
+                    if sender.lower() != account["SMTP_FROM"].lower():
+                        try:
+                            verify_sender_alias(DB_PATH, self.current_user, sender, SETTINGS)
+                        except Exception:
+                            raise ValueError("代发地址验证失败；请检查 mailcow send-as 授权")
                 schedule_batch(DB_PATH, batch_id, start, interval, int(SETTINGS["UTC_OFFSET_HOURS"]),
-                               track_open, track_click, form.getfirst("reply_to", ""), account["SMTP_FROM"], hourly_limit)
+                               track_open, track_click, form.getfirst("reply_to", ""), account["SMTP_FROM"], hourly_limit,
+                               senders)
             elif action == "pause":
                 set_batch_state(DB_PATH, batch_id, "paused")
             elif action == "resume":
