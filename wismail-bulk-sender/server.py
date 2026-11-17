@@ -25,7 +25,7 @@ from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, a
                   parse_contacts_upload, parse_upload, preflight_template, prepare_contact_campaign, render_template, report_data,
                   save_automation_rule, set_automation_rule, delete_automation_rule, save_scheduled_rule,
                   set_scheduled_rule, delete_scheduled_rule, save_template, send_template_test,
-                  revoke_mailbox_auth, save_contact, save_mailbox_auth, schedule_batch,
+                  revoke_mailbox_auth, remove_sender_alias, verify_sender_alias, save_contact, save_mailbox_auth, schedule_batch,
                   set_batch_state, set_contact_deleted, set_contact_status, tracking_ready,
                   record_tracking_event, verify_tracking_token, utcnow, verify_mailbox_auth)
 from core import unsubscribe_token, verify_unsubscribe_token
@@ -608,19 +608,25 @@ def batch_page(batch_id, error="", user="__legacy_admin__"):
 def account_page(user, error="", success=False):
     with connect(DB_PATH) as db:
         row = db.execute("SELECT updated_at,imap_password_enc FROM mailbox_auth WHERE owner_email=?", (user,)).fetchone()
+        aliases = db.execute("SELECT alias_email,verified_at FROM sender_aliases WHERE owner_email=? ORDER BY alias_email", (user,)).fetchall()
     alert = '<div class="alert">{}</div>'.format(h(error)) if error else ""
     confirmation = '<div class="notice">发件授权已验证并保存。现在可以返回首页启动批次。</div>' if success else ""
     state = ('已配置 · 上次更新 ' + local_time(row["updated_at"])) if row else "尚未配置"
     imap_state = "已开启" if row and row["imap_password_enc"] else "未开启"
-    content = '''<nav class="back"><a href="/">← 返回发送批次</a></nav><section class="batch-head"><div><div class="eyebrow">邮箱授权</div><h1>让后台以你的邮箱发信</h1><p class="muted">当前登录：{user}。发件人固定为这个邮箱地址，不能代其他账号发送。</p></div></section>
+    alias_rows = ''.join('<li>{address} · 已验证 {time}<form method="post" action="/account/aliases/remove">{csrf}<input type="hidden" name="alias_email" value="{value}"><button type="submit">移除</button></form></li>'.format(
+        address=h(item["alias_email"]), time=local_time(item["verified_at"]), csrf=csrf(user), value=h(item["alias_email"])) for item in aliases)
+    content = '''<nav class="back"><a href="/">← 返回发送批次</a></nav><section class="batch-head"><div><div class="eyebrow">邮箱授权</div><h1>让后台以你的邮箱发信</h1><p class="muted">当前登录：{user}。当前批次仍固定从这个邮箱发信；已获 mailcow 代发授权的地址可先在下方验证。</p></div></section>
 {alert}{confirmation}<div class="two-col"><section class="panel"><h2>配置应用密码</h2><p class="muted">请输入在邮箱设置中创建的应用密码。Wismail 会先测试登录，不会发送测试邮件；通过后加密保存，供定时任务使用。</p>
 <form method="post" action="/account">{csrf}<label for="smtp-password">SMTP 应用密码</label><input id="smtp-password" name="smtp_password" type="password" autocomplete="new-password" required>
 <label for="imap-password">IMAP 应用密码（可选）</label><input id="imap-password" name="imap_password" type="password" autocomplete="new-password">
 <p class="muted">配置 IMAP 后才能尝试统计回复和退信。部分邮箱可使用同一应用密码。</p><button class="button" type="submit">测试并保存授权</button></form></section>
 <section class="panel side"><h2>当前状态</h2><div class="account-state"><div><span>SMTP 发件授权</span><strong>{state}</strong></div><div><span>IMAP 状态同步</span><strong>{imap_state}</strong></div><div><span>SMTP 服务器</span><strong>{smtp_host}:{smtp_port}</strong></div><div><span>IMAP 服务器</span><strong>{imap_host}:{imap_port}</strong></div></div>
 <p class="muted">登录 Wismail 的密码只用于网页登录。后台定时发送需要独立的应用密码；该密码不会显示在页面或上传表格中。</p>
-<form method="post" action="/account/revoke">{csrf}<button class="button subtle" type="submit" onclick="return confirm('撤销授权后，正在排队的批次会暂停。确定撤销？')">撤销发件授权</button></form></section></div>'''.format(
+<form method="post" action="/account/revoke">{csrf}<button class="button subtle" type="submit" onclick="return confirm('撤销授权后，正在排队的批次会暂停。确定撤销？')">撤销发件授权</button></form></section></div>
+<section class="panel"><h2>验证代发地址</h2><p>请先在 mailcow 为当前邮箱授予该地址的 send-as 权限。验证只执行 SMTP MAIL/RCPT 握手，不提交邮件内容；通过的地址暂不参与发送，后续可用于轮换。</p>
+<form method="post" action="/account/aliases/add">{csrf}<label>代发邮箱<input type="email" name="alias_email" required></label><button class="button" type="submit">验证并保存</button></form><ul>{alias_rows}</ul></section>'''.format(
         user=h(user), alert=alert, confirmation=confirmation, csrf=csrf(user), state=h(state),
+        alias_rows=alias_rows,
         imap_state=h(imap_state), smtp_host=h(SETTINGS["SMTP_HOST"] or "未配置"),
         smtp_port=h(SETTINGS["SMTP_PORT"]), imap_host=h(SETTINGS["IMAP_HOST"] or "未配置"),
         imap_port=h(SETTINGS["IMAP_PORT"]))
@@ -935,6 +941,17 @@ class Handler(BaseHTTPRequestHandler):
                 revoke_mailbox_auth(DB_PATH, self.current_user)
                 self._redirect("/account")
                 return
+            if path == "/account/aliases/add" and oauth_login.configured(SETTINGS):
+                try:
+                    verify_sender_alias(DB_PATH, self.current_user, form.getfirst("alias_email", ""), SETTINGS)
+                except Exception:
+                    raise ValueError("代发地址验证失败；请检查 mailcow send-as 授权及 SMTP 连接")
+                self._redirect("/account")
+                return
+            if path == "/account/aliases/remove" and oauth_login.configured(SETTINGS):
+                remove_sender_alias(DB_PATH, self.current_user, form.getfirst("alias_email", ""))
+                self._redirect("/account")
+                return
             if path == "/suppressions":
                 add_suppression(DB_PATH, form.getfirst("email", ""), owner_email=self.current_user)
                 self._redirect("/")
@@ -1101,7 +1118,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/automations"):
                 self._send(400, automations_page(self.current_user, str(exc)))
                 return
-            if path == "/account" and oauth_login.configured(SETTINGS):
+            if path.startswith("/account") and oauth_login.configured(SETTINGS):
                 self._send(400, account_page(self.current_user, str(exc)))
                 return
             match = re.match(r"^/batches/(\d+)/", path)

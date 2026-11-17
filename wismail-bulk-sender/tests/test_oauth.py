@@ -109,6 +109,35 @@ class OAuthTests(unittest.TestCase):
         conn.close()
         self.assertIsNone(core.mailbox_settings(server.DB_PATH, "alice@example.com", server.SETTINGS))
 
+    def test_sender_alias_probe_never_sends_and_is_owner_scoped(self):
+        owner = "alice@example.com"
+        settings = dict(server.SETTINGS, SMTP_HOST="smtp.example.test", SMTP_PORT="587")
+        core.save_mailbox_auth(server.DB_PATH, owner, "smtp-app-secret", "", settings["CREDENTIAL_KEY"])
+        with mock.patch.object(core.smtplib, "SMTP") as smtp_class:
+            smtp = smtp_class.return_value
+            smtp.mail.return_value = (250, b"ok")
+            smtp.rcpt.return_value = (250, b"ok")
+            self.assertEqual(core.verify_sender_alias(server.DB_PATH, owner, "sales@example.com", settings),
+                             "sales@example.com")
+            smtp.login.assert_called_once_with(owner, "smtp-app-secret")
+            smtp.mail.assert_called_once_with("sales@example.com")
+            smtp.rcpt.assert_called_once_with(owner)
+            smtp.rset.assert_called_once()
+            smtp.sendmail.assert_not_called()
+            smtp.send_message.assert_not_called()
+            smtp.data.assert_not_called()
+            smtp.rcpt.return_value = (553, b"sender not allowed")
+            with self.assertRaisesRegex(ValueError, "未允许"):
+                core.verify_sender_alias(server.DB_PATH, owner, "other@example.com", settings)
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual([row[0] for row in db.execute("SELECT alias_email FROM sender_aliases")],
+                             ["sales@example.com"])
+        with self.assertRaisesRegex(ValueError, "不存在"):
+            core.remove_sender_alias(server.DB_PATH, "bob@example.com", "sales@example.com")
+        core.revoke_mailbox_auth(server.DB_PATH, owner)
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM sender_aliases").fetchone()[0], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

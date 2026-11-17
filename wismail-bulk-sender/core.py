@@ -128,6 +128,12 @@ def init_db(path):
           imap_password_enc TEXT,
           updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS sender_aliases (
+          owner_email TEXT NOT NULL,
+          alias_email TEXT NOT NULL,
+          verified_at TEXT NOT NULL,
+          PRIMARY KEY(owner_email,alias_email)
+        );
         CREATE TABLE IF NOT EXISTS imap_events (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           kind TEXT NOT NULL,
@@ -1176,6 +1182,7 @@ def save_mailbox_auth(path, owner_email, smtp_password, imap_password, encryptio
 def revoke_mailbox_auth(path, owner_email):
     with connect(path) as db:
         db.execute("DELETE FROM mailbox_auth WHERE owner_email=?", (owner_email,))
+        db.execute("DELETE FROM sender_aliases WHERE owner_email=?", (owner_email,))
         db.execute("UPDATE batches SET state='paused' WHERE owner_email=? AND state='active'", (owner_email,))
 
 
@@ -1228,6 +1235,52 @@ def verify_mailbox_auth(owner_email, smtp_password, imap_password, settings):
                 mailbox.logout()
             except Exception:
                 pass
+
+
+def verify_sender_alias(path, owner_email, alias_email, settings):
+    """Ask SMTP whether this login may use an envelope sender; never issue DATA."""
+    alias_email = str(alias_email or "").strip().lower()
+    if (not REPLY_ADDRESS_RE.fullmatch(owner_email) or not REPLY_ADDRESS_RE.fullmatch(alias_email) or len(alias_email) > 254 or
+            alias_email.startswith(".") or ".." in alias_email.split("@", 1)[0] or
+            alias_email == owner_email.lower()):
+        raise ValueError("请输入其他有效的发件邮箱地址")
+    account = mailbox_settings(path, owner_email, settings)
+    if not account or not all(account.get(key) for key in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD")):
+        raise ValueError("请先完成当前邮箱的 SMTP 授权")
+    port = int(account.get("SMTP_PORT", 587))
+    if port == 465:
+        smtp = smtplib.SMTP_SSL(account["SMTP_HOST"], port, timeout=15, context=ssl.create_default_context())
+    else:
+        smtp = smtplib.SMTP(account["SMTP_HOST"], port, timeout=15)
+    try:
+        if port != 465:
+            smtp.ehlo()
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.ehlo()
+        smtp.login(account["SMTP_USER"], account["SMTP_PASSWORD"])
+        code, _ = smtp.mail(alias_email)
+        if not 200 <= code < 300:
+            raise ValueError("mailcow 未允许当前账号使用此发件地址")
+        code, _ = smtp.rcpt(owner_email)
+        if not 200 <= code < 300:
+            raise ValueError("mailcow 未允许当前账号使用此发件地址")
+        smtp.rset()
+    finally:
+        try:
+            smtp.quit()
+        except Exception:
+            smtp.close()
+    with connect(path) as db:
+        db.execute("INSERT OR REPLACE INTO sender_aliases(owner_email,alias_email,verified_at) VALUES (?,?,?)",
+                   (owner_email, alias_email, iso(utcnow())))
+    return alias_email
+
+
+def remove_sender_alias(path, owner_email, alias_email):
+    with connect(path) as db:
+        if not db.execute("DELETE FROM sender_aliases WHERE owner_email=? AND alias_email=?",
+                          (owner_email, str(alias_email or "").strip().lower())).rowcount:
+            raise ValueError("代发地址不存在")
 
 
 def schedule_batch(path, batch_id, start_local, interval_seconds, offset_hours=8,
