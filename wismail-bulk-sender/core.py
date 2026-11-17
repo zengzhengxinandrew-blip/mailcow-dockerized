@@ -763,7 +763,7 @@ def add_suppression(path, recipient, reason="手动添加", owner_email="__legac
             _apply_automation_event(db, owner_email, recipient, "unsubscribe", event_key)
 
 
-AUTOMATION_EVENTS = {"open": "观测打开", "click": "观测点击", "unsubscribe": "收件人退订"}
+AUTOMATION_EVENTS = {"open": "观测打开", "click": "观测点击", "unsubscribe": "收件人退订", "birthday": "联系人生日"}
 
 
 def save_automation_rule(path, owner_email, event_kind, category_name, followup_template_id=None):
@@ -775,6 +775,8 @@ def save_automation_rule(path, owner_email, event_kind, category_name, followup_
     followup_template_id = int(followup_template_id or 0) or None
     if followup_template_id and event_kind == "unsubscribe":
         raise ValueError("退订行为不能生成后续邮件草稿")
+    if event_kind == "birthday" and not followup_template_id:
+        raise ValueError("生日规则必须选择邮件模板")
     with connect(path) as db:
         if followup_template_id and not db.execute(
                 "SELECT 1 FROM templates WHERE id=? AND owner_email=?", (followup_template_id, owner_email)).fetchone():
@@ -870,6 +872,29 @@ def _apply_automation_event(db, owner_email, recipient_email, event_kind, event_
         _create_automation_draft(db, owner_email, contact, rule, event_key)
         applied += 1
     return applied
+
+
+def run_birthday_automations(path, now=None, offset_hours=8):
+    """Generate review-only drafts once per local birthday and rule, including after a restart."""
+    now = now or utcnow()
+    local_date = (now + dt.timedelta(hours=offset_hours)).date()
+    month_day = local_date.strftime("%m-%d")
+    created = 0
+    with connect(path) as db:
+        contacts = db.execute("""SELECT c.id,c.owner_email,c.email,c.birthday FROM contacts c
+                                 WHERE c.status='subscribed' AND c.deleted_at IS NULL
+                                 AND length(c.birthday)=10 AND substr(c.birthday,6,5)=?
+                                 AND EXISTS (SELECT 1 FROM automation_rules r WHERE
+                                   r.owner_email=c.owner_email AND r.event_kind='birthday' AND r.enabled=1)
+                                 ORDER BY c.id""", (month_day,)).fetchall()
+        for contact in contacts:
+            try:
+                dt.datetime.strptime(contact["birthday"], "%Y-%m-%d")
+            except ValueError:
+                continue
+            key = "birthday:{}:{}".format(local_date.isoformat(), contact["id"])
+            created += _apply_automation_event(db, contact["owner_email"], contact["email"], "birthday", key)
+    return created
 
 
 CONTACT_STATUSES = {"subscribed", "unsubscribed", "complained", "invalid"}
@@ -1527,11 +1552,18 @@ class Worker(threading.Thread):
 
     def run(self):
         next_imap = utcnow()
+        next_birthday = utcnow()
         while not self.stop_event.is_set():
             try:
                 dispatch_one(self.path, self.settings)
             except Exception as exc:
                 print("发送任务检查失败：{}".format(exc))
+            if utcnow() >= next_birthday:
+                try:
+                    run_birthday_automations(self.path, offset_hours=int(self.settings["UTC_OFFSET_HOURS"]))
+                except Exception as exc:
+                    print("生日草稿检查失败：{}".format(exc))
+                next_birthday = utcnow() + dt.timedelta(minutes=5)
             if utcnow() >= next_imap:
                 with connect(self.path) as db:
                     owners = [row["owner_email"] for row in db.execute("SELECT owner_email FROM mailbox_auth")]

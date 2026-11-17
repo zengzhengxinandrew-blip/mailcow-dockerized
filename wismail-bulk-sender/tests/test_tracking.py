@@ -1,5 +1,6 @@
 import os
 import re
+import datetime as dt
 import sqlite3
 import tempfile
 import unittest
@@ -163,6 +164,37 @@ class TrackingTests(unittest.TestCase):
         with core.connect(self.path) as db:
             row = db.execute("SELECT status,batch_id FROM automation_drafts WHERE rule_id=?", (rule,)).fetchone()
             self.assertEqual(tuple(row), ("skipped", None))
+
+    def test_birthday_rule_uses_local_date_and_deduplicates_each_year(self):
+        owner = "sender@example.com"
+        core.save_contact(self.path, owner, {"email": "buyer@example.com", "name": "Buyer",
+                                             "birthday": "2000-11-18"})
+        template_id, _ = core.save_template(self.path, owner, "生日", "生日快乐 {{姓名}}", "祝好")
+        rule = core.save_automation_rule(self.path, owner, "birthday", "生日联系人", template_id)
+        before = dt.datetime(2026, 11, 17, 15, 59, tzinfo=dt.timezone.utc)
+        due = dt.datetime(2026, 11, 17, 16, 0, tzinfo=dt.timezone.utc)
+        self.assertEqual(core.run_birthday_automations(self.path, before, 8), 0)
+        self.assertEqual(core.run_birthday_automations(self.path, due, 8), 1)
+        self.assertEqual(core.run_birthday_automations(self.path, due, 8), 0)
+        with core.connect(self.path) as db:
+            row = db.execute("""SELECT b.state,m.subject,m.status FROM automation_drafts d
+                                JOIN batches b ON b.id=d.batch_id JOIN messages m ON m.batch_id=b.id
+                                WHERE d.rule_id=?""", (rule,)).fetchone()
+            self.assertEqual(tuple(row), ("draft", "生日快乐 Buyer", "draft"))
+        next_year = dt.datetime(2027, 11, 17, 16, 0, tzinfo=dt.timezone.utc)
+        self.assertEqual(core.run_birthday_automations(self.path, next_year, 8), 1)
+
+    def test_birthday_rule_needs_template_and_leap_day_only_occurs_in_leap_year(self):
+        owner = "sender@example.com"
+        with self.assertRaisesRegex(ValueError, "必须选择"):
+            core.save_automation_rule(self.path, owner, "birthday", "生日")
+        core.save_contact(self.path, owner, {"email": "leap@example.com", "birthday": "2000-02-29"})
+        template_id, _ = core.save_template(self.path, owner, "生日", "主题", "正文")
+        core.save_automation_rule(self.path, owner, "birthday", "生日", template_id)
+        ordinary = dt.datetime(2027, 2, 28, 4, tzinfo=dt.timezone.utc)
+        leap = dt.datetime(2028, 2, 29, 4, tzinfo=dt.timezone.utc)
+        self.assertEqual(core.run_birthday_automations(self.path, ordinary, 0), 0)
+        self.assertEqual(core.run_birthday_automations(self.path, leap, 0), 1)
 
     def test_paused_rule_does_not_replay_old_click(self):
         owner = "sender@example.com"

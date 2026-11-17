@@ -92,7 +92,7 @@ def page(title, content, user=""):
     account_link = ('<span class="top-meta">{}</span><a class="top-account" href="/account">发件授权</a>'
                     '<a class="top-account" href="/logout">退出</a>'.format(h(user)) if oauth_login.configured(SETTINGS) and user
                     else '<span class="top-meta">外贸邮件工作台 / V2</span>')
-    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/campaigns">创建任务</a><a class="top-account" href="/automations">自动分类</a><a class="top-account" href="/reports">统计报表</a>' + account_link
+    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/campaigns">创建任务</a><a class="top-account" href="/automations">自动化</a><a class="top-account" href="/reports">统计报表</a>' + account_link
     markup = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Wismail</title>
 <link rel="stylesheet" href="/static.css"></head><body>
@@ -326,8 +326,8 @@ def automations_page(user, error=""):
         else '未生成：' + h(row["detail"])) for row in draft_events)
     alert = '<div class="alert">{}</div>'.format(h(error)) if error else ''
     content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>行为规则</h1>{alert}
-<p>新发生的打开、点击或退订行为可以给联系人加分类。打开和点击还能生成使用所选模板的单人待确认草稿；须人工检查并启动，不会自动发送。</p>
-<p class="muted">打开和点击是请求观测值，可能由图片代理或安全扫描触发；退订会继续停止该联系人的排队邮件。</p>
+<p>新发生的打开、点击、退订或生日事件可以给联系人加分类。打开、点击和生日还能生成使用所选模板的单人待确认草稿；须人工检查并启动，不会自动发送。</p>
+<p class="muted">生日按服务器设置的时区每天检查，同一联系人每年每条规则最多生成一次；生日规则必须选择模板。2 月 29 日只在闰年触发。打开和点击可能由代理或安全扫描触发；退订会停止排队邮件，也不能生成后续草稿。</p>
 <form method="post" action="/automations/add">{csrf}<div class="campaign-grid"><label>触发行为<select name="event_kind" required>{options}</select></label><label>添加到分类<input name="category_name" maxlength="80" required placeholder="例如：点击过产品邮件"></label><label>后续草稿模板（可选）<select name="followup_template_id"><option value="">不生成草稿</option>{template_options}</select></label></div><button class="button" type="submit">创建规则</button></form></section>
 <section class="list-section"><h2>我的规则</h2><div class="table-wrap"><table><thead><tr><th>触发行为</th><th>添加分类</th><th>草稿模板</th><th>状态</th><th>触发次数</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table></div></section>
 <section class="list-section"><h2>最近生成的草稿</h2><div class="table-wrap"><table><thead><tr><th>时间</th><th>联系人</th><th>结果</th></tr></thead><tbody>{draft_rows}</tbody></table></div></section>
@@ -335,7 +335,7 @@ def automations_page(user, error=""):
         alert=alert, csrf=csrf(user), options=options, template_options=template_options,
         rows=rows or '<tr><td colspan="6">还没有行为规则。</td></tr>', draft_rows=draft_rows or '<tr><td colspan="3">还没有草稿记录。</td></tr>',
         history=history or '<tr><td colspan="3">还没有新行为触发规则。</td></tr>')
-    return page("自动分类", content, user)
+    return page("自动化", content, user)
 
 
 def templates_page(user, error="", selected_id=0, selected_version=None, preview_contact_id=0, precheck=False):
