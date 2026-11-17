@@ -61,6 +61,44 @@ class ContactTests(unittest.TestCase):
         with core.connect(self.path) as db:
             self.assertEqual(db.execute("SELECT status FROM contacts").fetchone()["status"], "unsubscribed")
 
+    def test_category_management_preserves_status_and_rule_references(self):
+        owner = "a@example.com"
+        contact_id = core.save_contact(self.path, owner, {"email": "buyer@example.com", "categories": "客户"})
+        core.set_contact_status(self.path, owner, contact_id, "unsubscribed")
+        category_id = core.create_category(self.path, owner, "重点")
+        core.set_contact_category(self.path, owner, contact_id, category_id, True)
+        with self.assertRaisesRegex(ValueError, "联系人不存在"):
+            core.set_contact_category(self.path, "b@example.com", contact_id, category_id, False)
+        core.rename_category(self.path, owner, category_id, "优先")
+        with core.connect(self.path) as db:
+            row = db.execute("""SELECT c.status,g.name FROM contacts c JOIN contact_category_links l
+                                ON l.contact_id=c.id JOIN contact_categories g ON g.id=l.category_id
+                                WHERE c.id=? AND g.id=?""", (contact_id, category_id)).fetchone()
+            self.assertEqual(tuple(row), ("unsubscribed", "优先"))
+        core.set_contact_category(self.path, owner, contact_id, category_id, False)
+        core.delete_category(self.path, owner, category_id)
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT status FROM contacts WHERE id=?", (contact_id,)).fetchone()[0],
+                             "unsubscribed")
+
+    def test_category_rename_updates_automations_and_active_category_cannot_be_deleted(self):
+        owner = "a@example.com"
+        contact_id = core.save_contact(self.path, owner, {"email": "buyer@example.com", "categories": "客户"})
+        template_id, _ = core.save_template(self.path, owner, "测试", "主题", "正文")
+        core.save_automation_rule(self.path, owner, "click", "客户")
+        core.save_scheduled_rule(self.path, owner, "weekly", "1", "客户", template_id)
+        with core.connect(self.path) as db:
+            category_id = db.execute("SELECT id FROM contact_categories WHERE owner_email=? AND name='客户'",
+                                     (owner,)).fetchone()[0]
+        core.rename_category(self.path, owner, category_id, "新客户")
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT category_name FROM automation_rules").fetchone()[0], "新客户")
+            self.assertEqual(db.execute("SELECT target_category FROM scheduled_rules").fetchone()[0], "新客户")
+        with self.assertRaisesRegex(ValueError, "规则"):
+            core.delete_category(self.path, owner, category_id)
+        with self.assertRaisesRegex(ValueError, "分类不存在"):
+            core.rename_category(self.path, "b@example.com", category_id, "外部")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1103,6 +1103,73 @@ def import_contacts(path, owner_email, contacts):
     return len(contacts)
 
 
+def _category_name(value):
+    name = str(value or "").strip()
+    if not name or len(name) > 80 or re.search(r"[,，;；\x00-\x1f]", name):
+        raise ValueError("分类名称需为 1 至 80 个字符，且不能包含逗号或分号")
+    return name
+
+
+def create_category(path, owner_email, name):
+    name = _category_name(name)
+    with connect(path) as db:
+        if db.execute("SELECT COUNT(*) FROM contact_categories WHERE owner_email=?", (owner_email,)).fetchone()[0] >= 100:
+            raise ValueError("每个账号最多创建 100 个分类")
+        try:
+            return db.execute("INSERT INTO contact_categories(owner_email,name) VALUES (?,?)",
+                              (owner_email, name)).lastrowid
+        except sqlite3.IntegrityError:
+            raise ValueError("分类已存在")
+
+
+def rename_category(path, owner_email, category_id, name):
+    name = _category_name(name)
+    with connect(path) as db:
+        old = db.execute("SELECT name FROM contact_categories WHERE id=? AND owner_email=?",
+                         (category_id, owner_email)).fetchone()
+        if not old:
+            raise ValueError("分类不存在")
+        if old["name"] == name:
+            return
+        if db.execute("SELECT 1 FROM contact_categories WHERE owner_email=? AND name=?",
+                      (owner_email, name)).fetchone():
+            raise ValueError("目标分类已存在")
+        db.execute("UPDATE contact_categories SET name=? WHERE id=?", (name, category_id))
+        db.execute("UPDATE automation_rules SET category_name=? WHERE owner_email=? AND category_name=?",
+                   (name, owner_email, old["name"]))
+        db.execute("UPDATE scheduled_rules SET target_category=? WHERE owner_email=? AND target_category=?",
+                   (name, owner_email, old["name"]))
+
+
+def delete_category(path, owner_email, category_id):
+    with connect(path) as db:
+        row = db.execute("SELECT name FROM contact_categories WHERE id=? AND owner_email=?",
+                         (category_id, owner_email)).fetchone()
+        if not row:
+            raise ValueError("分类不存在")
+        if (db.execute("SELECT 1 FROM automation_rules WHERE owner_email=? AND category_name=?",
+                       (owner_email, row["name"])).fetchone() or
+                db.execute("SELECT 1 FROM scheduled_rules WHERE owner_email=? AND target_category=?",
+                           (owner_email, row["name"])).fetchone()):
+            raise ValueError("该分类正被自动化规则使用，请先删除相关规则")
+        db.execute("DELETE FROM contact_categories WHERE id=?", (category_id,))
+
+
+def set_contact_category(path, owner_email, contact_id, category_id, add):
+    with connect(path) as db:
+        if not db.execute("SELECT 1 FROM contacts WHERE id=? AND owner_email=?", (contact_id, owner_email)).fetchone():
+            raise ValueError("联系人不存在")
+        if not db.execute("SELECT 1 FROM contact_categories WHERE id=? AND owner_email=?",
+                          (category_id, owner_email)).fetchone():
+            raise ValueError("分类不存在")
+        if add:
+            db.execute("INSERT OR IGNORE INTO contact_category_links(contact_id,category_id) VALUES (?,?)",
+                       (contact_id, category_id))
+        else:
+            db.execute("DELETE FROM contact_category_links WHERE contact_id=? AND category_id=?",
+                       (contact_id, category_id))
+
+
 def set_contact_status(path, owner_email, contact_id, status, reason=""):
     if status not in CONTACT_STATUSES - {"subscribed"}:
         raise ValueError("不支持的联系人状态")

@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 from cryptography.fernet import Fernet
 
-from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_draft,
+from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_category, rename_category, delete_category, set_contact_category, create_draft,
                   create_contact_campaign, get_template, import_contacts, init_db, mailbox_settings,
                   parse_contacts_upload, parse_upload, preflight_template, prepare_contact_campaign, render_template, report_data,
                   save_automation_rule, set_automation_rule, delete_automation_rule, save_scheduled_rule,
@@ -271,9 +271,15 @@ def contacts_page(user, error="", search="", status="", category="", recycle=Fal
         params += [user, category]
     with connect(DB_PATH) as db:
         rows = db.execute(query + " ORDER BY c.id DESC LIMIT 200", params).fetchall()
-        categories = db.execute("SELECT name FROM contact_categories WHERE owner_email=? ORDER BY name", (user,)).fetchall()
+        categories = db.execute("""SELECT g.id,g.name,(SELECT COUNT(*) FROM contact_category_links l
+                                   WHERE l.category_id=g.id) AS members FROM contact_categories g
+                                   WHERE g.owner_email=? ORDER BY g.name""", (user,)).fetchall()
         count = db.execute("SELECT COUNT(*) AS n FROM contacts WHERE owner_email=?", (user,)).fetchone()["n"]
     options = ''.join('<option value="{0}" {1}>{0}</option>'.format(h(x["name"]), 'selected' if x["name"] == category else '') for x in categories)
+    category_options = ''.join('<option value="{}">{}</option>'.format(x["id"], h(x["name"])) for x in categories)
+    contact_options = ''.join('<option value="{}">{}</option>'.format(x["id"], h(x["email"])) for x in rows if not recycle)
+    category_rows = ''.join('''<tr><td>{name}</td><td>{members}</td><td><form method="post" action="/contacts/categories/rename">{csrf}<input type="hidden" name="id" value="{id}"><input name="name" value="{name}" maxlength="80" required><button type="submit">重命名</button></form><form method="post" action="/contacts/categories/delete">{csrf}<input type="hidden" name="id" value="{id}"><button type="submit" onclick="return confirm('删除分类会移除联系人的这个分类。确定删除？')">删除</button></form></td></tr>'''.format(
+        name=h(x["name"]), members=x["members"], csrf=csrf(user), id=x["id"]) for x in categories)
     items = []
     for row in rows:
         actions = ('<form method="post" action="/contacts/restore">{csrf}<input type="hidden" name="id" value="{id}"><button type="submit">恢复</button></form>' if recycle else
@@ -287,8 +293,13 @@ def contacts_page(user, error="", search="", status="", category="", recycle=Fal
 <div class="two-col"><form method="post" action="/contacts/add">{csrf}<h2>添加联系人</h2><label>邮箱</label><input type="email" name="email" required><label>姓名</label><input name="name"><label>分类（逗号分隔）</label><input name="categories"><button class="button" type="submit">保存</button></form>
 <form method="post" action="/contacts/import" enctype="multipart/form-data">{csrf}<h2>导入联系人</h2><p>CSV 或 XLSX：邮箱、姓名、性别、生日、手机、地区、分类、变量1至变量10。</p><input type="file" name="file" accept=".csv,.xlsx" required><button class="button" type="submit">导入并合并</button></form></div></section>
 <section class="panel"><form method="get" action="/contacts"><input name="q" value="{search}" placeholder="搜索邮箱或姓名"><select name="status"><option value="">全部状态</option><option value="subscribed" {subscribed}>可发送</option><option value="unsubscribed" {unsubscribed}>退订</option><option value="complained" {complained}>投诉</option><option value="invalid" {invalid}>无效</option></select><select name="category"><option value="">全部分类</option>{options}</select><button type="submit">筛选</button></form>
-<p><a href="/contacts/export.csv">导出全部联系人 CSV</a> · <a href="/contacts?recycle=1">回收站</a></p><div class="table-wrap"><table><thead><tr><th>邮箱</th><th>姓名</th><th>分类</th><th>状态</th><th>操作</th></tr></thead><tbody>{items}</tbody></table></div></section>'''.format(
+<p><a href="/contacts/export.csv">导出全部联系人 CSV</a> · <a href="/contacts?recycle=1">回收站</a></p><div class="table-wrap"><table><thead><tr><th>邮箱</th><th>姓名</th><th>分类</th><th>状态</th><th>操作</th></tr></thead><tbody>{items}</tbody></table></div></section>
+<section class="panel"><h2>分类管理</h2><form method="post" action="/contacts/categories/create">{csrf}<label>新分类名称<input name="name" maxlength="80" required></label><button class="button" type="submit">创建分类</button></form>
+<div class="table-wrap"><table><thead><tr><th>分类</th><th>联系人</th><th>操作</th></tr></thead><tbody>{category_rows}</tbody></table></div>
+<h3>调整联系人分类</h3><p class="muted">下方联系人来自当前列表（最多 200 人）。移除分类不会改变退订、投诉或无效状态。</p><form method="post" action="/contacts/categories/assign">{csrf}<label>联系人<select name="contact_id" required>{contact_options}</select></label><label>分类<select name="category_id" required>{category_options}</select></label><label>操作<select name="action"><option value="add">添加</option><option value="remove">移除</option></select></label><button class="button" type="submit">保存</button></form></section>'''.format(
         count=count, alert=alert, csrf=csrf(user), search=h(search), options=options,
+        category_options=category_options, contact_options=contact_options,
+        category_rows=category_rows or '<tr><td colspan="3">还没有分类。</td></tr>',
         items=''.join(items) or '<tr><td colspan="5">暂无联系人</td></tr>',
         **{key: 'selected' if status == key else '' for key in ('subscribed', 'unsubscribed', 'complained', 'invalid')})
     return page("联系人", content, user)
@@ -1057,6 +1068,26 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/contacts/status":
                 set_contact_status(DB_PATH, self.current_user, int(form.getfirst("id", "0")), form.getfirst("status", ""))
+                self._redirect("/contacts")
+                return
+            if path == "/contacts/categories/create":
+                create_category(DB_PATH, self.current_user, form.getfirst("name", ""))
+                self._redirect("/contacts")
+                return
+            if path == "/contacts/categories/rename":
+                rename_category(DB_PATH, self.current_user, int(form.getfirst("id", "0")), form.getfirst("name", ""))
+                self._redirect("/contacts")
+                return
+            if path == "/contacts/categories/delete":
+                delete_category(DB_PATH, self.current_user, int(form.getfirst("id", "0")))
+                self._redirect("/contacts")
+                return
+            if path == "/contacts/categories/assign":
+                action = form.getfirst("action", "")
+                if action not in ("add", "remove"):
+                    raise ValueError("分类操作无效")
+                set_contact_category(DB_PATH, self.current_user, int(form.getfirst("contact_id", "0")),
+                                     int(form.getfirst("category_id", "0")), action == "add")
                 self._redirect("/contacts")
                 return
             if path in ("/contacts/delete", "/contacts/restore"):
