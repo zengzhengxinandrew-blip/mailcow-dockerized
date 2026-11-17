@@ -193,6 +193,27 @@ def init_db(path):
           created_at TEXT NOT NULL,
           PRIMARY KEY(rule_id,event_key)
         );
+        CREATE TABLE IF NOT EXISTS scheduled_rules (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          owner_email TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          schedule_value TEXT NOT NULL,
+          target_category TEXT NOT NULL,
+          template_id INTEGER NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          UNIQUE(owner_email,kind,schedule_value,target_category,template_id)
+        );
+        CREATE TABLE IF NOT EXISTS scheduled_runs (
+          rule_id INTEGER NOT NULL REFERENCES scheduled_rules(id) ON DELETE CASCADE,
+          occurrence_date TEXT NOT NULL,
+          contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+          batch_id INTEGER REFERENCES batches(id) ON DELETE SET NULL,
+          status TEXT NOT NULL,
+          detail TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(rule_id,occurrence_date,contact_id)
+        );
         CREATE TABLE IF NOT EXISTS templates (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           owner_email TEXT NOT NULL,
@@ -812,11 +833,8 @@ def delete_automation_rule(path, owner_email, rule_id):
             raise ValueError("自动分类规则不存在")
 
 
-def _create_automation_draft(db, owner_email, contact, rule, event_key):
-    """Create one reviewable draft in the event transaction; never queue or send it."""
-    template_id = rule["followup_template_id"]
-    if not template_id:
-        return
+def _create_review_draft(db, owner_email, contact, template_id, name):
+    """Create one owned review-only draft in the current transaction."""
     template = db.execute("""SELECT t.id,t.name,v.version,v.subject,v.body_text,v.body_html
                              FROM templates t JOIN template_versions v ON v.template_id=t.id
                              WHERE t.id=? AND t.owner_email=? AND v.version=(
@@ -837,11 +855,20 @@ def _create_automation_draft(db, owner_email, contact, rule, event_key):
     batch_id = None
     if not reason:
         batch_id = db.execute("INSERT INTO batches(owner_email,name,state,created_at) VALUES (?,?, 'draft',?)",
-                              (owner_email, ("自动草稿：" + rule["category_name"])[:120], iso(utcnow()))).lastrowid
+                              (owner_email, ("自动草稿：" + name)[:120], iso(utcnow()))).lastrowid
         db.execute("""INSERT INTO messages(batch_id,row_number,recipient_email,subject,body,body_html,
                       template_id,template_name,template_version) VALUES (?,?,?,?,?,?,?,?,?)""",
                    (batch_id, 1, contact["email"], subject, body, body_html,
                     template["id"], template["name"], template["version"]))
+    return batch_id, reason
+
+
+def _create_automation_draft(db, owner_email, contact, rule, event_key):
+    """Create one reviewable draft in the event transaction; never queue or send it."""
+    if not rule["followup_template_id"]:
+        return
+    batch_id, reason = _create_review_draft(db, owner_email, contact,
+                                            rule["followup_template_id"], rule["category_name"])
     db.execute("""INSERT INTO automation_drafts(rule_id,event_key,contact_id,batch_id,status,detail,created_at)
                   VALUES (?,?,?,?,?,?,?)""", (rule["id"], event_key, contact["id"], batch_id,
                                              "draft" if batch_id else "skipped", reason, iso(utcnow())))
@@ -894,6 +921,88 @@ def run_birthday_automations(path, now=None, offset_hours=8):
                 continue
             key = "birthday:{}:{}".format(local_date.isoformat(), contact["id"])
             created += _apply_automation_event(db, contact["owner_email"], contact["email"], "birthday", key)
+    return created
+
+
+SCHEDULE_KINDS = {"holiday": "每年指定日期", "weekly": "每周", "monthly": "每月"}
+
+
+def save_scheduled_rule(path, owner_email, kind, schedule_value, target_category, template_id):
+    schedule_value = str(schedule_value or "").strip()
+    target_category = str(target_category or "").strip()
+    template_id = int(template_id or 0)
+    if kind not in SCHEDULE_KINDS:
+        raise ValueError("请选择支持的循环类型")
+    if kind == "holiday":
+        if not re.fullmatch(r"\d{2}-\d{2}", schedule_value):
+            raise ValueError("指定日期请填写 MM-DD，例如 01-01")
+        try:
+            dt.datetime.strptime("2000-" + schedule_value, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("指定日期不存在")
+    elif kind == "weekly" and schedule_value not in {str(i) for i in range(1, 8)}:
+        raise ValueError("每周日期须为 1 至 7，周一为 1")
+    elif kind == "monthly" and schedule_value not in {str(i) for i in range(1, 32)}:
+        raise ValueError("每月日期须为 1 至 31")
+    with connect(path) as db:
+        if not db.execute("SELECT 1 FROM contact_categories WHERE owner_email=? AND name=?",
+                          (owner_email, target_category)).fetchone():
+            raise ValueError("请选择已有的联系人分类")
+        if not db.execute("SELECT 1 FROM templates WHERE id=? AND owner_email=?",
+                          (template_id, owner_email)).fetchone():
+            raise ValueError("只能选择自己的邮件模板")
+        if db.execute("SELECT COUNT(*) FROM scheduled_rules WHERE owner_email=?", (owner_email,)).fetchone()[0] >= 20:
+            raise ValueError("每个账号最多创建 20 条定时规则")
+        try:
+            return db.execute("""INSERT INTO scheduled_rules(owner_email,kind,schedule_value,target_category,
+                                 template_id,created_at) VALUES (?,?,?,?,?,?)""",
+                              (owner_email, kind, schedule_value, target_category, template_id, iso(utcnow()))).lastrowid
+        except sqlite3.IntegrityError:
+            raise ValueError("相同的定时规则已存在")
+
+
+def set_scheduled_rule(path, owner_email, rule_id, enabled):
+    with connect(path) as db:
+        if not db.execute("UPDATE scheduled_rules SET enabled=? WHERE id=? AND owner_email=?",
+                          (int(bool(enabled)), rule_id, owner_email)).rowcount:
+            raise ValueError("定时规则不存在")
+
+
+def delete_scheduled_rule(path, owner_email, rule_id):
+    with connect(path) as db:
+        if not db.execute("DELETE FROM scheduled_rules WHERE id=? AND owner_email=?",
+                          (rule_id, owner_email)).rowcount:
+            raise ValueError("定时规则不存在")
+
+
+def run_scheduled_automations(path, now=None, offset_hours=8):
+    """Draft for due category members once per local date; short months do not shift a monthly date."""
+    local_date = ((now or utcnow()) + dt.timedelta(hours=offset_hours)).date()
+    created = 0
+    with connect(path) as db:
+        rules = db.execute("SELECT * FROM scheduled_rules WHERE enabled=1 ORDER BY id").fetchall()
+        for rule in rules:
+            due = ((rule["kind"] == "holiday" and rule["schedule_value"] == local_date.strftime("%m-%d")) or
+                   (rule["kind"] == "weekly" and rule["schedule_value"] == str(local_date.isoweekday())) or
+                   (rule["kind"] == "monthly" and rule["schedule_value"] == str(local_date.day)))
+            if not due:
+                continue
+            contacts = db.execute("""SELECT c.* FROM contacts c JOIN contact_category_links l ON l.contact_id=c.id
+                                     JOIN contact_categories g ON g.id=l.category_id
+                                     WHERE c.owner_email=? AND c.status='subscribed' AND c.deleted_at IS NULL
+                                     AND g.owner_email=? AND g.name=? AND NOT EXISTS (
+                                       SELECT 1 FROM scheduled_runs s WHERE s.rule_id=?
+                                       AND s.occurrence_date=? AND s.contact_id=c.id)
+                                     ORDER BY c.id LIMIT 100""",
+                                  (rule["owner_email"], rule["owner_email"], rule["target_category"],
+                                   rule["id"], local_date.isoformat())).fetchall()
+            for contact in contacts:
+                batch_id, reason = _create_review_draft(db, rule["owner_email"], contact,
+                                                        rule["template_id"], rule["target_category"])
+                db.execute("""INSERT INTO scheduled_runs(rule_id,occurrence_date,contact_id,batch_id,status,detail,created_at)
+                              VALUES (?,?,?,?,?,?,?)""", (rule["id"], local_date.isoformat(), contact["id"],
+                                                          batch_id, "draft" if batch_id else "skipped", reason, iso(utcnow())))
+                created += 1
     return created
 
 
@@ -1561,8 +1670,9 @@ class Worker(threading.Thread):
             if utcnow() >= next_birthday:
                 try:
                     run_birthday_automations(self.path, offset_hours=int(self.settings["UTC_OFFSET_HOURS"]))
+                    run_scheduled_automations(self.path, offset_hours=int(self.settings["UTC_OFFSET_HOURS"]))
                 except Exception as exc:
-                    print("生日草稿检查失败：{}".format(exc))
+                    print("定时草稿检查失败：{}".format(exc))
                 next_birthday = utcnow() + dt.timedelta(minutes=5)
             if utcnow() >= next_imap:
                 with connect(self.path) as db:

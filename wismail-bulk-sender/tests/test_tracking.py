@@ -196,6 +196,57 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(core.run_birthday_automations(self.path, ordinary, 0), 0)
         self.assertEqual(core.run_birthday_automations(self.path, leap, 0), 1)
 
+    def test_scheduled_rules_target_owned_category_and_deduplicate(self):
+        owner = "sender@example.com"
+        core.save_contact(self.path, owner, {"email": "buyer@example.com", "name": "Buyer", "categories": "客户"})
+        core.save_contact(self.path, owner, {"email": "outside@example.com", "categories": "其他"})
+        core.save_contact(self.path, "other@example.com", {"email": "private@example.com", "categories": "客户"})
+        template_id, _ = core.save_template(self.path, owner, "跟进", "你好 {{姓名}}", "正文")
+        rule = core.save_scheduled_rule(self.path, owner, "weekly", "3", "客户", template_id)
+        before = dt.datetime(2026, 11, 17, 15, 59, tzinfo=dt.timezone.utc)
+        due = dt.datetime(2026, 11, 17, 16, 0, tzinfo=dt.timezone.utc)
+        self.assertEqual(core.run_scheduled_automations(self.path, before, 8), 0)
+        with mock.patch.object(core, "_smtp_submit") as submit:
+            self.assertEqual(core.run_scheduled_automations(self.path, due, 8), 1)
+            self.assertEqual(core.run_scheduled_automations(self.path, due, 8), 0)
+            submit.assert_not_called()
+        with core.connect(self.path) as db:
+            row = db.execute("""SELECT b.owner_email,b.state,m.recipient_email,m.subject,m.status
+                                FROM scheduled_runs s JOIN batches b ON b.id=s.batch_id
+                                JOIN messages m ON m.batch_id=b.id WHERE s.rule_id=?""", (rule,)).fetchone()
+            self.assertEqual(tuple(row), (owner, "draft", "buyer@example.com", "你好 Buyer", "draft"))
+        core.set_scheduled_rule(self.path, owner, rule, False)
+        self.assertEqual(core.run_scheduled_automations(self.path, due + dt.timedelta(days=7), 8), 0)
+        core.set_scheduled_rule(self.path, owner, rule, True)
+        self.assertEqual(core.run_scheduled_automations(self.path, due + dt.timedelta(days=7), 8), 1)
+
+    def test_holiday_and_monthly_dates_skip_missing_days_and_suppression(self):
+        owner = "sender@example.com"
+        core.save_contact(self.path, owner, {"email": "buyer@example.com", "categories": "客户"})
+        template_id, _ = core.save_template(self.path, owner, "节日", "主题", "正文")
+        core.save_scheduled_rule(self.path, owner, "holiday", "02-29", "客户", template_id)
+        core.save_scheduled_rule(self.path, owner, "monthly", "31", "客户", template_id)
+        self.assertEqual(core.run_scheduled_automations(self.path, dt.datetime(2027, 2, 28, tzinfo=dt.timezone.utc), 0), 0)
+        self.assertEqual(core.run_scheduled_automations(self.path, dt.datetime(2028, 2, 29, tzinfo=dt.timezone.utc), 0), 1)
+        self.assertEqual(core.run_scheduled_automations(self.path, dt.datetime(2028, 4, 30, tzinfo=dt.timezone.utc), 0), 0)
+        with core.connect(self.path) as db:
+            db.execute("INSERT INTO suppressions(owner_email,recipient_email,reason,created_at) VALUES (?,?,?,?)",
+                       (owner, "buyer@example.com", "测试", core.iso(core.utcnow())))
+        self.assertEqual(core.run_scheduled_automations(self.path, dt.datetime(2028, 5, 31, tzinfo=dt.timezone.utc), 0), 1)
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT status FROM scheduled_runs WHERE occurrence_date='2028-05-31'").fetchone()[0], "skipped")
+
+    def test_scheduled_rule_rejects_foreign_template_category_and_bad_dates(self):
+        core.save_contact(self.path, "other@example.com", {"email": "other@example.com", "categories": "私有"})
+        template_id, _ = core.save_template(self.path, "other@example.com", "私有", "主题", "正文")
+        with self.assertRaises(ValueError):
+            core.save_scheduled_rule(self.path, "owner@example.com", "holiday", "02-30", "私有", template_id)
+        with self.assertRaisesRegex(ValueError, "已有"):
+            core.save_scheduled_rule(self.path, "owner@example.com", "weekly", "1", "私有", template_id)
+        core.save_contact(self.path, "owner@example.com", {"email": "buyer@example.com", "categories": "客户"})
+        with self.assertRaisesRegex(ValueError, "自己的"):
+            core.save_scheduled_rule(self.path, "owner@example.com", "monthly", "1", "客户", template_id)
+
     def test_paused_rule_does_not_replay_old_click(self):
         owner = "sender@example.com"
         core.save_contact(self.path, owner, {"email": "buyer@example.com"})

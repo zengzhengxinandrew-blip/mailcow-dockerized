@@ -20,10 +20,11 @@ from urllib.parse import parse_qs, urlparse
 
 from cryptography.fernet import Fernet
 
-from core import (AUTOMATION_EVENTS, MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_draft,
+from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_draft,
                   create_contact_campaign, get_template, import_contacts, init_db, mailbox_settings,
                   parse_contacts_upload, parse_upload, preflight_template, prepare_contact_campaign, render_template, report_data,
-                  save_automation_rule, set_automation_rule, delete_automation_rule, save_template, send_template_test,
+                  save_automation_rule, set_automation_rule, delete_automation_rule, save_scheduled_rule,
+                  set_scheduled_rule, delete_scheduled_rule, save_template, send_template_test,
                   revoke_mailbox_auth, save_contact, save_mailbox_auth, schedule_batch,
                   set_batch_state, set_contact_deleted, set_contact_status, tracking_ready,
                   record_tracking_event, verify_tracking_token, utcnow, verify_mailbox_auth)
@@ -302,6 +303,12 @@ def automations_page(user, error=""):
                                JOIN contacts c ON c.id=a.contact_id
                                WHERE r.owner_email=? ORDER BY a.applied_at DESC LIMIT 20""", (user,)).fetchall()
         templates = db.execute("SELECT id,name FROM templates WHERE owner_email=? ORDER BY name,id", (user,)).fetchall()
+        categories = db.execute("SELECT name FROM contact_categories WHERE owner_email=? ORDER BY name", (user,)).fetchall()
+        scheduled = db.execute("""SELECT r.*, (SELECT COUNT(*) FROM scheduled_runs s WHERE s.rule_id=r.id) AS runs
+                                  FROM scheduled_rules r WHERE r.owner_email=? ORDER BY r.id DESC""", (user,)).fetchall()
+        scheduled_recent = db.execute("""SELECT s.created_at,s.batch_id,s.detail,c.email FROM scheduled_runs s
+                                        JOIN scheduled_rules r ON r.id=s.rule_id JOIN contacts c ON c.id=s.contact_id
+                                        WHERE r.owner_email=? ORDER BY s.created_at DESC LIMIT 20""", (user,)).fetchall()
         draft_events = db.execute("""SELECT d.created_at,d.status,d.detail,d.batch_id,c.email
                                      FROM automation_drafts d JOIN automation_rules r ON r.id=d.rule_id
                                      JOIN contacts c ON c.id=d.contact_id WHERE r.owner_email=?
@@ -310,6 +317,19 @@ def automations_page(user, error=""):
                       for kind, label in AUTOMATION_EVENTS.items())
     template_names = {row["id"]: row["name"] for row in templates}
     template_options = ''.join('<option value="{}">{}</option>'.format(row["id"], h(row["name"])) for row in templates)
+    category_options = ''.join('<option value="{0}">{0}</option>'.format(h(row["name"])) for row in categories)
+    schedule_options = ''.join('<option value="{}">{}</option>'.format(kind, h(label)) for kind, label in SCHEDULE_KINDS.items())
+    scheduled_rows = ''.join('''<tr><td>{kind}</td><td>{date}</td><td>{category}</td><td>{template}</td><td>{state}</td><td>{runs}</td><td>
+<form method="post" action="/automations/scheduled/toggle">{csrf}<input type="hidden" name="id" value="{id}"><input type="hidden" name="enabled" value="{next_state}"><button type="submit">{toggle}</button></form>
+<form method="post" action="/automations/scheduled/delete">{csrf}<input type="hidden" name="id" value="{id}"><button type="submit" onclick="return confirm('删除规则不会删除已生成的草稿。确定删除？')">删除</button></form></td></tr>'''.format(
+        kind=h(SCHEDULE_KINDS[row["kind"]]), date=h(row["schedule_value"]), category=h(row["target_category"]),
+        template=h(template_names.get(row["template_id"], "模板已不存在")),
+        state="启用" if row["enabled"] else "暂停", runs=row["runs"], csrf=csrf(user), id=row["id"],
+        next_state="0" if row["enabled"] else "1", toggle="暂停" if row["enabled"] else "启用") for row in scheduled)
+    scheduled_history = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        local_time(row["created_at"]), h(row["email"]),
+        '<a href="/batches/{}">查看待确认草稿</a>'.format(row["batch_id"]) if row["batch_id"]
+        else '未生成：' + h(row["detail"])) for row in scheduled_recent)
     rows = ''.join('''<tr><td>{event}</td><td>{category}</td><td>{template}</td><td>{state}</td><td>{runs}</td><td>
 <form method="post" action="/automations/toggle">{csrf}<input type="hidden" name="id" value="{id}"><input type="hidden" name="enabled" value="{next_state}"><button type="submit">{toggle}</button></form>
 <form method="post" action="/automations/delete">{csrf}<input type="hidden" name="id" value="{id}"><button type="submit" onclick="return confirm('删除规则不会移除已添加的联系人分类。确定删除？')">删除</button></form></td></tr>'''.format(
@@ -331,8 +351,15 @@ def automations_page(user, error=""):
 <form method="post" action="/automations/add">{csrf}<div class="campaign-grid"><label>触发行为<select name="event_kind" required>{options}</select></label><label>添加到分类<input name="category_name" maxlength="80" required placeholder="例如：点击过产品邮件"></label><label>后续草稿模板（可选）<select name="followup_template_id"><option value="">不生成草稿</option>{template_options}</select></label></div><button class="button" type="submit">创建规则</button></form></section>
 <section class="list-section"><h2>我的规则</h2><div class="table-wrap"><table><thead><tr><th>触发行为</th><th>添加分类</th><th>草稿模板</th><th>状态</th><th>触发次数</th><th>操作</th></tr></thead><tbody>{rows}</tbody></table></div></section>
 <section class="list-section"><h2>最近生成的草稿</h2><div class="table-wrap"><table><thead><tr><th>时间</th><th>联系人</th><th>结果</th></tr></thead><tbody>{draft_rows}</tbody></table></div></section>
-<section class="list-section"><h2>最近触发记录</h2><div class="table-wrap"><table><thead><tr><th>时间</th><th>行为</th><th>联系人与分类</th></tr></thead><tbody>{history}</tbody></table></div></section>'''.format(
+<section class="list-section"><h2>最近触发记录</h2><div class="table-wrap"><table><thead><tr><th>时间</th><th>行为</th><th>联系人与分类</th></tr></thead><tbody>{history}</tbody></table></div></section>
+<section class="panel"><h2>指定日期与循环草稿</h2><p>仅对所选联系人分类生效；指定日期填写 MM-DD（如 01-01），每周填写 1–7（周一为 1），每月填写 1–31。按配置时区检查，短月份不会顺延到月底。规则只生成待确认草稿。</p>
+<form method="post" action="/automations/scheduled/add">{csrf}<div class="campaign-grid"><label>类型<select name="kind" required>{schedule_options}</select></label><label>日期数值<input name="schedule_value" required maxlength="5" placeholder="01-01 或 1"></label><label>目标分类<select name="target_category" required>{category_options}</select></label><label>草稿模板<select name="template_id" required>{template_options}</select></label></div><button class="button" type="submit">创建定时规则</button></form></section>
+<section class="list-section"><h2>我的定时规则</h2><div class="table-wrap"><table><thead><tr><th>类型</th><th>日期</th><th>目标分类</th><th>模板</th><th>状态</th><th>处理次数</th><th>操作</th></tr></thead><tbody>{scheduled_rows}</tbody></table></div></section>
+<section class="list-section"><h2>最近定时草稿</h2><div class="table-wrap"><table><thead><tr><th>时间</th><th>联系人</th><th>结果</th></tr></thead><tbody>{scheduled_history}</tbody></table></div></section>'''.format(
         alert=alert, csrf=csrf(user), options=options, template_options=template_options,
+        schedule_options=schedule_options, category_options=category_options,
+        scheduled_rows=scheduled_rows or '<tr><td colspan="7">还没有定时规则。</td></tr>',
+        scheduled_history=scheduled_history or '<tr><td colspan="3">还没有定时触发记录。</td></tr>',
         rows=rows or '<tr><td colspan="6">还没有行为规则。</td></tr>', draft_rows=draft_rows or '<tr><td colspan="3">还没有草稿记录。</td></tr>',
         history=history or '<tr><td colspan="3">还没有新行为触发规则。</td></tr>')
     return page("自动化", content, user)
@@ -924,6 +951,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/automations/delete":
                 delete_automation_rule(DB_PATH, self.current_user, int(form.getfirst("id", "0")))
+                self._redirect("/automations")
+                return
+            if path == "/automations/scheduled/add":
+                save_scheduled_rule(DB_PATH, self.current_user, form.getfirst("kind", ""),
+                                    form.getfirst("schedule_value", ""), form.getfirst("target_category", ""),
+                                    form.getfirst("template_id", ""))
+                self._redirect("/automations")
+                return
+            if path == "/automations/scheduled/toggle":
+                set_scheduled_rule(DB_PATH, self.current_user, int(form.getfirst("id", "0")),
+                                   form.getfirst("enabled", "") == "1")
+                self._redirect("/automations")
+                return
+            if path == "/automations/scheduled/delete":
+                delete_scheduled_rule(DB_PATH, self.current_user, int(form.getfirst("id", "0")))
                 self._redirect("/automations")
                 return
             if path == "/templates/save":

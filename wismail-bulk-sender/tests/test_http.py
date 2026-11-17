@@ -106,6 +106,31 @@ class HttpFlowTests(unittest.TestCase):
                              "followup_template_id": str(foreign_id)})
         self.assertEqual(self.request("POST", "/automations/add", invalid, headers)[0], 400)
 
+    def test_scheduled_rule_form_is_owner_scoped(self):
+        owner = "__legacy_admin__"
+        core.save_contact(server.DB_PATH, owner, {"email": "buyer@example.com", "categories": "客户"})
+        template_id, _ = core.save_template(server.DB_PATH, owner, "循环模板", "主题", "正文")
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        form = urlencode({"csrf": server.CSRF_TOKEN, "kind": "weekly", "schedule_value": "1",
+                          "target_category": "客户", "template_id": str(template_id)})
+        status, response_headers, _ = self.request("POST", "/automations/scheduled/add", form, headers)
+        self.assertEqual((status, response_headers["Location"]), (303, "/automations"))
+        status, _, page = self.request("GET", "/automations")
+        self.assertEqual(status, 200)
+        self.assertIn("循环模板".encode("utf-8"), page)
+        self.assertEqual(self.request("POST", "/automations/scheduled/add", form, headers)[0], 400)
+        core.save_contact(server.DB_PATH, "other@example.com", {"email": "private@example.com", "categories": "私有"})
+        private_template, _ = core.save_template(server.DB_PATH, "other@example.com", "私有模板", "主题", "正文")
+        other_id = core.save_scheduled_rule(server.DB_PATH, "other@example.com", "weekly", "2", "私有", private_template)
+        self.assertEqual(self.request("POST", "/automations/scheduled/delete",
+                                      urlencode({"csrf": server.CSRF_TOKEN, "id": other_id}), headers)[0], 400)
+        with core.connect(server.DB_PATH) as db:
+            own_id = db.execute("SELECT id FROM scheduled_rules WHERE owner_email=?", (owner,)).fetchone()[0]
+        self.assertEqual(self.request("POST", "/automations/scheduled/toggle",
+                                      urlencode({"csrf": server.CSRF_TOKEN, "id": own_id, "enabled": "0"}), headers)[0], 303)
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT enabled FROM scheduled_rules WHERE id=?", (own_id,)).fetchone()[0], 0)
+
     def test_template_upload_preview_requires_explicit_start(self):
         status, _, template = self.request("GET", "/template.xlsx")
         self.assertEqual(status, 200)
