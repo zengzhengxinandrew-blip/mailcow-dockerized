@@ -1764,16 +1764,21 @@ def dispatch_one(path, settings):
     return True
 
 
-def _extract_dsn_recipient(message):
+def _extract_dsn_feedback(message):
     for part in message.walk():
         if part.get_content_type() == "message/delivery-status":
             payload = part.get_payload()
             for block in payload if isinstance(payload, list) else []:
                 raw = block.get("Final-Recipient") or block.get("Original-Recipient")
                 if raw:
-                    return raw.split(";", 1)[-1].strip().lower()
+                    recipient = raw.split(";", 1)[-1].strip().lower()
+                    if EMAIL_RE.fullmatch(recipient):
+                        permanent = (str(block.get("Action", "")).lower() == "failed" and
+                                     str(block.get("Status", "")).startswith("5."))
+                        return recipient, permanent
     raw = message.get("X-Failed-Recipients")
-    return raw.strip().lower() if raw else None
+    recipient = raw.strip().lower() if raw else None
+    return (recipient, False) if recipient and EMAIL_RE.fullmatch(recipient) else (None, False)
 
 
 def poll_imap(path, settings, owner_email="__legacy_admin__"):
@@ -1804,19 +1809,21 @@ def poll_imap(path, settings, owner_email="__legacy_admin__"):
             msg = email.message_from_bytes(raw, policy=email.policy.default)
             references = " ".join([str(msg.get("In-Reply-To", "")), str(msg.get("References", ""))])
             ids = MESSAGE_ID_RE.findall(references)
-            recipient = _extract_dsn_recipient(msg)
+            recipient, permanent_failure = _extract_dsn_feedback(msg)
             kind = "bounce" if recipient else "reply"
             matched = None
             with connect(path) as db:
                 source_uid = owner_email + ":" + str(uid)
                 already_seen = db.execute("SELECT 1 FROM imap_events WHERE source_uid=?", (source_uid,)).fetchone()
+                matched_by_id = False
                 for message_id in ids:
-                    matched = db.execute("""SELECT m.id FROM messages m JOIN batches b ON b.id=m.batch_id
+                    matched = db.execute("""SELECT m.id,m.recipient_email FROM messages m JOIN batches b ON b.id=m.batch_id
                                             WHERE m.message_id=? AND b.owner_email=?""", (message_id, owner_email)).fetchone()
                     if matched:
+                        matched_by_id = True
                         break
                 if not matched and recipient:
-                    candidates = db.execute("""SELECT m.id FROM messages m JOIN batches b ON b.id=m.batch_id
+                    candidates = db.execute("""SELECT m.id,m.recipient_email FROM messages m JOIN batches b ON b.id=m.batch_id
                                                WHERE b.owner_email=? AND lower(m.recipient_email)=? AND m.submitted_at>=?
                                                ORDER BY m.submitted_at DESC LIMIT 2""",
                                             (owner_email, recipient, iso(utcnow() - dt.timedelta(days=14)))).fetchall()
@@ -1829,6 +1836,19 @@ def poll_imap(path, settings, owner_email="__legacy_admin__"):
                                (iso(utcnow()), matched_id))
                     db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,?,?,?)",
                                (matched_id, kind, iso(utcnow()), "IMAP 检测到{}".format("退信" if kind == "bounce" else "回复")))
+                    if (permanent_failure and matched_by_id and recipient and
+                            matched["recipient_email"].lower() == recipient):
+                        reason = "IMAP 确认永久退信"
+                        db.execute("""INSERT OR IGNORE INTO suppressions
+                                      (owner_email,recipient_email,reason,created_at) VALUES (?,?,?,?)""",
+                                   (owner_email, recipient, reason, iso(utcnow())))
+                        db.execute("""UPDATE contacts SET status='invalid',status_reason=?,updated_at=?
+                                      WHERE owner_email=? AND email=? AND status='subscribed'""",
+                                   (reason, iso(utcnow()), owner_email, recipient))
+                        db.execute("""UPDATE messages SET status='suppressed',last_error=?
+                                      WHERE lower(recipient_email)=? AND status='queued' AND batch_id IN
+                                      (SELECT id FROM batches WHERE owner_email=?)""",
+                                   (reason, recipient, owner_email))
                 db.execute("INSERT OR IGNORE INTO imap_events(kind,source_uid,matched_message_id,observed_at,detail) VALUES (?,?,?,?,?)",
                            (kind, source_uid, matched_id, iso(utcnow()), recipient or str(msg.get("From", ""))[:200]))
                 db.execute("INSERT OR REPLACE INTO imap_state(key,value) VALUES (?,?)", (state_key, str(uid)))

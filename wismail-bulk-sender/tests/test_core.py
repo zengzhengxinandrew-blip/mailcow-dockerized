@@ -208,6 +208,87 @@ class CampaignTests(unittest.TestCase):
             self.assertTrue(db.execute("SELECT replied_at FROM messages WHERE batch_id=?", (batch_id,)).fetchone()["replied_at"])
             self.assertEqual(db.execute("SELECT COUNT(*) FROM delivery_events WHERE kind='reply'").fetchone()[0], 1)
 
+    def test_imap_permanent_bounce_blocks_only_confirmed_recipient(self):
+        owner = "sender@example.com"
+        core.save_contact(self.db_path, owner, {"email": "buyer@example.com"})
+        sent = core.create_draft(self.db_path, "已发", [(1, "buyer@example.com", "主题", "正文")], owner)
+        queued = core.create_draft(self.db_path, "待发", [(1, "buyer@example.com", "主题", "正文")], owner)
+        other = core.create_draft(self.db_path, "其他账号", [(1, "buyer@example.com", "主题", "正文")], "other@example.com")
+        core.schedule_batch(self.db_path, queued, "now", 60)
+        core.schedule_batch(self.db_path, other, "now", 60)
+        with core.connect(self.db_path) as db:
+            db.execute("UPDATE messages SET status='submitted',submitted_at=?,message_id=? WHERE batch_id=?",
+                       (core.iso(core.utcnow()), "<sent-bounce@example.com>", sent))
+
+        class FakeImap:
+            def login(self, *_):
+                return "OK", []
+
+            def select(self, *_args, **_kwargs):
+                return "OK", []
+
+            def uid(self, command, *_args):
+                if command == "SEARCH":
+                    return "OK", [b"21"]
+                raw = ("From: mailer-daemon@example.com\r\n"
+                       "References: <sent-bounce@example.com>\r\n"
+                       "Content-Type: multipart/report; report-type=delivery-status; boundary=x\r\n\r\n"
+                       "--x\r\nContent-Type: text/plain\r\n\r\nFailed\r\n"
+                       "--x\r\nContent-Type: message/delivery-status\r\n\r\n"
+                       "Final-Recipient: rfc822; buyer@example.com\r\nAction: failed\r\n"
+                       "Status: 5.1.1\r\n\r\n--x--\r\n").encode()
+                return "OK", [(b"21 (RFC822)", raw)]
+
+            def logout(self):
+                return "BYE", []
+
+        settings = {"IMAP_HOST": "imap.example.com", "IMAP_USER": owner, "IMAP_PASSWORD": "test"}
+        with mock.patch.object(core.imaplib, "IMAP4_SSL", return_value=FakeImap()):
+            self.assertEqual(core.poll_imap(self.db_path, settings, owner), 1)
+            with core.connect(self.db_path) as db:
+                db.execute("DELETE FROM imap_state")
+            self.assertEqual(core.poll_imap(self.db_path, settings, owner), 1)
+        with core.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT status FROM contacts WHERE owner_email=?", (owner,)).fetchone()[0], "invalid")
+            self.assertEqual(db.execute("SELECT status FROM messages WHERE batch_id=?", (queued,)).fetchone()[0], "suppressed")
+            self.assertEqual(db.execute("SELECT status FROM messages WHERE batch_id=?", (other,)).fetchone()[0], "queued")
+            self.assertEqual(db.execute("SELECT count(*) FROM suppressions WHERE owner_email=?", (owner,)).fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM delivery_events WHERE kind='bounce'").fetchone()[0], 1)
+
+    def test_imap_temporary_or_weakly_matched_bounce_does_not_block(self):
+        def feedback(status, references=""):
+            raw = ("From: mailer-daemon@example.com\r\n" + references +
+                   "Content-Type: multipart/report; boundary=x\r\n\r\n"
+                   "--x\r\nContent-Type: message/delivery-status\r\n\r\n"
+                   "Final-Recipient: rfc822; buyer@example.com\r\nAction: failed\r\n"
+                   "Status: " + status + "\r\n\r\n--x--\r\n")
+            return raw.encode()
+
+        owner = "sender@example.com"
+        core.save_contact(self.db_path, owner, {"email": "buyer@example.com"})
+        sent = core.create_draft(self.db_path, "已发", [(1, "buyer@example.com", "主题", "正文")], owner)
+        with core.connect(self.db_path) as db:
+            db.execute("UPDATE messages SET status='submitted',submitted_at=?,message_id=? WHERE batch_id=?",
+                       (core.iso(core.utcnow()), "<sent-weak@example.com>", sent))
+
+        class FakeImap:
+            def login(self, *_): return "OK", []
+            def select(self, *_args, **_kwargs): return "OK", []
+            def uid(self, command, *_args):
+                if command == "SEARCH": return "OK", [b"31 32"]
+                uid = _args[0]
+                raw = (feedback("4.2.2", "References: <sent-weak@example.com>\r\n") if uid == "31"
+                       else feedback("5.1.1"))
+                return "OK", [(b"RFC822", raw)]
+            def logout(self): return "BYE", []
+
+        settings = {"IMAP_HOST": "imap.example.com", "IMAP_USER": owner, "IMAP_PASSWORD": "test"}
+        with mock.patch.object(core.imaplib, "IMAP4_SSL", return_value=FakeImap()):
+            self.assertEqual(core.poll_imap(self.db_path, settings, owner), 2)
+        with core.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT status FROM contacts WHERE owner_email=?", (owner,)).fetchone()[0], "subscribed")
+            self.assertEqual(db.execute("SELECT count(*) FROM suppressions").fetchone()[0], 0)
+
     def test_smtp_submission_uses_tls_and_one_recipient(self):
         class FakeSmtp:
             def __init__(self):
