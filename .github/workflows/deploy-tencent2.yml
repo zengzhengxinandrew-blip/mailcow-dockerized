@@ -52,16 +52,32 @@ jobs:
           SSH_KEY=(-i "$HOME/.ssh/tencent2_key")
           SSH_TARGET="$DEPLOY_USER@$DEPLOY_HOST"
 
+          deploy_wismail() {
+            ssh "${SSH_OPTS[@]}" "${SSH_KEY[@]}" "$SSH_TARGET" 'sudo -n bash -se' <<'REMOTE'
+          set -Eeuo pipefail
+          cd /opt/mailcow-dockerized
+          backup_dir=/var/backups/mailcow-private/wismail-$(date +%Y%m%d-%H%M%S)
+          install -d -m 700 "$backup_dir"
+          cp -a wismail-bulk-sender "$backup_dir/source"
+          test -f "$backup_dir/source/.env"
+          container_id=$(docker compose ps -q wismail-bulk-sender)
+          test -n "$container_id"
+          docker exec "$container_id" python -c 'import sqlite3; s=sqlite3.connect("file:/app/data/wismail.sqlite3?mode=ro",uri=True); d=sqlite3.connect("/app/data/predeploy.sqlite3"); s.backup(d); result=d.execute("PRAGMA integrity_check").fetchone()[0]; print("live-backup-integrity:",result); assert result=="ok"; d.close(); s.close()'
+          docker cp "$container_id:/app/data/predeploy.sqlite3" "$backup_dir/database.sqlite3" >/dev/null
+          python3 -c 'import sqlite3,sys; p=sys.argv[1]; result=sqlite3.connect("file:"+p+"?mode=ro",uri=True).execute("PRAGMA integrity_check").fetchone()[0]; print("copied-backup-integrity:",result); assert result=="ok"' "$backup_dir/database.sqlite3"
+          stat -c '%n %s bytes' "$backup_dir/database.sqlite3"
+          /usr/local/sbin/wismail-deploy
+          REMOTE
+          }
+
           if [[ "$DEPLOY_MODE" == "connection-test" ]]; then
             ssh "${SSH_OPTS[@]}" "${SSH_KEY[@]}" "$SSH_TARGET" \
               'whoami && sudo -n -l /usr/local/sbin/mailcow-deploy'
           elif [[ "$DEPLOY_MODE" == "wismail-deploy" ]]; then
-            ssh "${SSH_OPTS[@]}" "${SSH_KEY[@]}" "$SSH_TARGET" \
-              'sudo -n /usr/local/sbin/wismail-deploy'
+            deploy_wismail
           elif [[ "$DEPLOY_MODE" == "deploy" ]]; then
             if [[ "$GITHUB_REF_NAME" == "feature/wismail-bulk-sender-v2" ]]; then
-              ssh "${SSH_OPTS[@]}" "${SSH_KEY[@]}" "$SSH_TARGET" \
-                'sudo -n /usr/local/sbin/wismail-deploy'
+              deploy_wismail
             else
               ssh "${SSH_OPTS[@]}" "${SSH_KEY[@]}" "$SSH_TARGET" \
                 'sudo -n /usr/local/sbin/mailcow-deploy'

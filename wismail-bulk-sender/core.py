@@ -162,6 +162,23 @@ def init_db(path):
           UNIQUE(owner_email,email)
         );
         CREATE INDEX IF NOT EXISTS idx_contacts_owner_status ON contacts(owner_email,status,deleted_at);
+        CREATE TABLE IF NOT EXISTS provider_feedback_imports (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          owner_email TEXT NOT NULL,
+          source_name TEXT NOT NULL,
+          file_sha256 TEXT NOT NULL,
+          row_count INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(owner_email,file_sha256)
+        );
+        CREATE TABLE IF NOT EXISTS provider_feedback_events (
+          import_id INTEGER NOT NULL REFERENCES provider_feedback_imports(id) ON DELETE CASCADE,
+          row_number INTEGER NOT NULL,
+          recipient_email TEXT NOT NULL,
+          status TEXT NOT NULL,
+          previous_status TEXT NOT NULL,
+          PRIMARY KEY(import_id,row_number)
+        );
         CREATE TABLE IF NOT EXISTS contact_categories (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           owner_email TEXT NOT NULL,
@@ -1105,6 +1122,85 @@ def import_contacts(path, owner_email, contacts):
     for item in contacts:
         save_contact(path, owner_email, item)
     return len(contacts)
+
+
+def parse_provider_feedback_upload(filename, data):
+    if not filename.lower().endswith(".csv"):
+        raise ValueError("反馈文件仅支持 UTF-8 CSV")
+    if not data or len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError("反馈文件为空或超过 5 MB")
+    try:
+        rows = list(csv.reader(io.StringIO(data.decode("utf-8-sig"), newline=""), strict=True))
+    except (UnicodeDecodeError, csv.Error):
+        raise ValueError("反馈 CSV 格式无效，请使用 UTF-8 编码")
+    rows = [(number, row) for number, row in enumerate(rows, 1) if any(cell.strip() for cell in row)]
+    if len(rows) < 2 or len(rows) > 1001:
+        raise ValueError("反馈文件需有表头，且每次最多 1000 条")
+    headers = [cell.strip().lower() for cell in rows[0][1]]
+    email_columns = [i for i, value in enumerate(headers) if value in ("邮箱", "email")]
+    status_columns = [i for i, value in enumerate(headers) if value in ("类型", "status")]
+    if len(email_columns) != 1 or len(status_columns) != 1:
+        raise ValueError("反馈表头需包含且仅包含一个邮箱列和一个类型列")
+    result, seen = [], set()
+    statuses = {"投诉": "complained", "complained": "complained",
+                "无效地址": "invalid", "invalid": "invalid"}
+    for number, row in rows[1:]:
+        if len(row) != len(headers):
+            raise ValueError("第 {} 行列数与表头不一致".format(number))
+        address = row[email_columns[0]].strip().lower()
+        status = statuses.get(row[status_columns[0]].strip().lower())
+        if not EMAIL_RE.fullmatch(address) or len(address) > 254:
+            raise ValueError("第 {} 行邮箱无效".format(number))
+        if not status:
+            raise ValueError("第 {} 行类型仅支持投诉或无效地址".format(number))
+        if address in seen:
+            raise ValueError("第 {} 行邮箱重复".format(number))
+        seen.add(address)
+        result.append((number, address, status))
+    return result
+
+
+def import_provider_feedback(path, owner_email, source_name, filename, data):
+    source_name = str(source_name or "").strip()
+    if not source_name or len(source_name) > 80 or re.search(r"[\x00-\x1f]", source_name):
+        raise ValueError("反馈来源需为 1 至 80 个字符")
+    items = parse_provider_feedback_upload(filename, data)
+    digest = hashlib.sha256(data).hexdigest()
+    severity = {"subscribed": 0, "invalid": 1, "unsubscribed": 2, "complained": 3}
+    now = iso(utcnow())
+    with connect(path) as db:
+        if db.execute("SELECT 1 FROM provider_feedback_imports WHERE owner_email=? AND file_sha256=?",
+                      (owner_email, digest)).fetchone():
+            return None
+        import_id = db.execute("""INSERT INTO provider_feedback_imports
+                                  (owner_email,source_name,file_sha256,row_count,created_at) VALUES (?,?,?,?,?)""",
+                               (owner_email, source_name, digest, len(items), now)).lastrowid
+        changed, stopped = 0, 0
+        for number, address, status in items:
+            reason = "{}反馈：{}".format(source_name, "投诉" if status == "complained" else "无效地址")[:200]
+            row = db.execute("SELECT id,status FROM contacts WHERE owner_email=? AND email=?",
+                             (owner_email, address)).fetchone()
+            previous = row["status"] if row else ""
+            if row:
+                if severity[status] > severity[previous]:
+                    db.execute("UPDATE contacts SET status=?,status_reason=?,updated_at=? WHERE id=?",
+                               (status, reason, now, row["id"]))
+                    changed += 1
+            else:
+                db.execute("""INSERT INTO contacts(owner_email,email,status,status_reason,created_at,updated_at)
+                              VALUES (?,?,?,?,?,?)""", (owner_email, address, status, reason, now, now))
+                changed += 1
+            db.execute("""INSERT OR IGNORE INTO suppressions
+                          (owner_email,recipient_email,reason,created_at) VALUES (?,?,?,?)""",
+                       (owner_email, address, reason, now))
+            stopped += db.execute("""UPDATE messages SET status='suppressed',last_error=?
+                                     WHERE lower(recipient_email)=? AND status='queued' AND batch_id IN
+                                     (SELECT id FROM batches WHERE owner_email=?)""",
+                                  (reason, address, owner_email)).rowcount
+            db.execute("""INSERT INTO provider_feedback_events
+                          (import_id,row_number,recipient_email,status,previous_status) VALUES (?,?,?,?,?)""",
+                       (import_id, number, address, status, previous))
+    return len(items), changed, stopped
 
 
 def _category_name(value):

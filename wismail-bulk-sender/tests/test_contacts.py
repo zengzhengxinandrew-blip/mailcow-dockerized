@@ -63,6 +63,39 @@ class ContactTests(unittest.TestCase):
         with core.connect(self.path) as db:
             self.assertEqual(db.execute("SELECT status FROM contacts").fetchone()["status"], "unsubscribed")
 
+    def test_provider_feedback_is_atomic_idempotent_and_owner_scoped(self):
+        owner = "a@example.com"
+        core.save_contact(self.path, owner, {"email": "buyer@example.com"})
+        own_batch = core.create_draft(self.path, "待发", [(1, "buyer@example.com", "主题", "正文")], owner)
+        other_batch = core.create_draft(self.path, "其他账号", [(1, "buyer@example.com", "主题", "正文")], "b@example.com")
+        core.schedule_batch(self.path, own_batch, "now", 60)
+        core.schedule_batch(self.path, other_batch, "now", 60)
+        bad = "邮箱,类型\nbuyer@example.com,投诉\nwrong-address,无效地址\n".encode()
+        with self.assertRaisesRegex(ValueError, "第 3 行"):
+            core.import_provider_feedback(self.path, owner, "服务商", "feedback.csv", bad)
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM provider_feedback_imports").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT status FROM messages WHERE batch_id=?", (own_batch,)).fetchone()[0], "queued")
+
+        data = "邮箱,类型\nbuyer@example.com,投诉\nmissing@example.com,无效地址\n".encode()
+        self.assertEqual(core.import_provider_feedback(self.path, owner, "服务商", "feedback.csv", data), (2, 2, 1))
+        self.assertIsNone(core.import_provider_feedback(self.path, owner, "重复导入", "renamed.csv", data))
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT status FROM contacts WHERE owner_email=? AND email=?",
+                                        (owner, "buyer@example.com")).fetchone()[0], "complained")
+            self.assertEqual(db.execute("SELECT status FROM contacts WHERE owner_email=? AND email=?",
+                                        (owner, "missing@example.com")).fetchone()[0], "invalid")
+            self.assertEqual(db.execute("SELECT status FROM messages WHERE batch_id=?", (own_batch,)).fetchone()[0], "suppressed")
+            self.assertEqual(db.execute("SELECT status FROM messages WHERE batch_id=?", (other_batch,)).fetchone()[0], "queued")
+            self.assertEqual(db.execute("SELECT count(*) FROM provider_feedback_events").fetchone()[0], 2)
+        with self.assertRaises(ValueError):
+            core.create_draft(self.path, "再次发送", [(1, "missing@example.com", "主题", "正文")], owner)
+        later = "邮箱,类型\nbuyer@example.com,无效地址\n".encode()
+        self.assertEqual(core.import_provider_feedback(self.path, owner, "服务商", "later.csv", later), (1, 0, 0))
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT status FROM contacts WHERE owner_email=? AND email=?",
+                                        (owner, "buyer@example.com")).fetchone()[0], "complained")
+
     def test_category_management_preserves_status_and_rule_references(self):
         owner = "a@example.com"
         contact_id = core.save_contact(self.path, owner, {"email": "buyer@example.com", "categories": "客户"})

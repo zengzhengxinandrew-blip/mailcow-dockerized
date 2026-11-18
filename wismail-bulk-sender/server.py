@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from cryptography.fernet import Fernet
 
 from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_category, rename_category, delete_category, set_contact_category, merge_contacts, create_draft,
-                  create_contact_campaign, get_template, import_contacts, init_db, mailbox_settings,
+                  create_contact_campaign, get_template, import_contacts, import_provider_feedback, init_db, mailbox_settings,
                   parse_contacts_upload, parse_upload, preflight_template, prepare_contact_campaign, render_template, report_data,
                   save_automation_rule, set_automation_rule, delete_automation_rule, save_scheduled_rule,
                   set_scheduled_rule, delete_scheduled_rule, save_template, send_template_test,
@@ -257,7 +257,7 @@ def dashboard(error="", user="__legacy_admin__"):
     return page("发送批次", content, user)
 
 
-def contacts_page(user, error="", search="", status="", category="", recycle=False):
+def contacts_page(user, error="", search="", status="", category="", recycle=False, notice=""):
     query = "SELECT c.*, (SELECT email FROM contacts p WHERE p.id=c.merged_into_contact_id) AS merged_to_email, (SELECT group_concat(g.name, ', ') FROM contact_category_links l JOIN contact_categories g ON g.id=l.category_id WHERE l.contact_id=c.id) AS categories FROM contacts c WHERE c.owner_email=? AND c.deleted_at IS {}".format("NOT NULL" if recycle else "NULL")
     params = [user]
     if search:
@@ -275,6 +275,8 @@ def contacts_page(user, error="", search="", status="", category="", recycle=Fal
                                    WHERE l.category_id=g.id) AS members FROM contact_categories g
                                    WHERE g.owner_email=? ORDER BY g.name""", (user,)).fetchall()
         count = db.execute("SELECT COUNT(*) AS n FROM contacts WHERE owner_email=?", (user,)).fetchone()["n"]
+        feedback_imports = db.execute("""SELECT source_name,row_count,created_at FROM provider_feedback_imports
+                                         WHERE owner_email=? ORDER BY id DESC LIMIT 5""", (user,)).fetchall()
     options = ''.join('<option value="{0}" {1}>{0}</option>'.format(h(x["name"]), 'selected' if x["name"] == category else '') for x in categories)
     category_options = ''.join('<option value="{}">{}</option>'.format(x["id"], h(x["name"])) for x in categories)
     contact_options = ''.join('<option value="{}">{}</option>'.format(x["id"], h(x["email"])) for x in rows if not recycle)
@@ -290,10 +292,16 @@ def contacts_page(user, error="", search="", status="", category="", recycle=Fal
             status=h(row["status"]), actions=actions if recycle and row["merged_into_contact_id"] else
             actions.format(csrf=csrf(user), id=row["id"])))
     alert = '<div class="alert">{}</div>'.format(h(error)) if error else ''
+    success = '<div class="alert">{}</div>'.format(h(notice)) if notice else ''
+    history = ''.join('<li>{} · {} 条 · {}</li>'.format(h(row["source_name"]), row["row_count"],
+                      local_time(row["created_at"])) for row in feedback_imports)
     content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>联系人 <small>共 {count} 人</small></h1>{alert}
 <p class="muted">导入同一邮箱会合并资料；退订、投诉、无效地址和回收站状态不会被导入重置。发送前再次检查状态。</p>
 <div class="two-col"><form method="post" action="/contacts/add">{csrf}<h2>添加联系人</h2><label>邮箱</label><input type="email" name="email" required><label>姓名</label><input name="name"><label>分类（逗号分隔）</label><input name="categories"><button class="button" type="submit">保存</button></form>
 <form method="post" action="/contacts/import" enctype="multipart/form-data">{csrf}<h2>导入联系人</h2><p>CSV 或 XLSX：邮箱、姓名、性别、生日、手机、地区、分类、变量1至变量10。</p><input type="file" name="file" accept=".csv,.xlsx" required><button class="button" type="submit">导入并合并</button></form></div></section>
+<section class="panel"><h2>导入投诉与无效地址反馈</h2>{success}<p class="muted">仅上传已核对来源的 UTF-8 CSV。表头为「邮箱,类型」，类型填「投诉」或「无效地址」；整份文件校验通过后才会更新。会停止该账号对这些地址的排队发送，同一文件重复上传不会重复处理。</p>
+<form method="post" action="/contacts/feedback/import" enctype="multipart/form-data" onsubmit="return confirm('确认反馈文件来源可信，并停止向其中地址发送？')">{csrf}<label>反馈来源<input name="source_name" maxlength="80" placeholder="例如：邮件服务商后台导出" required></label><label>反馈 CSV<input type="file" name="file" accept=".csv" required></label><button class="button" type="submit">确认并导入</button></form>
+<h3>最近导入</h3><ul>{feedback_history}</ul></section>
 <section class="panel"><form method="get" action="/contacts"><input name="q" value="{search}" placeholder="搜索邮箱或姓名"><select name="status"><option value="">全部状态</option><option value="subscribed" {subscribed}>可发送</option><option value="unsubscribed" {unsubscribed}>退订</option><option value="complained" {complained}>投诉</option><option value="invalid" {invalid}>无效</option></select><select name="category"><option value="">全部分类</option>{options}</select><button type="submit">筛选</button></form>
 <p><a href="/contacts/export.csv">导出全部联系人 CSV</a> · <a href="/contacts?recycle=1">回收站</a></p><div class="table-wrap"><table><thead><tr><th>邮箱</th><th>姓名</th><th>分类</th><th>状态</th><th>操作</th></tr></thead><tbody>{items}</tbody></table></div></section>
 <section class="panel"><h2>分类管理</h2><form method="post" action="/contacts/categories/create">{csrf}<label>新分类名称<input name="name" maxlength="80" required></label><button class="button" type="submit">创建分类</button></form>
@@ -301,7 +309,8 @@ def contacts_page(user, error="", search="", status="", category="", recycle=Fal
 <h3>调整联系人分类</h3><p class="muted">下方联系人来自当前列表（最多 200 人）。移除分类不会改变退订、投诉或无效状态。</p><form method="post" action="/contacts/categories/assign">{csrf}<label>联系人<select name="contact_id" required>{contact_options}</select></label><label>分类<select name="category_id" required>{category_options}</select></label><label>操作<select name="action"><option value="add">添加</option><option value="remove">移除</option></select></label><button class="button" type="submit">保存</button></form></section>
 <section class="panel"><h2>合并两个邮箱的联系人</h2><p>主联系人保留邮箱与已有资料，空字段从次联系人补齐，分类合并；较严格的退订、投诉或无效状态会保留。次联系人归档并保留原记录，无法直接恢复或自动拆分。</p>
 <form method="post" action="/contacts/merge" onsubmit="return confirm('确认将次联系人归档并合并到主联系人？此操作不能自动拆分。')">{csrf}<label>主联系人邮箱<input type="email" name="primary_email" required></label><label>次联系人邮箱<input type="email" name="secondary_email" required></label><button class="button" type="submit">确认合并</button></form></section>'''.format(
-        count=count, alert=alert, csrf=csrf(user), search=h(search), options=options,
+        count=count, alert=alert, success=success, feedback_history=history or '<li>尚无导入记录</li>',
+        csrf=csrf(user), search=h(search), options=options,
         category_options=category_options, contact_options=contact_options,
         category_rows=category_rows or '<tr><td colspan="3">还没有分类。</td></tr>',
         items=''.join(items) or '<tr><td colspan="5">暂无联系人</td></tr>',
@@ -1070,6 +1079,17 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("请选择联系人文件")
                 import_contacts(DB_PATH, self.current_user, parse_contacts_upload(item.filename, item.file.read(MAX_UPLOAD_BYTES + 1)))
                 self._redirect("/contacts")
+                return
+            if path == "/contacts/feedback/import":
+                item = form["file"] if "file" in form else None
+                if item is None or not getattr(item, "filename", None):
+                    raise ValueError("请选择反馈 CSV")
+                result = import_provider_feedback(DB_PATH, self.current_user,
+                                                  form.getfirst("source_name", ""), item.filename,
+                                                  item.file.read(MAX_UPLOAD_BYTES + 1))
+                notice = ("此文件已导入，无需重复处理" if result is None else
+                          "已导入 {} 条反馈，更新 {} 位联系人，停止 {} 封排队邮件".format(*result))
+                self._send(200, contacts_page(self.current_user, notice=notice))
                 return
             if path == "/contacts/status":
                 set_contact_status(DB_PATH, self.current_user, int(form.getfirst("id", "0")), form.getfirst("status", ""))

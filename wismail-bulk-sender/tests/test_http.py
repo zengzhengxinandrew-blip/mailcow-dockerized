@@ -66,6 +66,31 @@ class HttpFlowTests(unittest.TestCase):
         finally:
             server.SETTINGS["SESSION_SECRET"] = old_secret
 
+    def test_provider_feedback_upload_requires_csrf_and_records_source(self):
+        def upload(token):
+            boundary = "wismail-feedback-test"
+            parts = []
+            for name, value in (("csrf", token), ("source_name", "服务商后台")):
+                parts.append(('--{}\r\nContent-Disposition: form-data; name="{}"\r\n\r\n{}\r\n'
+                              .format(boundary, name, value)).encode())
+            parts.append(('--{}\r\nContent-Disposition: form-data; name="file"; filename="feedback.csv"\r\n'
+                          'Content-Type: text/csv\r\n\r\n'.format(boundary)).encode())
+            parts.append('邮箱,类型\nbuyer@example.com,投诉\n'.encode())
+            parts.append(('\r\n--{}--\r\n'.format(boundary)).encode())
+            return self.request("POST", "/contacts/feedback/import", b"".join(parts),
+                                {"Content-Type": "multipart/form-data; boundary=" + boundary})
+
+        self.assertEqual(upload("wrong")[0], 403)
+        status, _, page = upload(server.CSRF_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertIn("已导入 1 条反馈".encode(), page)
+        self.assertIn("服务商后台".encode(), page)
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT status FROM contacts WHERE email='buyer@example.com'").fetchone()[0],
+                             "complained")
+            self.assertEqual(db.execute("SELECT count(*) FROM provider_feedback_imports").fetchone()[0], 1)
+        self.assertIn("无需重复处理".encode(), upload(server.CSRF_TOKEN)[2])
+
     def test_automation_rules_are_owner_scoped_and_do_not_send(self):
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         with mock.patch.object(core, "_smtp_submit") as submit:
