@@ -156,6 +156,7 @@ def init_db(path):
           status TEXT NOT NULL DEFAULT 'subscribed',
           status_reason TEXT NOT NULL DEFAULT '',
           deleted_at TEXT,
+          merged_into_contact_id INTEGER REFERENCES contacts(id),
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           UNIQUE(owner_email,email)
@@ -288,6 +289,9 @@ def init_db(path):
                                    ("template_version", "INTEGER")):
             if column not in message_columns:
                 db.execute("ALTER TABLE messages ADD COLUMN {} {}".format(column, definition))
+        contact_columns = [item["name"] for item in db.execute("PRAGMA table_info(contacts)")]
+        if "merged_into_contact_id" not in contact_columns:
+            db.execute("ALTER TABLE contacts ADD COLUMN merged_into_contact_id INTEGER REFERENCES contacts(id)")
         suppression_columns = [item["name"] for item in db.execute("PRAGMA table_info(suppressions)")]
         if "owner_email" not in suppression_columns:
             db.execute("ALTER TABLE suppressions RENAME TO suppressions_legacy")
@@ -1186,15 +1190,59 @@ def set_contact_status(path, owner_email, contact_id, status, reason=""):
 
 def set_contact_deleted(path, owner_email, contact_id, deleted):
     with connect(path) as db:
-        row = db.execute("SELECT email FROM contacts WHERE id=? AND owner_email=?", (contact_id, owner_email)).fetchone()
+        row = db.execute("SELECT email,merged_into_contact_id FROM contacts WHERE id=? AND owner_email=?",
+                         (contact_id, owner_email)).fetchone()
         if not row:
             raise ValueError("联系人不存在")
+        if not deleted and row["merged_into_contact_id"]:
+            raise ValueError("已合并的联系人不能直接恢复")
         changed = db.execute("UPDATE contacts SET deleted_at=?,updated_at=? WHERE id=? AND owner_email=?",
                              (iso(utcnow()) if deleted else None, iso(utcnow()), contact_id, owner_email))
         if deleted:
             db.execute("""UPDATE messages SET status='suppressed',last_error='联系人已移入回收站'
                           WHERE lower(recipient_email)=? AND status='queued' AND batch_id IN
                           (SELECT id FROM batches WHERE owner_email=?)""", (row["email"], owner_email))
+
+
+def merge_contacts(path, owner_email, primary_email, secondary_email):
+    """Keep both address records, archive the secondary, and retain the strictest send block."""
+    primary_email = str(primary_email or "").strip().lower()
+    secondary_email = str(secondary_email or "").strip().lower()
+    if not primary_email or not secondary_email or primary_email == secondary_email:
+        raise ValueError("请填写两个不同的联系人邮箱")
+    with connect(path) as db:
+        primary = db.execute("SELECT * FROM contacts WHERE owner_email=? AND email=?",
+                             (owner_email, primary_email)).fetchone()
+        secondary = db.execute("SELECT * FROM contacts WHERE owner_email=? AND email=?",
+                               (owner_email, secondary_email)).fetchone()
+        if not primary or not secondary or primary["deleted_at"] or secondary["deleted_at"] or \
+                primary["merged_into_contact_id"] or secondary["merged_into_contact_id"]:
+            raise ValueError("两个邮箱都必须是当前账号下未回收、未合并的联系人")
+        fields = ("name", "gender", "birthday", "phone", "region")
+        merged_fields = [primary[key] or secondary[key] for key in fields]
+        primary_custom = json.loads(primary["custom_json"])
+        secondary_custom = json.loads(secondary["custom_json"])
+        for key, value in secondary_custom.items():
+            if not primary_custom.get(key) and value:
+                primary_custom[key] = value
+        severity = {"subscribed": 0, "invalid": 1, "unsubscribed": 2, "complained": 3}
+        strict = secondary if severity[secondary["status"]] > severity[primary["status"]] else primary
+        now = iso(utcnow())
+        db.execute("""UPDATE contacts SET name=?,gender=?,birthday=?,phone=?,region=?,custom_json=?,
+                      status=?,status_reason=?,updated_at=? WHERE id=?""",
+                   tuple(merged_fields) + (json.dumps(primary_custom, ensure_ascii=False), strict["status"],
+                                           strict["status_reason"], now, primary["id"]))
+        db.execute("""INSERT OR IGNORE INTO contact_category_links(contact_id,category_id)
+                      SELECT ?,category_id FROM contact_category_links WHERE contact_id=?""",
+                   (primary["id"], secondary["id"]))
+        db.execute("UPDATE contacts SET deleted_at=?,merged_into_contact_id=?,updated_at=? WHERE id=?",
+                   (now, primary["id"], now, secondary["id"]))
+        blocked = [secondary_email] + ([primary_email] if strict["status"] != "subscribed" else [])
+        for address in blocked:
+            db.execute("""UPDATE messages SET status='suppressed',last_error='联系人合并后禁止发送'
+                          WHERE lower(recipient_email)=? AND status='queued' AND batch_id IN
+                          (SELECT id FROM batches WHERE owner_email=?)""", (address, owner_email))
+    return primary["id"]
 
 
 def contact_blocked(db, owner_email, address):

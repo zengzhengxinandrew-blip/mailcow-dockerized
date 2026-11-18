@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 from cryptography.fernet import Fernet
 
-from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_category, rename_category, delete_category, set_contact_category, create_draft,
+from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_category, rename_category, delete_category, set_contact_category, merge_contacts, create_draft,
                   create_contact_campaign, get_template, import_contacts, init_db, mailbox_settings,
                   parse_contacts_upload, parse_upload, preflight_template, prepare_contact_campaign, render_template, report_data,
                   save_automation_rule, set_automation_rule, delete_automation_rule, save_scheduled_rule,
@@ -258,7 +258,7 @@ def dashboard(error="", user="__legacy_admin__"):
 
 
 def contacts_page(user, error="", search="", status="", category="", recycle=False):
-    query = "SELECT c.*, (SELECT group_concat(g.name, ', ') FROM contact_category_links l JOIN contact_categories g ON g.id=l.category_id WHERE l.contact_id=c.id) AS categories FROM contacts c WHERE c.owner_email=? AND c.deleted_at IS {}".format("NOT NULL" if recycle else "NULL")
+    query = "SELECT c.*, (SELECT email FROM contacts p WHERE p.id=c.merged_into_contact_id) AS merged_to_email, (SELECT group_concat(g.name, ', ') FROM contact_category_links l JOIN contact_categories g ON g.id=l.category_id WHERE l.contact_id=c.id) AS categories FROM contacts c WHERE c.owner_email=? AND c.deleted_at IS {}".format("NOT NULL" if recycle else "NULL")
     params = [user]
     if search:
         query += " AND (c.email LIKE ? OR c.name LIKE ?)"
@@ -282,11 +282,13 @@ def contacts_page(user, error="", search="", status="", category="", recycle=Fal
         name=h(x["name"]), members=x["members"], csrf=csrf(user), id=x["id"]) for x in categories)
     items = []
     for row in rows:
-        actions = ('<form method="post" action="/contacts/restore">{csrf}<input type="hidden" name="id" value="{id}"><button type="submit">恢复</button></form>' if recycle else
+        actions = (('已合并至 ' + h(row["merged_to_email"])) if recycle and row["merged_into_contact_id"] else
+                   '<form method="post" action="/contacts/restore">{csrf}<input type="hidden" name="id" value="{id}"><button type="submit">恢复</button></form>' if recycle else
                    '<form method="post" action="/contacts/status">{csrf}<input type="hidden" name="id" value="{id}"><select name="status"><option value="unsubscribed">退订</option><option value="complained">投诉</option><option value="invalid">无效地址</option></select><button type="submit">停止发送</button></form><form method="post" action="/contacts/delete">{csrf}<input type="hidden" name="id" value="{id}"><button type="submit">回收</button></form>')
         items.append('<tr><td>{email}</td><td>{name}</td><td>{categories}</td><td>{status}</td><td>{actions}</td></tr>'.format(
             email=h(row["email"]), name=h(row["name"]), categories=h(row["categories"] or ""),
-            status=h(row["status"]), actions=actions.format(csrf=csrf(user), id=row["id"])))
+            status=h(row["status"]), actions=actions if recycle and row["merged_into_contact_id"] else
+            actions.format(csrf=csrf(user), id=row["id"])))
     alert = '<div class="alert">{}</div>'.format(h(error)) if error else ''
     content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>联系人 <small>共 {count} 人</small></h1>{alert}
 <p class="muted">导入同一邮箱会合并资料；退订、投诉、无效地址和回收站状态不会被导入重置。发送前再次检查状态。</p>
@@ -296,7 +298,9 @@ def contacts_page(user, error="", search="", status="", category="", recycle=Fal
 <p><a href="/contacts/export.csv">导出全部联系人 CSV</a> · <a href="/contacts?recycle=1">回收站</a></p><div class="table-wrap"><table><thead><tr><th>邮箱</th><th>姓名</th><th>分类</th><th>状态</th><th>操作</th></tr></thead><tbody>{items}</tbody></table></div></section>
 <section class="panel"><h2>分类管理</h2><form method="post" action="/contacts/categories/create">{csrf}<label>新分类名称<input name="name" maxlength="80" required></label><button class="button" type="submit">创建分类</button></form>
 <div class="table-wrap"><table><thead><tr><th>分类</th><th>联系人</th><th>操作</th></tr></thead><tbody>{category_rows}</tbody></table></div>
-<h3>调整联系人分类</h3><p class="muted">下方联系人来自当前列表（最多 200 人）。移除分类不会改变退订、投诉或无效状态。</p><form method="post" action="/contacts/categories/assign">{csrf}<label>联系人<select name="contact_id" required>{contact_options}</select></label><label>分类<select name="category_id" required>{category_options}</select></label><label>操作<select name="action"><option value="add">添加</option><option value="remove">移除</option></select></label><button class="button" type="submit">保存</button></form></section>'''.format(
+<h3>调整联系人分类</h3><p class="muted">下方联系人来自当前列表（最多 200 人）。移除分类不会改变退订、投诉或无效状态。</p><form method="post" action="/contacts/categories/assign">{csrf}<label>联系人<select name="contact_id" required>{contact_options}</select></label><label>分类<select name="category_id" required>{category_options}</select></label><label>操作<select name="action"><option value="add">添加</option><option value="remove">移除</option></select></label><button class="button" type="submit">保存</button></form></section>
+<section class="panel"><h2>合并两个邮箱的联系人</h2><p>主联系人保留邮箱与已有资料，空字段从次联系人补齐，分类合并；较严格的退订、投诉或无效状态会保留。次联系人归档并保留原记录，无法直接恢复或自动拆分。</p>
+<form method="post" action="/contacts/merge" onsubmit="return confirm('确认将次联系人归档并合并到主联系人？此操作不能自动拆分。')">{csrf}<label>主联系人邮箱<input type="email" name="primary_email" required></label><label>次联系人邮箱<input type="email" name="secondary_email" required></label><button class="button" type="submit">确认合并</button></form></section>'''.format(
         count=count, alert=alert, csrf=csrf(user), search=h(search), options=options,
         category_options=category_options, contact_options=contact_options,
         category_rows=category_rows or '<tr><td colspan="3">还没有分类。</td></tr>',
@@ -841,16 +845,17 @@ class Handler(BaseHTTPRequestHandler):
                                           recycle=query.get("recycle", [""])[0] == "1"))
         elif path == "/contacts/export.csv":
             with connect(DB_PATH) as db:
-                rows = db.execute("""SELECT c.*, (SELECT group_concat(g.name, ', ') FROM contact_category_links l
+                rows = db.execute("""SELECT c.*, (SELECT email FROM contacts p WHERE p.id=c.merged_into_contact_id) AS merged_to_email,
+                                     (SELECT group_concat(g.name, ', ') FROM contact_category_links l
                                      JOIN contact_categories g ON g.id=l.category_id WHERE l.contact_id=c.id) AS categories
                                      FROM contacts c WHERE c.owner_email=? ORDER BY c.id""", (self.current_user,)).fetchall()
             output = io.StringIO()
             writer = csv.writer(output)
-            writer.writerow(["邮箱", "姓名", "性别", "生日", "手机", "地区", "分类", "状态", "状态原因", "回收时间"] + ["变量{}".format(i) for i in range(1, 11)])
+            writer.writerow(["邮箱", "姓名", "性别", "生日", "手机", "地区", "分类", "状态", "状态原因", "回收时间", "合并至邮箱"] + ["变量{}".format(i) for i in range(1, 11)])
             for row in rows:
                 custom = json.loads(row["custom_json"])
                 values = [row["email"], row["name"], row["gender"], row["birthday"], row["phone"], row["region"],
-                          row["categories"], row["status"], row["status_reason"], row["deleted_at"]]
+                          row["categories"], row["status"], row["status_reason"], row["deleted_at"], row["merged_to_email"]]
                 values += [custom.get("custom_" + str(i), "") for i in range(1, 11)]
                 writer.writerow([csv_safe(value) for value in values])
             self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
@@ -1068,6 +1073,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/contacts/status":
                 set_contact_status(DB_PATH, self.current_user, int(form.getfirst("id", "0")), form.getfirst("status", ""))
+                self._redirect("/contacts")
+                return
+            if path == "/contacts/merge":
+                merge_contacts(DB_PATH, self.current_user, form.getfirst("primary_email", ""),
+                               form.getfirst("secondary_email", ""))
                 self._redirect("/contacts")
                 return
             if path == "/contacts/categories/create":

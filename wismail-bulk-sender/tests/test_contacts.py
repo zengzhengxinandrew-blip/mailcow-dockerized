@@ -1,4 +1,6 @@
 import os
+import json
+import sqlite3
 import tempfile
 import unittest
 
@@ -98,6 +100,65 @@ class ContactTests(unittest.TestCase):
             core.delete_category(self.path, owner, category_id)
         with self.assertRaisesRegex(ValueError, "分类不存在"):
             core.rename_category(self.path, "b@example.com", category_id, "外部")
+
+    def test_manual_merge_preserves_strict_status_and_stops_both_queues(self):
+        owner = "a@example.com"
+        primary_id = core.save_contact(self.path, owner, {"email": "first@example.com", "name": "主姓名",
+                                                          "categories": "主分类", "custom_1": "保留"})
+        secondary_id = core.save_contact(self.path, owner, {"email": "second@example.com", "phone": "12345",
+                                                            "categories": "次分类", "custom_2": "补齐"})
+        batch = core.create_draft(self.path, "待发", [(1, "first@example.com", "A", "A"),
+                                                      (2, "second@example.com", "B", "B")], owner)
+        core.schedule_batch(self.path, batch, "2030-01-01T10:00", 60)
+        core.set_contact_status(self.path, owner, secondary_id, "complained", "客户投诉")
+        # A fresh batch for the still-subscribed primary must also be stopped by the merge.
+        another = core.create_draft(self.path, "主地址待发", [(1, "first@example.com", "C", "C")], owner)
+        core.schedule_batch(self.path, another, "2030-01-01T10:00", 60)
+        self.assertEqual(core.merge_contacts(self.path, owner, "first@example.com", "second@example.com"), primary_id)
+        with core.connect(self.path) as db:
+            primary = db.execute("SELECT * FROM contacts WHERE id=?", (primary_id,)).fetchone()
+            secondary = db.execute("SELECT * FROM contacts WHERE id=?", (secondary_id,)).fetchone()
+            labels = [r[0] for r in db.execute("""SELECT g.name FROM contact_category_links l JOIN contact_categories g
+                                               ON g.id=l.category_id WHERE l.contact_id=? ORDER BY g.name""", (primary_id,))]
+            self.assertEqual((primary["name"], primary["phone"], primary["status"], primary["status_reason"]),
+                             ("主姓名", "12345", "complained", "客户投诉"))
+            self.assertEqual(labels, ["主分类", "次分类"])
+            self.assertEqual(json.loads(primary["custom_json"]), {"custom_1": "保留", "custom_2": "补齐"})
+            self.assertEqual(secondary["merged_into_contact_id"], primary_id)
+            self.assertIsNotNone(secondary["deleted_at"])
+            self.assertEqual([r[0] for r in db.execute("SELECT status FROM messages WHERE batch_id=?", (another,))],
+                             ["suppressed"])
+        with self.assertRaisesRegex(ValueError, "不能直接恢复"):
+            core.set_contact_deleted(self.path, owner, secondary_id, False)
+        core.save_contact(self.path, owner, {"email": "second@example.com", "name": "重新导入"})
+        with core.connect(self.path) as db:
+            self.assertIsNotNone(db.execute("SELECT deleted_at FROM contacts WHERE id=?", (secondary_id,)).fetchone()[0])
+
+    def test_manual_merge_rejects_cross_account_and_archived_contacts(self):
+        owner = "a@example.com"
+        core.save_contact(self.path, owner, {"email": "first@example.com"})
+        secondary_id = core.save_contact(self.path, "b@example.com", {"email": "second@example.com"})
+        with self.assertRaisesRegex(ValueError, "当前账号"):
+            core.merge_contacts(self.path, owner, "first@example.com", "second@example.com")
+        core.set_contact_deleted(self.path, "b@example.com", secondary_id, True)
+        core.save_contact(self.path, "b@example.com", {"email": "third@example.com"})
+        with self.assertRaisesRegex(ValueError, "当前账号"):
+            core.merge_contacts(self.path, "b@example.com", "third@example.com", "second@example.com")
+
+    def test_existing_contact_table_adds_merge_column_without_losing_rows(self):
+        old_path = os.path.join(self.temp.name, "old-contacts.sqlite3")
+        with sqlite3.connect(old_path) as db:
+            db.execute("""CREATE TABLE contacts (id INTEGER PRIMARY KEY,owner_email TEXT NOT NULL,email TEXT NOT NULL,
+                         name TEXT NOT NULL DEFAULT '',gender TEXT NOT NULL DEFAULT '',birthday TEXT NOT NULL DEFAULT '',
+                         phone TEXT NOT NULL DEFAULT '',region TEXT NOT NULL DEFAULT '',custom_json TEXT NOT NULL DEFAULT '{}',
+                         status TEXT NOT NULL DEFAULT 'subscribed',status_reason TEXT NOT NULL DEFAULT '',deleted_at TEXT,
+                         created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(owner_email,email))""")
+            db.execute("INSERT INTO contacts(owner_email,email,created_at,updated_at) VALUES (?,?,?,?)",
+                       ("a@example.com", "buyer@example.com", "2026-01-01", "2026-01-01"))
+        core.init_db(old_path)
+        with core.connect(old_path) as db:
+            self.assertIn("merged_into_contact_id", [r["name"] for r in db.execute("PRAGMA table_info(contacts)")])
+            self.assertEqual(db.execute("SELECT email FROM contacts").fetchone()[0], "buyer@example.com")
 
 
 if __name__ == "__main__":
