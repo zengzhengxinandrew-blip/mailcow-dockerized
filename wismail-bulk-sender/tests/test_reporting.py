@@ -28,13 +28,26 @@ class ReportingTests(unittest.TestCase):
                                                   "2026-11-15T02:30:00+00:00", own))
             db.execute("UPDATE messages SET status='failed',sender_email='team@example.com',last_attempt_at=? WHERE batch_id=?",
                        ("2026-11-15T03:00:00+00:00", failed))
-            db.execute("UPDATE messages SET status='submitted',sender_email='foreign@example.com',submitted_at=? WHERE batch_id=?",
-                       ("2026-11-15T04:00:00+00:00", other))
+            db.execute("UPDATE messages SET status='submitted',sender_email='foreign@example.com',submitted_at=?,opened_at=?,clicked_at=? WHERE batch_id=?",
+                       ("2026-11-15T04:00:00+00:00", "2026-11-15T04:30:00+00:00",
+                        "2026-11-15T05:00:00+00:00", other))
         data = core.report_data(self.path, "owner@example.com", dt.date(2026, 11, 15), dt.date(2026, 11, 15))
         self.assertEqual(data["totals"], {"submitted": 1, "opened": 1, "clicked": 1,
                                           "failed": 1, "bounced": 1, "replied": 1})
         self.assertEqual(data["days"][0][0], "2026-11-15")
         self.assertEqual(data["devices"], [("unknown", {"opened": 1, "clicked": 1})])
+        details = core.engagement_details(self.path, "owner@example.com", dt.date(2026, 11, 15),
+                                          dt.date(2026, 11, 15))
+        self.assertEqual(len(details), 2)
+        self.assertEqual({row["kind"] for row in details}, {"opened", "clicked"})
+        self.assertEqual({row["recipient_email"] for row in details}, {"a@example.com"})
+        self.assertEqual(len(core.engagement_details(self.path, "owner@example.com", dt.date(2026, 11, 15),
+                                                     dt.date(2026, 11, 15), kind="opened")), 1)
+        self.assertEqual(core.engagement_details(self.path, "owner@example.com", dt.date(2026, 11, 14),
+                                                 dt.date(2026, 11, 14)), [])
+        with self.assertRaises(ValueError):
+            core.engagement_details(self.path, "owner@example.com", dt.date(2026, 11, 15),
+                                    dt.date(2026, 11, 15), kind="submitted")
         self.assertEqual({row["name"] for row in data["batches"]}, {"德国", "失败"})
         self.assertEqual({row["name"]: (row["submitted"], row["failed"], row["bounced"])
                           for row in data["senders"]},
