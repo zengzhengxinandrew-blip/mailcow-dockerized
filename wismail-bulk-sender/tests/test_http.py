@@ -91,6 +91,22 @@ class HttpFlowTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM provider_feedback_imports").fetchone()[0], 1)
         self.assertIn("无需重复处理".encode(), upload(server.CSRF_TOKEN)[2])
 
+    def test_audit_shows_only_successful_own_actions_without_form_values(self):
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        invalid = urlencode({"csrf": "wrong", "email": "private@example.com", "name": "Secret Customer"})
+        self.assertEqual(self.request("POST", "/contacts/add", invalid, headers)[0], 403)
+        valid = urlencode({"csrf": server.CSRF_TOKEN, "email": "private@example.com", "name": "Secret Customer"})
+        self.assertEqual(self.request("POST", "/contacts/add", valid, headers)[0], 303)
+        core.record_audit_event(server.DB_PATH, "other@example.com", "/account/revoke")
+        status, _, body = self.request("GET", "/audit")
+        self.assertEqual(status, 200)
+        self.assertIn("添加联系人".encode(), body)
+        self.assertNotIn(b"private@example.com", body)
+        self.assertNotIn(b"Secret Customer", body)
+        self.assertNotIn("撤销发件授权".encode(), body)
+        with core.connect(server.DB_PATH) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM audit_events WHERE owner_email='__legacy_admin__'").fetchone()[0], 1)
+
     def test_automation_rules_are_owner_scoped_and_do_not_send(self):
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         with mock.patch.object(core, "_smtp_submit") as submit:

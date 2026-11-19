@@ -162,6 +162,14 @@ def init_db(path):
           UNIQUE(owner_email,email)
         );
         CREATE INDEX IF NOT EXISTS idx_contacts_owner_status ON contacts(owner_email,status,deleted_at);
+        CREATE TABLE IF NOT EXISTS audit_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          owner_email TEXT NOT NULL,
+          action TEXT NOT NULL,
+          target_id INTEGER,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_events_owner ON audit_events(owner_email,id);
         CREATE TABLE IF NOT EXISTS provider_feedback_imports (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           owner_email TEXT NOT NULL,
@@ -1122,6 +1130,12 @@ def import_contacts(path, owner_email, contacts):
     for item in contacts:
         save_contact(path, owner_email, item)
     return len(contacts)
+
+
+def record_audit_event(path, owner_email, action, target_id=None):
+    with connect(path) as db:
+        db.execute("INSERT INTO audit_events(owner_email,action,target_id,created_at) VALUES (?,?,?,?)",
+                   (owner_email, action, target_id, iso(utcnow())))
 
 
 def parse_provider_feedback_upload(filename, data):

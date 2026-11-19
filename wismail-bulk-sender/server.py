@@ -27,7 +27,7 @@ from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, a
                   set_scheduled_rule, delete_scheduled_rule, save_template, send_template_test,
                   revoke_mailbox_auth, remove_sender_alias, verify_sender_alias, save_contact, save_mailbox_auth, schedule_batch,
                   set_batch_state, set_contact_deleted, set_contact_status, tracking_ready,
-                  record_tracking_event, verify_tracking_token, utcnow, verify_mailbox_auth)
+                  record_audit_event, record_tracking_event, verify_tracking_token, utcnow, verify_mailbox_auth)
 from core import unsubscribe_token, verify_unsubscribe_token
 import oauth_login
 from template_xlsx import build_template
@@ -93,7 +93,7 @@ def page(title, content, user=""):
     account_link = ('<span class="top-meta">{}</span><a class="top-account" href="/account">发件授权</a>'
                     '<a class="top-account" href="/logout">退出</a>'.format(h(user)) if oauth_login.configured(SETTINGS) and user
                     else '<span class="top-meta">外贸邮件工作台 / V2</span>')
-    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/campaigns">创建任务</a><a class="top-account" href="/automations">自动化</a><a class="top-account" href="/reports">统计报表</a>' + account_link
+    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/campaigns">创建任务</a><a class="top-account" href="/automations">自动化</a><a class="top-account" href="/reports">统计报表</a><a class="top-account" href="/audit">操作日志</a>' + account_link
     markup = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Wismail</title>
 <link rel="stylesheet" href="/static.css"></head><body>
@@ -666,6 +666,47 @@ def account_page(user, error="", success=False):
     return page("发件授权", content, user)
 
 
+AUDIT_LABELS = {
+    "/account": "保存发件授权", "/account/revoke": "撤销发件授权",
+    "/account/aliases/add": "添加代发地址", "/account/aliases/remove": "移除代发地址",
+    "/suppressions": "添加不再联系地址", "/upload": "上传发送批次",
+    "/templates/save": "保存模板", "/templates/copy": "复制模板", "/templates/test": "发送模板测试邮件",
+    "/campaigns/from-contacts": "创建联系人任务", "/campaigns": "创建联系人任务",
+    "/contacts/add": "添加联系人", "/contacts/import": "导入联系人",
+    "/contacts/feedback/import": "导入投诉或无效地址反馈", "/contacts/status": "标记联系人状态",
+    "/contacts/merge": "合并联系人", "/contacts/delete": "回收联系人",
+    "/contacts/restore": "恢复联系人", "/contacts/categories/create": "创建分类",
+    "/contacts/categories/rename": "重命名分类", "/contacts/categories/delete": "删除分类",
+    "/contacts/categories/assign": "调整联系人分类",
+    "/automations/add": "创建自动化规则", "/automations/toggle": "切换自动化规则",
+    "/automations/delete": "删除自动化规则", "/automations/scheduled/add": "创建定时规则",
+    "/automations/scheduled/toggle": "切换定时规则", "/automations/scheduled/delete": "删除定时规则",
+    "batch.start": "启动批次", "batch.pause": "暂停批次", "batch.resume": "继续批次",
+    "batch.cancel": "取消批次", "batch.copy": "复制批次",
+}
+
+
+def audit_action(route):
+    if route in AUDIT_LABELS:
+        return route, None
+    match = re.fullmatch(r"/batches/(\d+)/(start|pause|resume|cancel|copy)", route or "")
+    return ("batch." + match.group(2), int(match.group(1))) if match else (None, None)
+
+
+def audit_page(user):
+    with connect(DB_PATH) as db:
+        rows = db.execute("""SELECT action,target_id,created_at FROM audit_events
+                             WHERE owner_email=? ORDER BY id DESC LIMIT 100""", (user,)).fetchall()
+    items = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        h(local_time(row["created_at"])), h(AUDIT_LABELS.get(row["action"], row["action"])),
+        row["target_id"] if row["target_id"] is not None else "—") for row in rows)
+    content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>操作日志</h1>
+<p class="muted">仅显示当前账号最近 100 条成功操作，记录时间、动作与批次编号；不记录密码、邮件内容或上传文件。</p>
+<div class="table-wrap"><table><thead><tr><th>时间</th><th>操作</th><th>批次编号</th></tr></thead><tbody>{}</tbody></table></div></section>'''.format(
+        items or '<tr><td colspan="3">暂无操作记录</td></tr>')
+    return page("操作日志", content, user)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, _format, *_args):
         # OAuth callback URLs contain short-lived codes; never write them to access logs.
@@ -718,6 +759,10 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _redirect(self, destination, cookie=None):
+        if self.command == "POST" and getattr(self, "current_user", None):
+            action, target_id = audit_action(self._route_path())
+            if action:
+                record_audit_event(DB_PATH, self.current_user, action, target_id)
         if URL_PREFIX and destination.startswith("/") and not destination.startswith(URL_PREFIX + "/"):
             destination = URL_PREFIX + destination
         headers = {"Location": destination}
@@ -871,6 +916,8 @@ class Handler(BaseHTTPRequestHandler):
                        {"Content-Disposition": 'attachment; filename="wismail-contacts.csv"'})
         elif path == "/account" and oauth_login.configured(SETTINGS):
             self._send(200, account_page(self.current_user))
+        elif path == "/audit":
+            self._send(200, audit_page(self.current_user))
         elif path == "/static.css":
             with open(os.path.join(ROOT, "static.css"), "rb") as stream:
                 self._send(200, stream.read(), "text/css; charset=utf-8")
@@ -969,6 +1016,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     raise ValueError("邮箱授权验证失败，请检查服务器地址和应用密码")
                 save_mailbox_auth(DB_PATH, self.current_user, smtp_password, imap_password, SETTINGS["CREDENTIAL_KEY"])
+                record_audit_event(DB_PATH, self.current_user, "/account")
                 self._send(200, account_page(self.current_user, success=True))
                 return
             if path == "/account/revoke" and oauth_login.configured(SETTINGS):
@@ -1089,6 +1137,8 @@ class Handler(BaseHTTPRequestHandler):
                                                   item.file.read(MAX_UPLOAD_BYTES + 1))
                 notice = ("此文件已导入，无需重复处理" if result is None else
                           "已导入 {} 条反馈，更新 {} 位联系人，停止 {} 封排队邮件".format(*result))
+                if result is not None:
+                    record_audit_event(DB_PATH, self.current_user, "/contacts/feedback/import")
                 self._send(200, contacts_page(self.current_user, notice=notice))
                 return
             if path == "/contacts/status":
