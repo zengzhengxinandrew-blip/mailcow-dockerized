@@ -29,6 +29,31 @@ class ContactTests(unittest.TestCase):
             saved = db.execute("SELECT name,status FROM contacts WHERE id=?", (row["id"],)).fetchone()
         self.assertEqual((saved["name"], saved["status"]), ("新姓名", "unsubscribed"))
 
+    def test_import_deduplicates_complementary_rows_and_preserves_existing_fields(self):
+        owner = "a@example.com"
+        core.save_contact(self.path, owner, {"email": "buyer@example.com", "name": "旧姓名", "phone": "123"})
+        data = ("邮箱,姓名,地区,分类,变量1\n"
+                "Buyer@Example.com,,德国,客户,工业\n"
+                "buyer@example.com,,,重点,工业\n").encode()
+        items = core.parse_contacts_upload("contacts.csv", data)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(core.import_contacts(self.path, owner, items), 1)
+        with core.connect(self.path) as db:
+            row = db.execute("SELECT name,phone,region,custom_json FROM contacts WHERE owner_email=?", (owner,)).fetchone()
+            categories = [x[0] for x in db.execute("""SELECT g.name FROM contact_category_links l JOIN contact_categories g
+                                                       ON g.id=l.category_id JOIN contacts c ON c.id=l.contact_id
+                                                       WHERE c.owner_email=? ORDER BY g.name""", (owner,))]
+        self.assertEqual((row["name"], row["phone"], row["region"]), ("旧姓名", "123", "德国"))
+        self.assertEqual(json.loads(row["custom_json"])["custom_1"], "工业")
+        self.assertEqual(categories, ["客户", "重点"])
+
+    def test_conflicting_duplicate_rows_reject_entire_file(self):
+        data = "邮箱,姓名\nbuyer@example.com,张先生\nBUYER@example.com,李先生\n".encode()
+        with self.assertRaisesRegex(ValueError, "第 3 行与第 2 行"):
+            core.parse_contacts_upload("contacts.csv", data)
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM contacts").fetchone()[0], 0)
+
     def test_blocked_contact_rejected_at_import_and_queued_message_suppressed(self):
         contact_id = core.save_contact(self.path, "a@example.com", {"email": "buyer@example.com"})
         batch = core.create_draft(self.path, "test", [(2, "buyer@example.com", "subject", "body")], "a@example.com")

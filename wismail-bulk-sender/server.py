@@ -323,7 +323,7 @@ def contacts_page(user, error="", search="", status="", category="", recycle=Fal
     content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>联系人 <small>共 {count} 人</small></h1>{alert}
 <p class="muted">导入同一邮箱会合并资料；退订、投诉、无效地址和回收站状态不会被导入重置。发送前再次检查状态。</p>
 <div class="two-col"><form method="post" action="/contacts/add">{csrf}<h2>添加联系人</h2><label>邮箱</label><input type="email" name="email" required><label>姓名</label><input name="name"><label>分类（逗号分隔）</label><input name="categories"><button class="button" type="submit">保存</button></form>
-<form method="post" action="/contacts/import" enctype="multipart/form-data">{csrf}<h2>导入联系人</h2><p>CSV 或 XLSX：邮箱、姓名、性别、生日、手机、地区、分类、变量1至变量10。</p><input type="file" name="file" accept=".csv,.xlsx" required><button class="button" type="submit">导入并合并</button></form></div></section>
+<form method="post" action="/contacts/import" enctype="multipart/form-data">{csrf}<h2>导入联系人</h2><p>CSV 或 XLSX：邮箱、姓名、性别、生日、手机、地区、分类、变量1至变量10。同一文件的重复邮箱会合并互补资料；相同字段内容冲突时拒绝整份文件。</p><input type="file" name="file" accept=".csv,.xlsx" required><button class="button" type="submit">导入并合并</button></form></div></section>
 <section class="panel"><h2>导入投诉与无效地址反馈</h2>{success}<p class="muted">仅上传已核对来源的 UTF-8 CSV。表头为「邮箱,类型」，类型填「投诉」或「无效地址」；整份文件校验通过后才会更新。会停止该账号对这些地址的排队发送，同一文件重复上传不会重复处理。</p>
 <form method="post" action="/contacts/feedback/import" enctype="multipart/form-data" onsubmit="return confirm('确认反馈文件来源可信，并停止向其中地址发送？')">{csrf}<label>反馈来源<input name="source_name" maxlength="80" placeholder="例如：邮件服务商后台导出" required></label><label>反馈 CSV<input type="file" name="file" accept=".csv" required></label><button class="button" type="submit">确认并导入</button></form>
 <h3>最近导入</h3><ul>{feedback_history}</ul></section>

@@ -1102,7 +1102,7 @@ def parse_contacts_upload(filename, data):
             columns[key] = index
     if "email" not in columns:
         raise ValueError("联系人表头缺少邮箱列")
-    contacts, errors = [], []
+    contacts, errors, first_rows = [], [], {}
     for number, cells in raw[1:]:
         item = {key: str(cells.get(index, "")).strip() for key, index in columns.items()}
         address = item["email"].lower()
@@ -1110,13 +1110,26 @@ def parse_contacts_upload(filename, data):
             errors.append("第 {} 行邮箱无效".format(number))
             continue
         item["email"] = address
-        contacts.append(item)
+        if address in first_rows:
+            previous, first_number = first_rows[address]
+            for key, value in item.items():
+                if key in ("email", "categories") or not value:
+                    continue
+                if previous.get(key) and previous[key] != value:
+                    errors.append("第 {} 行与第 {} 行的 {} 有冲突".format(number, first_number, key))
+                else:
+                    previous[key] = value
+            categories = [name.strip() for name in re.split(r"[,，;；]", previous.get("categories", "") + "," + item.get("categories", "")) if name.strip()]
+            previous["categories"] = ",".join(dict.fromkeys(categories))
+        else:
+            contacts.append(item)
+            first_rows[address] = (item, number)
     if errors:
         raise ValueError("；".join(errors[:20]))
     return contacts
 
 
-def save_contact(path, owner_email, item):
+def save_contact(path, owner_email, item, merge_existing=False):
     address = str(item.get("email", "")).strip().lower()
     if not EMAIL_RE.fullmatch(address) or len(address) > 254:
         raise ValueError("联系人邮箱无效")
@@ -1126,7 +1139,10 @@ def save_contact(path, owner_email, item):
     categories = [name.strip()[:80] for name in re.split(r"[,，;；]", str(item.get("categories", ""))) if name.strip()]
     now = iso(utcnow())
     with connect(path) as db:
-        existing = db.execute("SELECT id FROM contacts WHERE owner_email=? AND email=?", (owner_email, address)).fetchone()
+        existing = db.execute("SELECT * FROM contacts WHERE owner_email=? AND email=?", (owner_email, address)).fetchone()
+        if existing and merge_existing:
+            fields = {key: fields[key] or existing[key] for key in fields}
+            custom = {**json.loads(existing["custom_json"]), **custom}
         values = (fields["name"], fields["gender"], fields["birthday"], fields["phone"], fields["region"],
                   json.dumps(custom, ensure_ascii=False))
         if existing:
@@ -1150,7 +1166,7 @@ def save_contact(path, owner_email, item):
 
 def import_contacts(path, owner_email, contacts):
     for item in contacts:
-        save_contact(path, owner_email, item)
+        save_contact(path, owner_email, item, merge_existing=True)
     return len(contacts)
 
 
