@@ -535,6 +535,23 @@ def report_data(path, owner_email, start_date, end_date, offset_hours=8):
             "senders": sorted(senders.values(), key=lambda item: (-item["submitted"], item["name"]))}
 
 
+def failure_summary(path, owner_email, start_date, end_date, offset_hours=8):
+    """Group recorded final SMTP failures and interrupted submissions by code."""
+    if start_date > end_date or (end_date - start_date).days >= 366:
+        raise ValueError("统计时间范围最多为 366 天")
+    offset = dt.timedelta(hours=offset_hours)
+    lower = iso((dt.datetime.combine(start_date, dt.time()) - offset).replace(tzinfo=dt.timezone.utc))
+    upper = iso((dt.datetime.combine(end_date + dt.timedelta(days=1), dt.time()) - offset).replace(tzinfo=dt.timezone.utc))
+    with connect(path) as db:
+        return db.execute("""SELECT e.kind,e.smtp_code,COUNT(DISTINCT e.message_id) AS messages,
+                            MAX(e.observed_at) AS latest_at FROM delivery_events e
+                            JOIN messages m ON m.id=e.message_id JOIN batches b ON b.id=m.batch_id
+                            WHERE b.owner_email=? AND e.kind IN ('failed','needs_review')
+                            AND e.observed_at>=? AND e.observed_at<?
+                            GROUP BY e.kind,e.smtp_code ORDER BY messages DESC,e.kind,e.smtp_code""",
+                          (owner_email, lower, upper)).fetchall()
+
+
 def ab_click_guidance(groups, state, track_click, latest_submitted_at, now=None):
     """Give a conservative, non-automatic A/B click comparison."""
     if not track_click:

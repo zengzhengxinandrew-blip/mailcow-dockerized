@@ -59,6 +59,25 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(events[1]["smtp_code"], 550)
         self.assertNotIn("private-secret", events[1]["detail"])
 
+    def test_failure_summary_groups_codes_by_owner_and_event_date(self):
+        own = core.create_draft(self.path, "自身", [(1, "buyer@example.com", "主题", "正文")], "owner@example.com")
+        other = core.create_draft(self.path, "他人", [(1, "other@example.com", "主题", "正文")], "other@example.com")
+        with core.connect(self.path) as db:
+            own_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (own,)).fetchone()[0]
+            other_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (other,)).fetchone()[0]
+            for message_id, kind, code, observed in (
+                (own_id, "failed", 535, "2026-11-14T16:30:00+00:00"),
+                (own_id, "failed", 535, "2026-11-14T17:00:00+00:00"),
+                (own_id, "needs_review", None, "2026-11-14T18:00:00+00:00"),
+                (other_id, "failed", 550, "2026-11-14T19:00:00+00:00"),
+                (own_id, "failed", 550, "2026-11-13T16:00:00+00:00")):
+                db.execute("INSERT INTO delivery_events(message_id,kind,smtp_code,observed_at) VALUES (?,?,?,?)",
+                           (message_id, kind, code, observed))
+        rows = core.failure_summary(self.path, "owner@example.com", dt.date(2026, 11, 15),
+                                    dt.date(2026, 11, 15))
+        self.assertEqual({(row["kind"], row["smtp_code"]): row["messages"] for row in rows},
+                         {("failed", 535): 1, ("needs_review", None): 1})
+
 
 if __name__ == "__main__":
     unittest.main()

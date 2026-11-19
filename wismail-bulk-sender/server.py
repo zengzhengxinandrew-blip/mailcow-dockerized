@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from cryptography.fernet import Fernet
 
 from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_category, rename_category, delete_category, set_contact_category, merge_contacts, create_draft,
-                  create_contact_campaign, get_template, import_contacts, import_provider_feedback, init_db, mailbox_settings,
+                  create_contact_campaign, failure_summary, get_template, import_contacts, import_provider_feedback, init_db, mailbox_settings,
                   parse_contacts_upload, parse_upload, preflight_template, prepare_contact_campaign, render_template, report_data,
                   save_automation_rule, set_automation_rule, delete_automation_rule, save_scheduled_rule,
                   set_scheduled_rule, delete_scheduled_rule, save_template, send_template_test,
@@ -177,6 +177,7 @@ def report_period(start, end):
 def reports_page(user, start="", end=""):
     first, last = report_period(start, end)
     data = report_data(DB_PATH, user, first, last, int(SETTINGS["UTC_OFFSET_HOURS"]))
+    failures = failure_summary(DB_PATH, user, first, last, int(SETTINGS["UTC_OFFSET_HOURS"]))
     labels = (("submitted", "SMTP 已接受"), ("opened", "观测到打开"), ("clicked", "观测到点击"),
               ("failed", "发送失败/待核对"), ("bounced", "检测到退信"), ("replied", "检测到回复"))
     summary = ''.join('<div class="stat"><strong>{}</strong><span>{}</span></div>'.format(data["totals"][key], label)
@@ -188,6 +189,10 @@ def reports_page(user, start="", end=""):
     batch_rows = ''.join('<tr><td><a class="text-link" href="/batches/{}">{}</a></td>{}</tr>'.format(
         row["id"], h(row["name"]), cells(row)) for row in data["batches"])
     sender_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(row["name"]), cells(row)) for row in data["senders"])
+    failure_rows = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        EVENT_LABELS[row["kind"]], row["smtp_code"] if row["smtp_code"] is not None else "—",
+        row["messages"], h(local_time(row["latest_at"])), h(event_suggestion(row["kind"], row["smtp_code"])))
+        for row in failures)
     headings = '<tr><th>维度</th>' + ''.join('<th>{}</th>'.format(label) for _, label in labels) + '</tr>'
     query = 'start={}&amp;end={}'.format(first.isoformat(), last.isoformat())
     content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>统计报表</h1>
@@ -198,12 +203,15 @@ def reports_page(user, start="", end=""):
 <section class="panel report-table"><h2>按日期</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{days}</tbody></table></div></section>
 <section class="panel report-table"><h2>按月份</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{months}</tbody></table></div></section>
 <section class="panel report-table"><h2>按发件人</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{senders}</tbody></table></div></section>
-<section class="panel report-table"><h2>按批次</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{batches}</tbody></table></div></section>'''.format(
+<section class="panel report-table"><h2>按批次</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{batches}</tbody></table></div></section>
+<section class="panel report-table"><h2>失败原因汇总</h2><p class="muted">按记录到的最终失败或需人工核对事件统计，与上方当前失败状态可能不同。返回码无法单独说明完整原因，请到批次的逐封日志核对详情。</p>
+<p><a href="/reports/failures.csv?{query}">导出失败原因 CSV</a></p><div class="table-wrap"><table><thead><tr><th>事件</th><th>SMTP 返回码</th><th>邮件数</th><th>最近时间</th><th>处理建议</th></tr></thead><tbody>{failures}</tbody></table></div></section>'''.format(
         start=first.isoformat(), end=last.isoformat(), query=query, summary=summary, headings=headings,
         days=day_rows or '<tr><td colspan="7">暂无记录</td></tr>',
         months=month_rows or '<tr><td colspan="7">暂无记录</td></tr>',
         senders=sender_rows or '<tr><td colspan="7">暂无记录</td></tr>',
-        batches=batch_rows or '<tr><td colspan="7">暂无记录</td></tr>')
+        batches=batch_rows or '<tr><td colspan="7">暂无记录</td></tr>',
+        failures=failure_rows or '<tr><td colspan="5">该日期范围内没有失败事件</td></tr>')
     return page("统计报表", content, user)
 
 
@@ -926,13 +934,13 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(urlparse(self.path).query)
             self._send(200, campaigns_page(self.current_user,
                                            {"template_ids": query.get("template_id", [])}))
-        elif path in ("/reports", "/reports/export.csv"):
+        elif path in ("/reports", "/reports/export.csv", "/reports/failures.csv"):
             query = parse_qs(urlparse(self.path).query)
             try:
                 first, last = report_period(query.get("start", [""])[0], query.get("end", [""])[0])
                 if path == "/reports":
                     self._send(200, reports_page(self.current_user, first.isoformat(), last.isoformat()))
-                else:
+                elif path == "/reports/export.csv":
                     data = report_data(DB_PATH, self.current_user, first, last, int(SETTINGS["UTC_OFFSET_HOURS"]))
                     output = io.StringIO()
                     writer = csv.writer(output)
@@ -948,6 +956,16 @@ class Handler(BaseHTTPRequestHandler):
                                         [values[key] for key in ("submitted", "opened", "clicked", "failed", "bounced", "replied")])
                     self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
                                {"Content-Disposition": 'attachment; filename="wismail-reports.csv"'})
+                else:
+                    rows = failure_summary(DB_PATH, self.current_user, first, last, int(SETTINGS["UTC_OFFSET_HOURS"]))
+                    output = io.StringIO()
+                    writer = csv.writer(output)
+                    writer.writerow(["事件", "SMTP 返回码", "邮件数", "最近时间(UTC)", "处理建议"])
+                    for row in rows:
+                        writer.writerow([EVENT_LABELS[row["kind"]], row["smtp_code"] or "", row["messages"],
+                                         row["latest_at"], event_suggestion(row["kind"], row["smtp_code"])])
+                    self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
+                               {"Content-Disposition": 'attachment; filename="wismail-failures.csv"'})
             except ValueError as exc:
                 self._send(400, page("统计报表", '<section class="panel"><h1>日期无效</h1><p>{}</p><a href="/reports">返回统计报表</a></section>'.format(h(exc)), self.current_user))
         elif path == "/templates":

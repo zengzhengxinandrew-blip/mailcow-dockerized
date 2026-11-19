@@ -374,6 +374,8 @@ class HttpFlowTests(unittest.TestCase):
             message_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (batch,)).fetchone()[0]
             db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,?,?,?)",
                        (message_id, "submitted", "2026-11-15T01:00:00+00:00", "SMTP 已接受"))
+            db.execute("INSERT INTO delivery_events(message_id,kind,smtp_code,observed_at,detail) VALUES (?,?,?,?,?)",
+                       (message_id, "failed", 550, "2026-11-15T02:00:00+00:00", "拒收"))
         status, _, page = self.request("GET", "/reports?start=2026-11-15&end=2026-11-15")
         self.assertEqual(status, 200)
         self.assertIn("SMTP 已接受".encode("utf-8"), page)
@@ -383,6 +385,10 @@ class HttpFlowTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("'=报价".encode("utf-8"), report_csv)
         self.assertIn(b"sales@example.com", report_csv)
+        self.assertIn("失败原因汇总".encode("utf-8"), page)
+        status, _, failures_csv = self.request("GET", "/reports/failures.csv?start=2026-11-15&end=2026-11-15")
+        self.assertEqual(status, 200)
+        self.assertIn(b"550", failures_csv)
         status, _, events_csv = self.request("GET", "/batches/1/events.csv")
         self.assertEqual(status, 200)
         self.assertIn("SMTP 已接受".encode("utf-8"), events_csv)
