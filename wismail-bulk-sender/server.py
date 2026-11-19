@@ -27,7 +27,8 @@ from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, a
                   set_scheduled_rule, delete_scheduled_rule, save_template, send_template_test,
                   revoke_mailbox_auth, remove_sender_alias, verify_sender_alias, save_contact, save_mailbox_auth, schedule_batch,
                   set_batch_state, set_contact_deleted, set_contact_status, tracking_ready,
-                  record_audit_event, record_tracking_event, verify_tracking_token, utcnow, verify_mailbox_auth)
+                  list_notifications, mark_notification_read, notification_preferences, record_audit_event,
+                  record_tracking_event, save_notification_preferences, verify_tracking_token, utcnow, verify_mailbox_auth)
 from core import unsubscribe_token, verify_unsubscribe_token
 import oauth_login
 from template_xlsx import build_template
@@ -93,7 +94,7 @@ def page(title, content, user=""):
     account_link = ('<span class="top-meta">{}</span><a class="top-account" href="/account">发件授权</a>'
                     '<a class="top-account" href="/logout">退出</a>'.format(h(user)) if oauth_login.configured(SETTINGS) and user
                     else '<span class="top-meta">外贸邮件工作台 / V2</span>')
-    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/campaigns">创建任务</a><a class="top-account" href="/automations">自动化</a><a class="top-account" href="/reports">统计报表</a><a class="top-account" href="/audit">操作日志</a>' + account_link
+    account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/campaigns">创建任务</a><a class="top-account" href="/automations">自动化</a><a class="top-account" href="/reports">统计报表</a><a class="top-account" href="/notifications">提醒</a><a class="top-account" href="/audit">操作日志</a>' + account_link
     markup = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Wismail</title>
 <link rel="stylesheet" href="/static.css"></head><body>
@@ -670,6 +671,7 @@ AUDIT_LABELS = {
     "/account": "保存发件授权", "/account/revoke": "撤销发件授权",
     "/account/aliases/add": "添加代发地址", "/account/aliases/remove": "移除代发地址",
     "/suppressions": "添加不再联系地址", "/upload": "上传发送批次",
+    "/notifications/preferences": "更新提醒设置",
     "/templates/save": "保存模板", "/templates/copy": "复制模板", "/templates/test": "发送模板测试邮件",
     "/campaigns/from-contacts": "创建联系人任务", "/campaigns": "创建联系人任务",
     "/contacts/add": "添加联系人", "/contacts/import": "导入联系人",
@@ -705,6 +707,27 @@ def audit_page(user):
 <div class="table-wrap"><table><thead><tr><th>时间</th><th>操作</th><th>批次编号</th></tr></thead><tbody>{}</tbody></table></div></section>'''.format(
         items or '<tr><td colspan="3">暂无操作记录</td></tr>')
     return page("操作日志", content, user)
+
+
+def notifications_page(user):
+    failures, bounces = notification_preferences(DB_PATH, user)
+    rows = list_notifications(DB_PATH, user)
+    items = ''.join('''<tr><td>{time}</td><td>{kind}</td><td><a href="/batches/{batch_id}">{batch}</a></td>
+<td>{recipient}</td><td>{state}</td><td>{action}</td></tr>'''.format(
+        time=h(local_time(row["observed_at"])),
+        kind={"failed": "发送失败", "needs_review": "需人工核对", "bounce": "检测到退信"}[row["kind"]],
+        batch_id=row["batch_id"], batch=h(row["batch_name"]), recipient=h(row["recipient_email"]),
+        state="已读" if row["read_at"] else "未读",
+        action="" if row["read_at"] else '<form method="post" action="/notifications/read">{}<input type="hidden" name="id" value="{}"><button type="submit">标为已读</button></form>'.format(csrf(user), row["id"])
+    ) for row in rows)
+    content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>提醒</h1>
+<p class="muted">显示当前账号最近 100 条发送失败、需人工核对和检测到退信的事件。SMTP 已接受不等于送达；退信依赖 IMAP 识别。提醒仅在 Wismail 页面显示。</p>
+<form method="post" action="/notifications/preferences">{csrf}<label><input type="checkbox" name="failures" value="1" {failures}>显示发送失败及需核对</label>
+<label><input type="checkbox" name="bounces" value="1" {bounces}>显示检测到的退信</label><button class="button" type="submit">保存提醒设置</button></form></section>
+<section class="panel"><h2>最近事件</h2><div class="table-wrap"><table><thead><tr><th>时间</th><th>事件</th><th>批次</th><th>地址</th><th>状态</th><th>操作</th></tr></thead><tbody>{items}</tbody></table></div></section>'''.format(
+        csrf=csrf(user), failures="checked" if failures else "", bounces="checked" if bounces else "",
+        items=items or '<tr><td colspan="6">暂无符合设置的提醒</td></tr>')
+    return page("提醒", content, user)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -918,6 +941,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, account_page(self.current_user))
         elif path == "/audit":
             self._send(200, audit_page(self.current_user))
+        elif path == "/notifications":
+            self._send(200, notifications_page(self.current_user))
         elif path == "/static.css":
             with open(os.path.join(ROOT, "static.css"), "rb") as stream:
                 self._send(200, stream.read(), "text/css; charset=utf-8")
@@ -1037,6 +1062,16 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/suppressions":
                 add_suppression(DB_PATH, form.getfirst("email", ""), owner_email=self.current_user)
                 self._redirect("/")
+                return
+            if path == "/notifications/preferences":
+                save_notification_preferences(DB_PATH, self.current_user,
+                                              form.getfirst("failures", "") == "1",
+                                              form.getfirst("bounces", "") == "1")
+                self._redirect("/notifications")
+                return
+            if path == "/notifications/read":
+                mark_notification_read(DB_PATH, self.current_user, int(form.getfirst("id", "0")))
+                self._redirect("/notifications")
                 return
             if path == "/automations/add":
                 save_automation_rule(DB_PATH, self.current_user, form.getfirst("event_kind", ""),
@@ -1247,6 +1282,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path.startswith("/automations"):
                 self._send(400, automations_page(self.current_user, str(exc)))
+                return
+            if path.startswith("/notifications"):
+                self._send(400, notifications_page(self.current_user))
                 return
             if path.startswith("/account") and oauth_login.configured(SETTINGS):
                 self._send(400, account_page(self.current_user, str(exc)))

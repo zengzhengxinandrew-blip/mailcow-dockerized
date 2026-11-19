@@ -281,6 +281,17 @@ def init_db(path):
           detail TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_delivery_events_message ON delivery_events(message_id,id);
+        CREATE TABLE IF NOT EXISTS notification_preferences (
+          owner_email TEXT PRIMARY KEY,
+          failures_enabled INTEGER NOT NULL DEFAULT 1,
+          bounces_enabled INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS notification_reads (
+          owner_email TEXT NOT NULL,
+          event_id INTEGER NOT NULL REFERENCES delivery_events(id) ON DELETE CASCADE,
+          read_at TEXT NOT NULL,
+          PRIMARY KEY(owner_email,event_id)
+        );
         """)
         batch_columns = [item["name"] for item in db.execute("PRAGMA table_info(batches)")]
         if "owner_email" not in batch_columns:
@@ -1136,6 +1147,46 @@ def record_audit_event(path, owner_email, action, target_id=None):
     with connect(path) as db:
         db.execute("INSERT INTO audit_events(owner_email,action,target_id,created_at) VALUES (?,?,?,?)",
                    (owner_email, action, target_id, iso(utcnow())))
+
+
+def notification_preferences(path, owner_email):
+    with connect(path) as db:
+        row = db.execute("SELECT failures_enabled,bounces_enabled FROM notification_preferences WHERE owner_email=?",
+                         (owner_email,)).fetchone()
+    return (bool(row["failures_enabled"]), bool(row["bounces_enabled"])) if row else (True, True)
+
+
+def save_notification_preferences(path, owner_email, failures_enabled, bounces_enabled):
+    with connect(path) as db:
+        db.execute("""INSERT OR REPLACE INTO notification_preferences(owner_email,failures_enabled,bounces_enabled)
+                      VALUES (?,?,?)""",
+                   (owner_email, int(bool(failures_enabled)), int(bool(bounces_enabled))))
+
+
+def list_notifications(path, owner_email, limit=100):
+    failures, bounces = notification_preferences(path, owner_email)
+    if not failures and not bounces:
+        return []
+    kinds = (["failed", "needs_review"] if failures else []) + (["bounce"] if bounces else [])
+    placeholders = ",".join("?" for _ in kinds)
+    with connect(path) as db:
+        return db.execute("""SELECT e.id,e.kind,e.observed_at,b.id AS batch_id,b.name AS batch_name,
+                            m.recipient_email,r.read_at FROM delivery_events e
+                            JOIN messages m ON m.id=e.message_id JOIN batches b ON b.id=m.batch_id
+                            LEFT JOIN notification_reads r ON r.event_id=e.id AND r.owner_email=b.owner_email
+                            WHERE b.owner_email=? AND e.kind IN ({}) ORDER BY e.id DESC LIMIT ?""".format(placeholders),
+                          (owner_email, *kinds, min(max(int(limit), 1), 100))).fetchall()
+
+
+def mark_notification_read(path, owner_email, event_id):
+    with connect(path) as db:
+        row = db.execute("""SELECT 1 FROM delivery_events e JOIN messages m ON m.id=e.message_id
+                            JOIN batches b ON b.id=m.batch_id WHERE e.id=? AND b.owner_email=?
+                            AND e.kind IN ('failed','needs_review','bounce')""", (event_id, owner_email)).fetchone()
+        if not row:
+            raise ValueError("提醒不存在")
+        db.execute("INSERT OR IGNORE INTO notification_reads(owner_email,event_id,read_at) VALUES (?,?,?)",
+                   (owner_email, event_id, iso(utcnow())))
 
 
 def parse_provider_feedback_upload(filename, data):

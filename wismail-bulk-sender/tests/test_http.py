@@ -107,6 +107,31 @@ class HttpFlowTests(unittest.TestCase):
         with core.connect(server.DB_PATH) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM audit_events WHERE owner_email='__legacy_admin__'").fetchone()[0], 1)
 
+    def test_notification_settings_and_reads_are_owner_scoped(self):
+        own = core.create_draft(server.DB_PATH, "自己的任务", [(1, "own@example.com", "主题", "正文")])
+        other = core.create_draft(server.DB_PATH, "他人任务", [(1, "other@example.com", "主题", "正文")], "other@example.com")
+        with core.connect(server.DB_PATH) as db:
+            own_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (own,)).fetchone()[0]
+            other_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (other,)).fetchone()[0]
+            event_id = db.execute("INSERT INTO delivery_events(message_id,kind,observed_at) VALUES (?,'failed',?)",
+                                  (own_id, core.iso(core.utcnow()))).lastrowid
+            foreign_id = db.execute("INSERT INTO delivery_events(message_id,kind,observed_at) VALUES (?,'bounce',?)",
+                                    (other_id, core.iso(core.utcnow()))).lastrowid
+        status, _, body = self.request("GET", "/notifications")
+        self.assertEqual(status, 200)
+        self.assertIn("自己的任务".encode(), body)
+        self.assertNotIn("他人任务".encode(), body)
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        self.assertEqual(self.request("POST", "/notifications/read",
+                                      urlencode({"csrf": server.CSRF_TOKEN, "id": foreign_id}), headers)[0], 400)
+        self.assertEqual(self.request("POST", "/notifications/read",
+                                      urlencode({"csrf": server.CSRF_TOKEN, "id": event_id}), headers)[0], 303)
+        self.assertIn("已读".encode(), self.request("GET", "/notifications")[2])
+        self.assertEqual(self.request("POST", "/notifications/preferences",
+                                      urlencode({"csrf": server.CSRF_TOKEN, "bounces": "1"}), headers)[0], 303)
+        self.assertNotIn("自己的任务".encode(), self.request("GET", "/notifications")[2])
+        self.assertEqual(core.notification_preferences(server.DB_PATH, "other@example.com"), (True, True))
+
     def test_automation_rules_are_owner_scoped_and_do_not_send(self):
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         with mock.patch.object(core, "_smtp_submit") as submit:
