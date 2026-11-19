@@ -552,6 +552,42 @@ def failure_summary(path, owner_email, start_date, end_date, offset_hours=8):
                           (owner_email, lower, upper)).fetchall()
 
 
+def failure_details(path, owner_email, start_date, end_date, offset_hours=8, kind=None, code=None):
+    """Return the latest event per message and failure group in the selected period."""
+    if start_date > end_date or (end_date - start_date).days >= 366:
+        raise ValueError("统计时间范围最多为 366 天")
+    if kind not in (None, "failed", "needs_review"):
+        raise ValueError("失败事件类型无效")
+    if code is not None and code != "none" and (not isinstance(code, int) or not 100 <= code <= 599):
+        raise ValueError("SMTP 返回码无效")
+    offset = dt.timedelta(hours=offset_hours)
+    lower = iso((dt.datetime.combine(start_date, dt.time()) - offset).replace(tzinfo=dt.timezone.utc))
+    upper = iso((dt.datetime.combine(end_date + dt.timedelta(days=1), dt.time()) - offset).replace(tzinfo=dt.timezone.utc))
+    conditions = ["b.owner_email=?", "e.kind IN ('failed','needs_review')", "e.observed_at>=?", "e.observed_at<?"]
+    params = [owner_email, lower, upper]
+    if kind:
+        conditions.append("e.kind=?")
+        params.append(kind)
+    if code == "none":
+        conditions.append("e.smtp_code IS NULL")
+    elif code is not None:
+        conditions.append("e.smtp_code=?")
+        params.append(code)
+    query = """SELECT e.kind,e.smtp_code,e.observed_at,e.detail,m.batch_id,b.name AS batch_name,
+                      m.row_number,m.recipient_email,m.sender_email
+               FROM delivery_events e JOIN messages m ON m.id=e.message_id
+               JOIN batches b ON b.id=m.batch_id WHERE %s
+               AND NOT EXISTS (SELECT 1 FROM delivery_events newer
+                 WHERE newer.message_id=e.message_id AND newer.kind=e.kind
+                   AND newer.smtp_code IS e.smtp_code
+                   AND newer.observed_at>=? AND newer.observed_at<?
+                   AND (newer.observed_at>e.observed_at OR
+                        (newer.observed_at=e.observed_at AND newer.id>e.id)))
+               ORDER BY e.observed_at DESC,m.batch_id,m.row_number""" % " AND ".join(conditions)
+    with connect(path) as db:
+        return db.execute(query, params + [lower, upper]).fetchall()
+
+
 def ab_click_guidance(groups, state, track_click, latest_submitted_at, now=None):
     """Give a conservative, non-automatic A/B click comparison."""
     if not track_click:

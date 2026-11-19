@@ -77,6 +77,19 @@ class ReportingTests(unittest.TestCase):
                                     dt.date(2026, 11, 15))
         self.assertEqual({(row["kind"], row["smtp_code"]): row["messages"] for row in rows},
                          {("failed", 535): 1, ("needs_review", None): 1})
+        details = core.failure_details(self.path, "owner@example.com", dt.date(2026, 11, 15),
+                                       dt.date(2026, 11, 15))
+        self.assertEqual(len(details), 2)
+        self.assertEqual({(row["kind"], row["smtp_code"]) for row in details},
+                         {("failed", 535), ("needs_review", None)})
+        self.assertEqual(core.failure_details(self.path, "owner@example.com", dt.date(2026, 11, 15),
+                                              dt.date(2026, 11, 15), kind="failed", code=535)[0]["observed_at"],
+                         "2026-11-14T17:00:00+00:00")
+        self.assertEqual(len(core.failure_details(self.path, "owner@example.com", dt.date(2026, 11, 15),
+                                                  dt.date(2026, 11, 15), kind="needs_review", code="none")), 1)
+        with self.assertRaises(ValueError):
+            core.failure_details(self.path, "owner@example.com", dt.date(2026, 11, 15),
+                                 dt.date(2026, 11, 15), kind="submitted")
 
 
 if __name__ == "__main__":
