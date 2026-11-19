@@ -820,7 +820,7 @@ def add_suppression(path, recipient, reason="手动添加", owner_email="__legac
     if not EMAIL_RE.match(recipient):
         raise ValueError("不再联系邮箱格式无效")
     with connect(path) as db:
-        db.execute("INSERT OR REPLACE INTO suppressions(owner_email,recipient_email,reason,created_at) VALUES (?,?,?,?)",
+        db.execute("INSERT OR IGNORE INTO suppressions(owner_email,recipient_email,reason,created_at) VALUES (?,?,?,?)",
                    (owner_email, recipient, reason[:200], iso(utcnow())))
         db.execute("""UPDATE contacts SET status='unsubscribed',status_reason=?,updated_at=?
                       WHERE email=? AND status='subscribed' AND (?='*' OR owner_email=?)""",
@@ -831,6 +831,17 @@ def add_suppression(path, recipient, reason="手动添加", owner_email="__legac
         if reason == "收件人退订" and owner_email != "*":
             event_key = "unsubscribe:" + hashlib.sha256(recipient.encode("utf-8")).hexdigest()
             _apply_automation_event(db, owner_email, recipient, "unsubscribe", event_key)
+
+
+def remove_manual_suppression(path, owner_email, recipient):
+    recipient = str(recipient or "").strip().lower()
+    if not EMAIL_RE.fullmatch(recipient):
+        raise ValueError("邮箱格式无效")
+    with connect(path) as db:
+        removed = db.execute("""DELETE FROM suppressions WHERE owner_email=? AND recipient_email=?
+                                AND reason='手动添加'""", (owner_email, recipient)).rowcount
+        if not removed:
+            raise ValueError("只能移除本账号手动添加的地址")
 
 
 AUTOMATION_EVENTS = {"open": "观测打开", "click": "观测点击", "unsubscribe": "收件人退订", "birthday": "联系人生日"}

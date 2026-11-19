@@ -132,6 +132,27 @@ class HttpFlowTests(unittest.TestCase):
         self.assertNotIn("自己的任务".encode(), self.request("GET", "/notifications")[2])
         self.assertEqual(core.notification_preferences(server.DB_PATH, "other@example.com"), (True, True))
 
+    def test_suppression_management_search_export_and_scope(self):
+        owner = "__legacy_admin__"
+        core.add_suppression(server.DB_PATH, "own@example.com", owner_email=owner)
+        core.add_suppression(server.DB_PATH, "global@example.com", "全局规则", "*")
+        core.add_suppression(server.DB_PATH, "foreign@example.com", owner_email="other@example.com")
+        status, _, page = self.request("GET", "/suppressions?q=own")
+        self.assertEqual(status, 200)
+        self.assertIn(b"own@example.com", page)
+        self.assertNotIn(b"foreign@example.com", page)
+        self.assertNotIn(b"global@example.com", page)
+        status, _, data = self.request("GET", "/suppressions/export.csv")
+        self.assertEqual(status, 200)
+        self.assertIn(b"global@example.com", data)
+        self.assertNotIn(b"foreign@example.com", data)
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        bad = urlencode({"csrf": server.CSRF_TOKEN, "email": "global@example.com"})
+        self.assertEqual(self.request("POST", "/suppressions/remove", bad, headers)[0], 400)
+        good = urlencode({"csrf": server.CSRF_TOKEN, "email": "own@example.com"})
+        self.assertEqual(self.request("POST", "/suppressions/remove", good, headers)[0], 303)
+        self.assertNotIn(b"own@example.com", self.request("GET", "/suppressions")[2])
+
     def test_automation_rules_are_owner_scoped_and_do_not_send(self):
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         with mock.patch.object(core, "_smtp_submit") as submit:

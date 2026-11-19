@@ -25,7 +25,7 @@ from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, a
                   parse_contacts_upload, parse_upload, preflight_template, prepare_contact_campaign, render_template, report_data,
                   save_automation_rule, set_automation_rule, delete_automation_rule, save_scheduled_rule,
                   set_scheduled_rule, delete_scheduled_rule, save_template, send_template_test,
-                  revoke_mailbox_auth, remove_sender_alias, verify_sender_alias, save_contact, save_mailbox_auth, schedule_batch,
+                  revoke_mailbox_auth, remove_manual_suppression, remove_sender_alias, verify_sender_alias, save_contact, save_mailbox_auth, schedule_batch,
                   set_batch_state, set_contact_deleted, set_contact_status, tracking_ready,
                   list_notifications, mark_notification_read, notification_preferences, record_audit_event,
                   record_tracking_event, save_notification_preferences, verify_tracking_token, utcnow, verify_mailbox_auth)
@@ -248,7 +248,7 @@ def dashboard(error="", user="__legacy_admin__"):
 <section class="panel side"><div class="panel-title"><span class="step">02</span><h2>检查后再发送</h2></div><ol class="process"><li>检查邮箱、主题、正文和重复邮件</li><li>逐封预览，设置开始时间与发送间隔</li><li>启动后查看提交、失败、退信和回复</li></ol><div class="config">{status}<small>每日上限 {limit} 封，每小时上限 {hourly} 封，最短发送间隔 {interval} 秒。退信和回复需要配置 IMAP。</small></div></section></div>
 <section class="list-section"><div class="section-heading"><h2>发送批次</h2><span class="muted">最近 50 个</span></div><div class="batch-list">{batches}</div></section>
 <section class="panel suppression"><div><div class="eyebrow">发送保护</div><h2>不再联系名单 <small>共 {suppression_count} 个</small></h2><p class="muted">客户要求停止联系时，先将邮箱加入这里。已排队但未发送的邮件也会被跳过。</p></div>
-<div><form method="post" action="/suppressions">{csrf}<label for="suppression-email">添加邮箱</label><div class="inline-form"><input id="suppression-email" type="email" name="email" placeholder="buyer@example.com" required><button class="button" type="submit">加入名单</button></div></form>
+<div><form method="post" action="/suppressions">{csrf}<label for="suppression-email">添加邮箱</label><div class="inline-form"><input id="suppression-email" type="email" name="email" placeholder="buyer@example.com" required><button class="button" type="submit">加入名单</button></div></form><p><a href="/suppressions">查看与管理全部地址</a></p>
 <div class="suppression-list">{suppressions}</div></div></section>'''.format(
         alert=alert, csrf=csrf(user), status=status, limit=h(SETTINGS["DAILY_LIMIT"]),
         interval=h(SETTINGS["MIN_INTERVAL_SECONDS"]), hourly=h(SETTINGS["HOURLY_LIMIT"]),
@@ -256,6 +256,30 @@ def dashboard(error="", user="__legacy_admin__"):
         suppression_count=suppression_count,
         suppressions="".join('<div><span>{}</span><small>{}</small></div>'.format(h(x["recipient_email"]), local_time(x["created_at"])) for x in suppressions) if suppressions else '<p class="muted">名单为空</p>')
     return page("发送批次", content, user)
+
+
+def suppressions_page(user, search="", error=""):
+    search = str(search or "")[:100].strip().lower()
+    with connect(DB_PATH) as db:
+        rows = db.execute("""SELECT owner_email,recipient_email,reason,created_at FROM suppressions
+                             WHERE owner_email IN (?, '*') AND instr(recipient_email,?)>0
+                             ORDER BY created_at DESC LIMIT 200""", (user, search)).fetchall()
+        count = db.execute("SELECT count(*) FROM suppressions WHERE owner_email IN (?, '*')", (user,)).fetchone()[0]
+    items = ''.join('''<tr><td>{email}</td><td>{scope}</td><td>{reason}</td><td>{time}</td><td>{action}</td></tr>'''.format(
+        email=h(row["recipient_email"]), scope="全局" if row["owner_email"] == "*" else "本账号",
+        reason=h(row["reason"]), time=h(local_time(row["created_at"])),
+        action=('''<form method="post" action="/suppressions/remove" onsubmit="return confirm('移除手动名单？已禁止发送的联系人及排队邮件不会自动恢复。')">{csrf}<input type="hidden" name="email" value="{email}"><button type="submit">移除手动项</button></form>'''.format(
+            csrf=csrf(user), email=h(row["recipient_email"])) if row["owner_email"] == user and row["reason"] == "手动添加" else "不可移除")
+    ) for row in rows)
+    alert = '<div class="alert">{}</div>'.format(h(error)) if error else ""
+    content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>不再联系名单 <small>共 {count} 个</small></h1>{alert}
+<p class="muted">显示本账号及全局禁发地址。只能移除本账号手动添加的项目；移除后，联系人退订、投诉、无效状态和已拦截的邮件不会自动恢复。</p>
+<form method="get" action="/suppressions"><label>搜索邮箱<input name="q" value="{search}"></label><button class="button" type="submit">搜索</button></form>
+<p><a href="/suppressions/export.csv">导出全部名单 CSV</a></p></section>
+<section class="panel"><div class="table-wrap"><table><thead><tr><th>邮箱</th><th>范围</th><th>原因</th><th>加入时间</th><th>操作</th></tr></thead><tbody>{items}</tbody></table></div>
+<p class="muted">页面最多显示 200 条；导出包含全部。</p></section>'''.format(
+        count=count, alert=alert, search=h(search), items=items or '<tr><td colspan="5">没有匹配地址</td></tr>')
+    return page("不再联系名单", content, user)
 
 
 def contacts_page(user, error="", search="", status="", category="", recycle=False, notice=""):
@@ -670,7 +694,8 @@ def account_page(user, error="", success=False):
 AUDIT_LABELS = {
     "/account": "保存发件授权", "/account/revoke": "撤销发件授权",
     "/account/aliases/add": "添加代发地址", "/account/aliases/remove": "移除代发地址",
-    "/suppressions": "添加不再联系地址", "/upload": "上传发送批次",
+    "/suppressions": "添加不再联系地址", "/suppressions/remove": "移除手动不再联系项",
+    "/upload": "上传发送批次",
     "/notifications/preferences": "更新提醒设置",
     "/templates/save": "保存模板", "/templates/copy": "复制模板", "/templates/test": "发送模板测试邮件",
     "/campaigns/from-contacts": "创建联系人任务", "/campaigns": "创建联系人任务",
@@ -875,6 +900,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/":
             self._send(200, dashboard(user=self.current_user))
+        elif path == "/suppressions":
+            query = parse_qs(urlparse(self.path).query)
+            self._send(200, suppressions_page(self.current_user, query.get("q", [""])[0]))
+        elif path == "/suppressions/export.csv":
+            with connect(DB_PATH) as db:
+                rows = db.execute("""SELECT recipient_email,owner_email,reason,created_at FROM suppressions
+                                     WHERE owner_email IN (?, '*') ORDER BY created_at DESC""",
+                                  (self.current_user,)).fetchall()
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["邮箱", "范围", "原因", "加入时间(UTC)"])
+            for row in rows:
+                writer.writerow([csv_safe(row["recipient_email"]),
+                                 "全局" if row["owner_email"] == "*" else "本账号",
+                                 csv_safe(row["reason"]), row["created_at"]])
+            self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
+                       {"Content-Disposition": 'attachment; filename="wismail-suppressions.csv"'})
         elif path == "/automations":
             self._send(200, automations_page(self.current_user))
         elif path == "/campaigns":
@@ -1062,6 +1104,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/suppressions":
                 add_suppression(DB_PATH, form.getfirst("email", ""), owner_email=self.current_user)
                 self._redirect("/")
+                return
+            if path == "/suppressions/remove":
+                remove_manual_suppression(DB_PATH, self.current_user, form.getfirst("email", ""))
+                self._redirect("/suppressions")
                 return
             if path == "/notifications/preferences":
                 save_notification_preferences(DB_PATH, self.current_user,
@@ -1285,6 +1331,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path.startswith("/notifications"):
                 self._send(400, notifications_page(self.current_user))
+                return
+            if path.startswith("/suppressions"):
+                self._send(400, suppressions_page(self.current_user, error=str(exc)))
                 return
             if path.startswith("/account") and oauth_login.configured(SETTINGS):
                 self._send(400, account_page(self.current_user, str(exc)))

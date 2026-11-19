@@ -63,6 +63,25 @@ class ContactTests(unittest.TestCase):
         with core.connect(self.path) as db:
             self.assertEqual(db.execute("SELECT status FROM contacts").fetchone()["status"], "unsubscribed")
 
+    def test_only_own_manual_suppression_can_be_removed_without_resubscribing(self):
+        owner = "a@example.com"
+        core.save_contact(self.path, owner, {"email": "buyer@example.com"})
+        batch = core.create_draft(self.path, "待发", [(1, "buyer@example.com", "主题", "正文")], owner)
+        core.schedule_batch(self.path, batch, "now", 60)
+        core.add_suppression(self.path, "buyer@example.com", owner_email=owner)
+        with self.assertRaises(ValueError):
+            core.remove_manual_suppression(self.path, "b@example.com", "buyer@example.com")
+        core.remove_manual_suppression(self.path, owner, "buyer@example.com")
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT status FROM contacts WHERE owner_email=?", (owner,)).fetchone()[0], "unsubscribed")
+            self.assertEqual(db.execute("SELECT status FROM messages WHERE batch_id=?", (batch,)).fetchone()[0], "suppressed")
+        core.add_suppression(self.path, "buyer@example.com", "收件人退订", owner)
+        core.add_suppression(self.path, "buyer@example.com", owner_email=owner)
+        with core.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT reason FROM suppressions WHERE owner_email=?", (owner,)).fetchone()[0], "收件人退订")
+        with self.assertRaises(ValueError):
+            core.remove_manual_suppression(self.path, owner, "buyer@example.com")
+
     def test_provider_feedback_is_atomic_idempotent_and_owner_scoped(self):
         owner = "a@example.com"
         core.save_contact(self.path, owner, {"email": "buyer@example.com"})
