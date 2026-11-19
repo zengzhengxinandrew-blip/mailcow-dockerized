@@ -572,6 +572,31 @@ def engagement_details(path, owner_email, start_date, end_date, offset_hours=8, 
     return sorted(details, key=lambda row: (row["observed_at"], row["batch_id"], row["row_number"]), reverse=True)
 
 
+def feedback_details(path, owner_email, start_date, end_date, offset_hours=8, kind=None):
+    """List owner-scoped IMAP bounce/reply observations in the selected period."""
+    if start_date > end_date or (end_date - start_date).days >= 366:
+        raise ValueError("统计时间范围最多为 366 天")
+    if kind not in (None, "bounced", "replied"):
+        raise ValueError("反馈事件类型无效")
+    offset = dt.timedelta(hours=offset_hours)
+    lower = iso((dt.datetime.combine(start_date, dt.time()) - offset).replace(tzinfo=dt.timezone.utc))
+    upper = iso((dt.datetime.combine(end_date + dt.timedelta(days=1), dt.time()) - offset).replace(tzinfo=dt.timezone.utc))
+    details = []
+    with connect(path) as db:
+        for event_kind, time_field in (("bounced", "bounced_at"), ("replied", "replied_at")):
+            if kind is not None and kind != event_kind:
+                continue
+            rows = db.execute("""SELECT m.batch_id,b.name AS batch_name,m.row_number,m.recipient_email,
+                                        m.sender_email,m.{} AS observed_at
+                                 FROM messages m JOIN batches b ON b.id=m.batch_id
+                                 WHERE b.owner_email=? AND m.{}>=? AND m.{}<?""".format(
+                                  time_field, time_field, time_field),
+                              (owner_email, lower, upper)).fetchall()
+            for row in rows:
+                details.append({**dict(row), "kind": event_kind})
+    return sorted(details, key=lambda row: (row["observed_at"], row["batch_id"], row["row_number"]), reverse=True)
+
+
 def failure_summary(path, owner_email, start_date, end_date, offset_hours=8):
     """Group recorded final SMTP failures and interrupted submissions by code."""
     if start_date > end_date or (end_date - start_date).days >= 366:

@@ -369,8 +369,9 @@ class HttpFlowTests(unittest.TestCase):
     def test_report_and_event_exports_use_existing_results(self):
         batch = core.create_draft(server.DB_PATH, "=报价", [(1, "buyer@example.com", "报价", "正文")])
         with core.connect(server.DB_PATH) as db:
-            db.execute("UPDATE messages SET status='submitted',sender_email='sales@example.com',submitted_at=?,opened_at=?,opened_device='mobile' WHERE batch_id=?",
-                       ("2026-11-15T01:00:00+00:00", "2026-11-15T01:30:00+00:00", batch))
+            db.execute("UPDATE messages SET status='submitted',sender_email='sales@example.com',submitted_at=?,opened_at=?,opened_device='mobile',bounced_at=?,replied_at=? WHERE batch_id=?",
+                       ("2026-11-15T01:00:00+00:00", "2026-11-15T01:30:00+00:00",
+                        "2026-11-15T02:30:00+00:00", "2026-11-15T03:00:00+00:00", batch))
             message_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (batch,)).fetchone()[0]
             db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,?,?,?)",
                        (message_id, "submitted", "2026-11-15T01:00:00+00:00", "SMTP 已接受"))
@@ -383,6 +384,7 @@ class HttpFlowTests(unittest.TestCase):
         self.assertIn("按年份".encode("utf-8"), page)
         self.assertIn("跟踪请求设备类型".encode("utf-8"), page)
         self.assertIn(b"/reports/engagement-details.csv?", page)
+        self.assertIn(b"/reports/feedback-details.csv?", page)
         self.assertIn(b"sales@example.com", page)
         status, _, report_csv = self.request("GET", "/reports/export.csv?start=2026-11-15&end=2026-11-15")
         self.assertEqual(status, 200)
@@ -401,6 +403,17 @@ class HttpFlowTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(list(csv.reader(io.StringIO(clicked_csv.decode("utf-8-sig"))))), 1)
         self.assertEqual(self.request("GET", "/reports/engagement-details.csv?start=2026-11-15&end=2026-11-15&kind=submitted")[0], 400)
+        status, _, bounced_csv = self.request("GET", "/reports/feedback-details.csv?start=2026-11-15&end=2026-11-15&kind=bounced")
+        self.assertEqual(status, 200)
+        bounced_rows = list(csv.reader(io.StringIO(bounced_csv.decode("utf-8-sig"))))
+        self.assertEqual(len(bounced_rows), 2)
+        self.assertEqual(bounced_rows[1][2], "'=报价")
+        self.assertEqual(bounced_rows[1][4], "buyer@example.com")
+        self.assertEqual(bounced_rows[1][6], "检测到退信")
+        status, _, replied_csv = self.request("GET", "/reports/feedback-details.csv?start=2026-11-15&end=2026-11-15&kind=replied")
+        self.assertEqual(status, 200)
+        self.assertIn("检测到回复".encode("utf-8"), replied_csv)
+        self.assertEqual(self.request("GET", "/reports/feedback-details.csv?start=2026-11-15&end=2026-11-15&kind=opened")[0], 400)
         self.assertIn("失败原因汇总".encode("utf-8"), page)
         self.assertIn(b"/reports/failure-details.csv?", page)
         status, _, failures_csv = self.request("GET", "/reports/failures.csv?start=2026-11-15&end=2026-11-15")
@@ -423,10 +436,15 @@ class HttpFlowTests(unittest.TestCase):
             other_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (other,)).fetchone()[0]
             db.execute("INSERT INTO delivery_events(message_id,kind,smtp_code,observed_at,detail) VALUES (?,?,?,?,?)",
                        (other_id, "failed", 550, "2026-11-15T02:00:00+00:00", "他人记录"))
-            db.execute("UPDATE messages SET opened_at=? WHERE id=?", ("2026-11-15T02:30:00+00:00", other_id))
+            db.execute("UPDATE messages SET opened_at=?,bounced_at=?,replied_at=? WHERE id=?",
+                       ("2026-11-15T02:30:00+00:00", "2026-11-15T03:30:00+00:00",
+                        "2026-11-15T04:00:00+00:00", other_id))
         status, _, opened_csv = self.request("GET", "/reports/engagement-details.csv?start=2026-11-15&end=2026-11-15")
         self.assertEqual(status, 200)
         self.assertNotIn(b"other@example.com", opened_csv)
+        status, _, feedback_csv = self.request("GET", "/reports/feedback-details.csv?start=2026-11-15&end=2026-11-15")
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"other@example.com", feedback_csv)
         status, _, details_csv = self.request("GET", "/reports/failure-details.csv?start=2026-11-15&end=2026-11-15")
         self.assertEqual(status, 200)
         self.assertNotIn(b"other@example.com", details_csv)

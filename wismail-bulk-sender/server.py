@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from cryptography.fernet import Fernet
 
 from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_category, rename_category, delete_category, set_contact_category, merge_contacts, create_draft,
-                  create_contact_campaign, engagement_details, failure_details, failure_summary, get_template, import_contacts, import_provider_feedback, init_db, mailbox_settings,
+                  create_contact_campaign, engagement_details, failure_details, failure_summary, feedback_details, get_template, import_contacts, import_provider_feedback, init_db, mailbox_settings,
                   parse_contacts_upload, parse_upload, preflight_template, prepare_contact_campaign, render_template, report_data,
                   save_automation_rule, set_automation_rule, delete_automation_rule, save_scheduled_rule,
                   set_scheduled_rule, delete_scheduled_rule, save_template, send_template_test,
@@ -208,6 +208,7 @@ def reports_page(user, start="", end=""):
 <section class="panel report-table"><h2>按月份</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{months}</tbody></table></div></section>
 <section class="panel report-table"><h2>按年份</h2><p class="muted">只统计所选日期范围内的事件，跨年查询时每年可能不是完整年度。</p><div class="table-wrap"><table><thead>{headings}</thead><tbody>{years}</tbody></table></div></section>
 <section class="panel report-table"><h2>跟踪请求设备类型</h2><p class="muted">按首次打开或点击请求的 User-Agent 粗略识别，不保存原始 User-Agent 或请求 IP。邮箱图片代理和安全扫描可能代替收件人发出请求；“未知”也包含上线前的历史记录。这不是实际阅读设备的准确分布。</p><p><a href="/reports/engagement-details.csv?{query}&amp;kind=opened">导出打开地址明细 CSV</a> · <a href="/reports/engagement-details.csv?{query}&amp;kind=clicked">导出点击地址明细 CSV</a></p><div class="table-wrap"><table><thead><tr><th>设备类型</th><th>观测到打开</th><th>观测到点击</th></tr></thead><tbody>{devices}</tbody></table></div></section>
+<section class="panel"><h2>退信与回复地址明细</h2><p class="muted">只包含 IMAP 已检测且能关联到本账号邮件的退信、回复。未检测到不等于对方没有退信或回复；日期按检测时间计算。</p><p><a href="/reports/feedback-details.csv?{query}&amp;kind=bounced">导出退信地址明细 CSV</a> · <a href="/reports/feedback-details.csv?{query}&amp;kind=replied">导出回复地址明细 CSV</a></p></section>
 <section class="panel report-table"><h2>按发件人</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{senders}</tbody></table></div></section>
 <section class="panel report-table"><h2>按批次</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{batches}</tbody></table></div></section>
 <section class="panel report-table"><h2>失败原因汇总</h2><p class="muted">按记录到的最终失败或需人工核对事件统计，与上方当前失败状态可能不同。返回码无法单独说明完整原因，请到批次的逐封日志核对详情。</p>
@@ -943,7 +944,7 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(urlparse(self.path).query)
             self._send(200, campaigns_page(self.current_user,
                                            {"template_ids": query.get("template_id", [])}))
-        elif path in ("/reports", "/reports/export.csv", "/reports/failures.csv", "/reports/failure-details.csv", "/reports/engagement-details.csv"):
+        elif path in ("/reports", "/reports/export.csv", "/reports/failures.csv", "/reports/failure-details.csv", "/reports/engagement-details.csv", "/reports/feedback-details.csv"):
             query = parse_qs(urlparse(self.path).query)
             try:
                 first, last = report_period(query.get("start", [""])[0], query.get("end", [""])[0])
@@ -998,7 +999,7 @@ class Handler(BaseHTTPRequestHandler):
                                          csv_safe(event_suggestion(row["kind"], row["smtp_code"]))])
                     self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
                                {"Content-Disposition": 'attachment; filename="wismail-failure-details.csv"'})
-                else:
+                elif path == "/reports/engagement-details.csv":
                     kind = query.get("kind", [""])[0] or None
                     rows = engagement_details(DB_PATH, self.current_user, first, last,
                                               int(SETTINGS["UTC_OFFSET_HOURS"]), kind)
@@ -1014,6 +1015,21 @@ class Handler(BaseHTTPRequestHandler):
                                          DEVICE_LABELS[device]])
                     self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
                                {"Content-Disposition": 'attachment; filename="wismail-engagement-details.csv"'})
+                else:
+                    kind = query.get("kind", [""])[0] or None
+                    rows = feedback_details(DB_PATH, self.current_user, first, last,
+                                            int(SETTINGS["UTC_OFFSET_HOURS"]), kind)
+                    output = io.StringIO()
+                    writer = csv.writer(output)
+                    writer.writerow(["检测时间(UTC)", "批次编号", "批次名称", "表格行号", "收件邮箱",
+                                     "发件邮箱", "事件"])
+                    for row in rows:
+                        writer.writerow([row["observed_at"], row["batch_id"], csv_safe(row["batch_name"]),
+                                         row["row_number"], csv_safe(row["recipient_email"]),
+                                         csv_safe(row["sender_email"]),
+                                         "检测到退信" if row["kind"] == "bounced" else "检测到回复"])
+                    self._send(200, b"\xef\xbb\xbf" + output.getvalue().encode("utf-8"), "text/csv; charset=utf-8",
+                               {"Content-Disposition": 'attachment; filename="wismail-feedback-details.csv"'})
             except ValueError as exc:
                 self._send(400, page("统计报表", '<section class="panel"><h1>日期无效</h1><p>{}</p><a href="/reports">返回统计报表</a></section>'.format(h(exc)), self.current_user))
         elif path == "/templates":
