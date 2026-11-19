@@ -369,7 +369,7 @@ class HttpFlowTests(unittest.TestCase):
     def test_report_and_event_exports_use_existing_results(self):
         batch = core.create_draft(server.DB_PATH, "=报价", [(1, "buyer@example.com", "报价", "正文")])
         with core.connect(server.DB_PATH) as db:
-            db.execute("UPDATE messages SET status='submitted',submitted_at=? WHERE batch_id=?",
+            db.execute("UPDATE messages SET status='submitted',sender_email='sales@example.com',submitted_at=? WHERE batch_id=?",
                        ("2026-11-15T01:00:00+00:00", batch))
             message_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (batch,)).fetchone()[0]
             db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,?,?,?)",
@@ -377,9 +377,12 @@ class HttpFlowTests(unittest.TestCase):
         status, _, page = self.request("GET", "/reports?start=2026-11-15&end=2026-11-15")
         self.assertEqual(status, 200)
         self.assertIn("SMTP 已接受".encode("utf-8"), page)
+        self.assertIn("按发件人".encode("utf-8"), page)
+        self.assertIn(b"sales@example.com", page)
         status, _, report_csv = self.request("GET", "/reports/export.csv?start=2026-11-15&end=2026-11-15")
         self.assertEqual(status, 200)
         self.assertIn("'=报价".encode("utf-8"), report_csv)
+        self.assertIn(b"sales@example.com", report_csv)
         status, _, events_csv = self.request("GET", "/batches/1/events.csv")
         self.assertEqual(status, 200)
         self.assertIn("SMTP 已接受".encode("utf-8"), events_csv)

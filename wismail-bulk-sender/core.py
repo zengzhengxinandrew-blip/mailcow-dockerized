@@ -498,7 +498,7 @@ def report_data(path, owner_email, start_date, end_date, offset_hours=8):
     fields = {"submitted": "submitted_at", "opened": "opened_at", "clicked": "clicked_at",
               "failed": "last_attempt_at", "bounced": "bounced_at", "replied": "replied_at"}
     with connect(path) as db:
-        rows = db.execute("""SELECT m.batch_id,b.name,m.status,m.submitted_at,m.opened_at,m.clicked_at,
+        rows = db.execute("""SELECT m.batch_id,b.name,m.sender_email,m.status,m.submitted_at,m.opened_at,m.clicked_at,
                                    m.last_attempt_at,m.bounced_at,m.replied_at
                             FROM messages m JOIN batches b ON b.id=m.batch_id
                             WHERE b.owner_email=? AND (
@@ -511,7 +511,7 @@ def report_data(path, owner_email, start_date, end_date, offset_hours=8):
                           (owner_email,) + (lower, upper) * 6).fetchall()
     def empty():
         return {key: 0 for key in fields}
-    totals, days, months, batches = empty(), {}, {}, {}
+    totals, days, months, batches, senders = empty(), {}, {}, {}, {}
     for row in rows:
         for key, column in fields.items():
             value = row[column]
@@ -522,13 +522,17 @@ def report_data(path, owner_email, start_date, end_date, offset_hours=8):
             day = (parse_iso(value) + offset).date().isoformat()
             month = day[:7]
             batch = batches.setdefault(row["batch_id"], {"id": row["batch_id"], "name": row["name"], **empty()})
+            sender_name = row["sender_email"].lower() or "未记录发件地址"
+            sender = senders.setdefault(sender_name, {"name": sender_name, **empty()})
             totals[key] += 1
             days.setdefault(day, empty())[key] += 1
             months.setdefault(month, empty())[key] += 1
             batch[key] += 1
+            sender[key] += 1
     return {"totals": totals, "days": sorted(days.items(), reverse=True),
             "months": sorted(months.items(), reverse=True),
-            "batches": sorted(batches.values(), key=lambda item: (-item["submitted"], item["id"]))}
+            "batches": sorted(batches.values(), key=lambda item: (-item["submitted"], item["id"])),
+            "senders": sorted(senders.values(), key=lambda item: (-item["submitted"], item["name"]))}
 
 
 def ab_click_guidance(groups, state, track_click, latest_submitted_at, now=None):

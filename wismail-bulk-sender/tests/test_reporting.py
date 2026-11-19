@@ -22,19 +22,22 @@ class ReportingTests(unittest.TestCase):
         failed = core.create_draft(self.path, "失败", [(1, "b@example.com", "B", "Body")], "owner@example.com")
         other = core.create_draft(self.path, "他人", [(1, "c@example.com", "C", "Body")], "other@example.com")
         with core.connect(self.path) as db:
-            db.execute("""UPDATE messages SET status='submitted',submitted_at=?,opened_at=?,clicked_at=?,bounced_at=?,replied_at=?
+            db.execute("""UPDATE messages SET status='submitted',sender_email='sales@example.com',submitted_at=?,opened_at=?,clicked_at=?,bounced_at=?,replied_at=?
                           WHERE batch_id=?""", ("2026-11-14T16:30:00+00:00", "2026-11-15T01:00:00+00:00",
                                                   "2026-11-15T01:30:00+00:00", "2026-11-15T02:00:00+00:00",
                                                   "2026-11-15T02:30:00+00:00", own))
-            db.execute("UPDATE messages SET status='failed',last_attempt_at=? WHERE batch_id=?",
+            db.execute("UPDATE messages SET status='failed',sender_email='team@example.com',last_attempt_at=? WHERE batch_id=?",
                        ("2026-11-15T03:00:00+00:00", failed))
-            db.execute("UPDATE messages SET status='submitted',submitted_at=? WHERE batch_id=?",
+            db.execute("UPDATE messages SET status='submitted',sender_email='foreign@example.com',submitted_at=? WHERE batch_id=?",
                        ("2026-11-15T04:00:00+00:00", other))
         data = core.report_data(self.path, "owner@example.com", dt.date(2026, 11, 15), dt.date(2026, 11, 15))
         self.assertEqual(data["totals"], {"submitted": 1, "opened": 1, "clicked": 1,
                                           "failed": 1, "bounced": 1, "replied": 1})
         self.assertEqual(data["days"][0][0], "2026-11-15")
         self.assertEqual({row["name"] for row in data["batches"]}, {"德国", "失败"})
+        self.assertEqual({row["name"]: (row["submitted"], row["failed"], row["bounced"])
+                          for row in data["senders"]},
+                         {"sales@example.com": (1, 0, 1), "team@example.com": (0, 1, 0)})
         self.assertEqual(core.report_data(self.path, "owner@example.com", dt.date(2026, 11, 14),
                                           dt.date(2026, 11, 14))["totals"]["submitted"], 0)
 

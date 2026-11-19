@@ -187,6 +187,7 @@ def reports_page(user, start="", end=""):
     month_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(month), cells(row)) for month, row in data["months"])
     batch_rows = ''.join('<tr><td><a class="text-link" href="/batches/{}">{}</a></td>{}</tr>'.format(
         row["id"], h(row["name"]), cells(row)) for row in data["batches"])
+    sender_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(row["name"]), cells(row)) for row in data["senders"])
     headings = '<tr><th>维度</th>' + ''.join('<th>{}</th>'.format(label) for _, label in labels) + '</tr>'
     query = 'start={}&amp;end={}'.format(first.isoformat(), last.isoformat())
     content = '''<nav class="back"><a href="/">← 返回批次</a></nav><section class="panel"><h1>统计报表</h1>
@@ -196,10 +197,12 @@ def reports_page(user, start="", end=""):
 <section class="stats report-stats">{summary}</section>
 <section class="panel report-table"><h2>按日期</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{days}</tbody></table></div></section>
 <section class="panel report-table"><h2>按月份</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{months}</tbody></table></div></section>
+<section class="panel report-table"><h2>按发件人</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{senders}</tbody></table></div></section>
 <section class="panel report-table"><h2>按批次</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{batches}</tbody></table></div></section>'''.format(
         start=first.isoformat(), end=last.isoformat(), query=query, summary=summary, headings=headings,
         days=day_rows or '<tr><td colspan="7">暂无记录</td></tr>',
         months=month_rows or '<tr><td colspan="7">暂无记录</td></tr>',
+        senders=sender_rows or '<tr><td colspan="7">暂无记录</td></tr>',
         batches=batch_rows or '<tr><td colspan="7">暂无记录</td></tr>')
     return page("统计报表", content, user)
 
@@ -933,10 +936,13 @@ class Handler(BaseHTTPRequestHandler):
                     data = report_data(DB_PATH, self.current_user, first, last, int(SETTINGS["UTC_OFFSET_HOURS"]))
                     output = io.StringIO()
                     writer = csv.writer(output)
-                    writer.writerow(["维度", "日期/批次", "SMTP 已接受", "观测到打开", "观测到点击", "发送失败/待核对", "检测到退信", "检测到回复"])
+                    writer.writerow(["维度", "日期/发件人/批次", "SMTP 已接受", "观测到打开", "观测到点击", "发送失败/待核对", "检测到退信", "检测到回复"])
                     for kind, rows in (("日期", data["days"]), ("月份", data["months"])):
                         for label, values in rows:
                             writer.writerow([kind, label] + [values[key] for key in ("submitted", "opened", "clicked", "failed", "bounced", "replied")])
+                    for values in data["senders"]:
+                        writer.writerow(["发件人", csv_safe(values["name"])] +
+                                        [values[key] for key in ("submitted", "opened", "clicked", "failed", "bounced", "replied")])
                     for values in data["batches"]:
                         writer.writerow(["批次", csv_safe(values["name"])] +
                                         [values[key] for key in ("submitted", "opened", "clicked", "failed", "bounced", "replied")])
