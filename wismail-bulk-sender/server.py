@@ -186,6 +186,7 @@ def reports_page(user, start="", end=""):
         return ''.join('<td>{}</td>'.format(row[key]) for key, _ in labels)
     day_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(day), cells(row)) for day, row in data["days"])
     month_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(month), cells(row)) for month, row in data["months"])
+    year_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(year), cells(row)) for year, row in data["years"])
     batch_rows = ''.join('<tr><td><a class="text-link" href="/batches/{}">{}</a></td>{}</tr>'.format(
         row["id"], h(row["name"]), cells(row)) for row in data["batches"])
     sender_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(row["name"]), cells(row)) for row in data["senders"])
@@ -203,6 +204,7 @@ def reports_page(user, start="", end=""):
 <section class="stats report-stats">{summary}</section>
 <section class="panel report-table"><h2>按日期</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{days}</tbody></table></div></section>
 <section class="panel report-table"><h2>按月份</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{months}</tbody></table></div></section>
+<section class="panel report-table"><h2>按年份</h2><p class="muted">只统计所选日期范围内的事件，跨年查询时每年可能不是完整年度。</p><div class="table-wrap"><table><thead>{headings}</thead><tbody>{years}</tbody></table></div></section>
 <section class="panel report-table"><h2>按发件人</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{senders}</tbody></table></div></section>
 <section class="panel report-table"><h2>按批次</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{batches}</tbody></table></div></section>
 <section class="panel report-table"><h2>失败原因汇总</h2><p class="muted">按记录到的最终失败或需人工核对事件统计，与上方当前失败状态可能不同。返回码无法单独说明完整原因，请到批次的逐封日志核对详情。</p>
@@ -210,6 +212,7 @@ def reports_page(user, start="", end=""):
         start=first.isoformat(), end=last.isoformat(), query=query, summary=summary, headings=headings,
         days=day_rows or '<tr><td colspan="7">暂无记录</td></tr>',
         months=month_rows or '<tr><td colspan="7">暂无记录</td></tr>',
+        years=year_rows or '<tr><td colspan="7">暂无记录</td></tr>',
         senders=sender_rows or '<tr><td colspan="7">暂无记录</td></tr>',
         batches=batch_rows or '<tr><td colspan="7">暂无记录</td></tr>',
         failures=failure_rows or '<tr><td colspan="6">该日期范围内没有失败事件</td></tr>')
@@ -946,7 +949,7 @@ class Handler(BaseHTTPRequestHandler):
                     output = io.StringIO()
                     writer = csv.writer(output)
                     writer.writerow(["维度", "日期/发件人/批次", "SMTP 已接受", "观测到打开", "观测到点击", "发送失败/待核对", "检测到退信", "检测到回复"])
-                    for kind, rows in (("日期", data["days"]), ("月份", data["months"])):
+                    for kind, rows in (("日期", data["days"]), ("月份", data["months"]), ("年份", data["years"])):
                         for label, values in rows:
                             writer.writerow([kind, label] + [values[key] for key in ("submitted", "opened", "clicked", "failed", "bounced", "replied")])
                     for values in data["senders"]:

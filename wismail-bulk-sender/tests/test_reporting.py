@@ -59,6 +59,25 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(events[1]["smtp_code"], 550)
         self.assertNotIn("private-secret", events[1]["detail"])
 
+    def test_report_groups_cross_year_events_by_local_year(self):
+        own = core.create_draft(self.path, "跨年", [(1, "a@example.com", "A", "Body"),
+                                                    (2, "b@example.com", "B", "Body")], "owner@example.com")
+        other = core.create_draft(self.path, "他人", [(1, "c@example.com", "C", "Body")], "other@example.com")
+        with core.connect(self.path) as db:
+            db.execute("UPDATE messages SET status='submitted',submitted_at=? WHERE batch_id=? AND row_number=1",
+                       ("2025-12-31T15:30:00+00:00", own))
+            db.execute("UPDATE messages SET status='submitted',submitted_at=? WHERE batch_id=? AND row_number=2",
+                       ("2025-12-31T16:30:00+00:00", own))
+            db.execute("UPDATE messages SET status='submitted',submitted_at=? WHERE batch_id=?",
+                       ("2025-12-31T17:00:00+00:00", other))
+        data = core.report_data(self.path, "owner@example.com", dt.date(2025, 12, 31),
+                                dt.date(2026, 1, 1))
+        self.assertEqual(data["totals"]["submitted"], 2)
+        self.assertEqual([(year, counts["submitted"]) for year, counts in data["years"]],
+                         [("2026", 1), ("2025", 1)])
+        self.assertEqual([(day, counts["submitted"]) for day, counts in data["days"]],
+                         [("2026-01-01", 1), ("2025-12-31", 1)])
+
     def test_failure_summary_groups_codes_by_owner_and_event_date(self):
         own = core.create_draft(self.path, "自身", [(1, "buyer@example.com", "主题", "正文")], "owner@example.com")
         other = core.create_draft(self.path, "他人", [(1, "other@example.com", "主题", "正文")], "other@example.com")

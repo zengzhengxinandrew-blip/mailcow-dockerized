@@ -511,7 +511,7 @@ def report_data(path, owner_email, start_date, end_date, offset_hours=8):
                           (owner_email,) + (lower, upper) * 6).fetchall()
     def empty():
         return {key: 0 for key in fields}
-    totals, days, months, batches, senders = empty(), {}, {}, {}, {}
+    totals, days, months, years, batches, senders = empty(), {}, {}, {}, {}, {}
     for row in rows:
         for key, column in fields.items():
             value = row[column]
@@ -527,10 +527,12 @@ def report_data(path, owner_email, start_date, end_date, offset_hours=8):
             totals[key] += 1
             days.setdefault(day, empty())[key] += 1
             months.setdefault(month, empty())[key] += 1
+            years.setdefault(day[:4], empty())[key] += 1
             batch[key] += 1
             sender[key] += 1
     return {"totals": totals, "days": sorted(days.items(), reverse=True),
             "months": sorted(months.items(), reverse=True),
+            "years": sorted(years.items(), reverse=True),
             "batches": sorted(batches.values(), key=lambda item: (-item["submitted"], item["id"])),
             "senders": sorted(senders.values(), key=lambda item: (-item["submitted"], item["name"]))}
 
