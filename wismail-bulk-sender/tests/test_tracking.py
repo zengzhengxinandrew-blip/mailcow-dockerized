@@ -21,6 +21,13 @@ class TrackingTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_device_classification_does_not_keep_raw_user_agent(self):
+        self.assertEqual(core.tracking_device("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)"), "mobile")
+        self.assertEqual(core.tracking_device("Mozilla/5.0 (iPad; CPU OS 17_0)"), "tablet")
+        self.assertEqual(core.tracking_device("Mozilla/5.0 (Windows NT 10.0; Win64; x64)"), "desktop")
+        self.assertEqual(core.tracking_device("GoogleImageProxy"), "unknown")
+        self.assertEqual(core.tracking_device(""), "unknown")
+
     def test_signed_tokens_reject_tampering_and_local_targets(self):
         token = core.tracking_token(15, "c", SECRET, "https://example.com/path?q=1")
         self.assertEqual(core.verify_tracking_token(token, "c", SECRET), (15, "https://example.com/path?q=1"))

@@ -34,6 +34,7 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(data["totals"], {"submitted": 1, "opened": 1, "clicked": 1,
                                           "failed": 1, "bounced": 1, "replied": 1})
         self.assertEqual(data["days"][0][0], "2026-11-15")
+        self.assertEqual(data["devices"], [("unknown", {"opened": 1, "clicked": 1})])
         self.assertEqual({row["name"] for row in data["batches"]}, {"德国", "失败"})
         self.assertEqual({row["name"]: (row["submitted"], row["failed"], row["bounced"])
                           for row in data["senders"]},

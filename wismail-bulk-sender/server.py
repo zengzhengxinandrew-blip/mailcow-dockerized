@@ -187,6 +187,8 @@ def reports_page(user, start="", end=""):
     day_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(day), cells(row)) for day, row in data["days"])
     month_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(month), cells(row)) for month, row in data["months"])
     year_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(year), cells(row)) for year, row in data["years"])
+    device_rows = ''.join('<tr><td>{}</td><td>{}</td><td>{}</td></tr>'.format(
+        DEVICE_LABELS[name], counts["opened"], counts["clicked"]) for name, counts in data["devices"])
     batch_rows = ''.join('<tr><td><a class="text-link" href="/batches/{}">{}</a></td>{}</tr>'.format(
         row["id"], h(row["name"]), cells(row)) for row in data["batches"])
     sender_rows = ''.join('<tr><td>{}</td>{}</tr>'.format(h(row["name"]), cells(row)) for row in data["senders"])
@@ -205,6 +207,7 @@ def reports_page(user, start="", end=""):
 <section class="panel report-table"><h2>按日期</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{days}</tbody></table></div></section>
 <section class="panel report-table"><h2>按月份</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{months}</tbody></table></div></section>
 <section class="panel report-table"><h2>按年份</h2><p class="muted">只统计所选日期范围内的事件，跨年查询时每年可能不是完整年度。</p><div class="table-wrap"><table><thead>{headings}</thead><tbody>{years}</tbody></table></div></section>
+<section class="panel report-table"><h2>跟踪请求设备类型</h2><p class="muted">按首次打开或点击请求的 User-Agent 粗略识别，不保存原始 User-Agent 或请求 IP。邮箱图片代理和安全扫描可能代替收件人发出请求；“未知”也包含上线前的历史记录。这不是实际阅读设备的准确分布。</p><div class="table-wrap"><table><thead><tr><th>设备类型</th><th>观测到打开</th><th>观测到点击</th></tr></thead><tbody>{devices}</tbody></table></div></section>
 <section class="panel report-table"><h2>按发件人</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{senders}</tbody></table></div></section>
 <section class="panel report-table"><h2>按批次</h2><div class="table-wrap"><table><thead>{headings}</thead><tbody>{batches}</tbody></table></div></section>
 <section class="panel report-table"><h2>失败原因汇总</h2><p class="muted">按记录到的最终失败或需人工核对事件统计，与上方当前失败状态可能不同。返回码无法单独说明完整原因，请到批次的逐封日志核对详情。</p>
@@ -213,6 +216,7 @@ def reports_page(user, start="", end=""):
         days=day_rows or '<tr><td colspan="7">暂无记录</td></tr>',
         months=month_rows or '<tr><td colspan="7">暂无记录</td></tr>',
         years=year_rows or '<tr><td colspan="7">暂无记录</td></tr>',
+        devices=device_rows or '<tr><td colspan="3">该日期范围内没有跟踪请求</td></tr>',
         senders=sender_rows or '<tr><td colspan="7">暂无记录</td></tr>',
         batches=batch_rows or '<tr><td colspan="7">暂无记录</td></tr>',
         failures=failure_rows or '<tr><td colspan="6">该日期范围内没有失败事件</td></tr>')
@@ -221,6 +225,7 @@ def reports_page(user, start="", end=""):
 
 EVENT_LABELS = {"attempt": "提交尝试", "submitted": "SMTP 已接受", "open": "观测到打开", "click": "观测到点击", "retry": "等待重试",
                 "failed": "发送失败", "needs_review": "需人工核对", "bounce": "检测到退信", "reply": "检测到回复"}
+DEVICE_LABELS = {"mobile": "手机", "tablet": "平板", "desktop": "电脑", "unknown": "未知"}
 
 
 def event_suggestion(kind, code):
@@ -859,7 +864,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 message_id, destination = verify_tracking_token(token, kind, SETTINGS["SESSION_SECRET"])
-                if not record_tracking_event(DB_PATH, message_id, kind):
+                if not record_tracking_event(DB_PATH, message_id, kind, self.headers.get("User-Agent", "")):
                     raise ValueError("链接无效")
             except ValueError:
                 self._send(404, "链接无效")
@@ -952,6 +957,9 @@ class Handler(BaseHTTPRequestHandler):
                     for kind, rows in (("日期", data["days"]), ("月份", data["months"]), ("年份", data["years"])):
                         for label, values in rows:
                             writer.writerow([kind, label] + [values[key] for key in ("submitted", "opened", "clicked", "failed", "bounced", "replied")])
+                    for name, counts in data["devices"]:
+                        writer.writerow(["跟踪请求设备类型", DEVICE_LABELS[name], "", counts["opened"],
+                                         counts["clicked"], "", "", ""])
                     for values in data["senders"]:
                         writer.writerow(["发件人", csv_safe(values["name"])] +
                                         [values[key] for key in ("submitted", "opened", "clicked", "failed", "bounced", "replied")])

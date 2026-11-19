@@ -102,7 +102,9 @@ def init_db(path):
           last_attempt_at TEXT,
           submitted_at TEXT,
           opened_at TEXT,
+          opened_device TEXT,
           clicked_at TEXT,
+          clicked_device TEXT,
           replied_at TEXT,
           bounced_at TEXT,
           message_id TEXT UNIQUE,
@@ -315,7 +317,7 @@ def init_db(path):
             db.execute("ALTER TABLE messages ADD COLUMN sender_email TEXT NOT NULL DEFAULT ''")
         if "variant" not in message_columns:
             db.execute("ALTER TABLE messages ADD COLUMN variant TEXT NOT NULL DEFAULT ''")
-        for column in ("opened_at", "clicked_at"):
+        for column in ("opened_at", "clicked_at", "opened_device", "clicked_device"):
             if column not in message_columns:
                 db.execute("ALTER TABLE messages ADD COLUMN {} TEXT".format(column))
         db.execute("CREATE INDEX IF NOT EXISTS idx_messages_opened_at ON messages(opened_at)")
@@ -499,6 +501,7 @@ def report_data(path, owner_email, start_date, end_date, offset_hours=8):
               "failed": "last_attempt_at", "bounced": "bounced_at", "replied": "replied_at"}
     with connect(path) as db:
         rows = db.execute("""SELECT m.batch_id,b.name,m.sender_email,m.status,m.submitted_at,m.opened_at,m.clicked_at,
+                                   m.opened_device,m.clicked_device,
                                    m.last_attempt_at,m.bounced_at,m.replied_at
                             FROM messages m JOIN batches b ON b.id=m.batch_id
                             WHERE b.owner_email=? AND (
@@ -511,7 +514,7 @@ def report_data(path, owner_email, start_date, end_date, offset_hours=8):
                           (owner_email,) + (lower, upper) * 6).fetchall()
     def empty():
         return {key: 0 for key in fields}
-    totals, days, months, years, batches, senders = empty(), {}, {}, {}, {}, {}
+    totals, days, months, years, batches, senders, devices = empty(), {}, {}, {}, {}, {}, {}
     for row in rows:
         for key, column in fields.items():
             value = row[column]
@@ -530,9 +533,15 @@ def report_data(path, owner_email, start_date, end_date, offset_hours=8):
             years.setdefault(day[:4], empty())[key] += 1
             batch[key] += 1
             sender[key] += 1
+            if key in ("opened", "clicked"):
+                device = row["opened_device" if key == "opened" else "clicked_device"]
+                if device not in ("mobile", "tablet", "desktop"):
+                    device = "unknown"
+                devices.setdefault(device, {"opened": 0, "clicked": 0})[key] += 1
     return {"totals": totals, "days": sorted(days.items(), reverse=True),
             "months": sorted(months.items(), reverse=True),
             "years": sorted(years.items(), reverse=True),
+            "devices": [(name, devices[name]) for name in ("mobile", "tablet", "desktop", "unknown") if name in devices],
             "batches": sorted(batches.values(), key=lambda item: (-item["submitted"], item["id"])),
             "senders": sorted(senders.values(), key=lambda item: (-item["submitted"], item["name"]))}
 
@@ -1841,10 +1850,25 @@ def tracked_html(body_html, message_id, settings, track_open, track_click):
     return body_html
 
 
-def record_tracking_event(path, message_id, kind):
+def tracking_device(user_agent):
+    """Classify a tracking request without retaining its raw User-Agent."""
+    value = (user_agent or "")[:512].lower()
+    if any(marker in value for marker in ("googleimageproxy", "appleimageproxy")):
+        return "unknown"
+    if "ipad" in value or "tablet" in value or ("android" in value and "mobile" not in value):
+        return "tablet"
+    if any(marker in value for marker in ("iphone", "ipod", "mobile", "windows phone")):
+        return "mobile"
+    if any(marker in value for marker in ("windows nt", "macintosh", "x11", "linux")):
+        return "desktop"
+    return "unknown"
+
+
+def record_tracking_event(path, message_id, kind, user_agent=""):
     if kind not in ("o", "c"):
         return False
-    field, flag = ("opened_at", "track_open") if kind == "o" else ("clicked_at", "track_click")
+    field, device_field, flag = (("opened_at", "opened_device", "track_open") if kind == "o"
+                                 else ("clicked_at", "clicked_device", "track_click"))
     with connect(path) as db:
         row = db.execute("""SELECT m.status,m.opened_at,m.clicked_at,m.recipient_email,
                             b.owner_email,b.track_open,b.track_click FROM messages m
@@ -1854,8 +1878,8 @@ def record_tracking_event(path, message_id, kind):
         if row[field]:
             return True
         now = iso(utcnow())
-        changed = db.execute("UPDATE messages SET {}=? WHERE id=? AND {} IS NULL".format(field, field),
-                             (now, message_id)).rowcount
+        changed = db.execute("UPDATE messages SET {}=?,{}=? WHERE id=? AND {} IS NULL".format(field, device_field, field),
+                             (now, tracking_device(user_agent), message_id)).rowcount
         if changed:
             event_kind = "open" if kind == "o" else "click"
             db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,?,?,?)",

@@ -369,8 +369,8 @@ class HttpFlowTests(unittest.TestCase):
     def test_report_and_event_exports_use_existing_results(self):
         batch = core.create_draft(server.DB_PATH, "=报价", [(1, "buyer@example.com", "报价", "正文")])
         with core.connect(server.DB_PATH) as db:
-            db.execute("UPDATE messages SET status='submitted',sender_email='sales@example.com',submitted_at=? WHERE batch_id=?",
-                       ("2026-11-15T01:00:00+00:00", batch))
+            db.execute("UPDATE messages SET status='submitted',sender_email='sales@example.com',submitted_at=?,opened_at=?,opened_device='mobile' WHERE batch_id=?",
+                       ("2026-11-15T01:00:00+00:00", "2026-11-15T01:30:00+00:00", batch))
             message_id = db.execute("SELECT id FROM messages WHERE batch_id=?", (batch,)).fetchone()[0]
             db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,?,?,?)",
                        (message_id, "submitted", "2026-11-15T01:00:00+00:00", "SMTP 已接受"))
@@ -381,12 +381,14 @@ class HttpFlowTests(unittest.TestCase):
         self.assertIn("SMTP 已接受".encode("utf-8"), page)
         self.assertIn("按发件人".encode("utf-8"), page)
         self.assertIn("按年份".encode("utf-8"), page)
+        self.assertIn("跟踪请求设备类型".encode("utf-8"), page)
         self.assertIn(b"sales@example.com", page)
         status, _, report_csv = self.request("GET", "/reports/export.csv?start=2026-11-15&end=2026-11-15")
         self.assertEqual(status, 200)
         self.assertIn("'=报价".encode("utf-8"), report_csv)
         self.assertIn(b"sales@example.com", report_csv)
         self.assertIn("年份,2026,1".encode("utf-8"), report_csv)
+        self.assertIn("跟踪请求设备类型,手机,,1,0".encode("utf-8"), report_csv)
         self.assertIn("失败原因汇总".encode("utf-8"), page)
         self.assertIn(b"/reports/failure-details.csv?", page)
         status, _, failures_csv = self.request("GET", "/reports/failures.csv?start=2026-11-15&end=2026-11-15")
@@ -512,19 +514,19 @@ class HttpFlowTests(unittest.TestCase):
             secret = server.SETTINGS["SESSION_SECRET"]
             open_token = core.tracking_token(message_id, "o", secret)
             click_token = core.tracking_token(message_id, "c", secret, "https://example.com/offer")
-            def public_get(path):
+            def public_get(path, user_agent=""):
                 conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-                conn.request("GET", path)
+                conn.request("GET", path, headers={"User-Agent": user_agent})
                 response = conn.getresponse()
                 result = response.status, dict(response.getheaders()), response.read()
                 conn.close()
                 return result
-            for _ in range(2):
-                status, headers, body = public_get("/track/o/" + open_token + ".gif")
+            for user_agent in ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)", "Mozilla/5.0 (Windows NT 10.0)"):
+                status, headers, body = public_get("/track/o/" + open_token + ".gif", user_agent)
                 self.assertEqual(status, 200)
                 self.assertEqual(headers["Content-Type"], "image/gif")
                 self.assertTrue(body.startswith(b"GIF"))
-            status, headers, _ = public_get("/track/c/" + click_token)
+            status, headers, _ = public_get("/track/c/" + click_token, "Mozilla/5.0 (Windows NT 10.0)")
             self.assertEqual(status, 303)
             self.assertEqual(headers["Location"], "https://example.com/offer")
             self.assertEqual(headers["Referrer-Policy"], "no-referrer")
@@ -533,6 +535,8 @@ class HttpFlowTests(unittest.TestCase):
             with core.connect(server.DB_PATH) as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM delivery_events WHERE kind='open'").fetchone()[0], 1)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM delivery_events WHERE kind='click'").fetchone()[0], 1)
+                devices = db.execute("SELECT opened_device,clicked_device FROM messages WHERE id=?", (message_id,)).fetchone()
+                self.assertEqual(tuple(devices), ("mobile", "desktop"))
         finally:
             server.SETTINGS["SESSION_SECRET"] = old_secret
 
