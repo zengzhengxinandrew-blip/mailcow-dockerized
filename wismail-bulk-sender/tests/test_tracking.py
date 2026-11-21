@@ -49,6 +49,23 @@ class TrackingTests(unittest.TestCase):
         self.assertIn('href="mailto:sales@example.com"', result)
         self.assertLess(result.index("/track/o/"), result.index("</body>"))
 
+    def test_separate_tracking_origin_requires_https_and_keeps_existing_default(self):
+        settings = {"OAUTH_BASE_URL": "https://mail.example.test", "URL_PREFIX": "/bulk",
+                    "SESSION_SECRET": SECRET}
+        self.assertEqual(core.tracking_base_url(settings), "https://mail.example.test")
+        settings["TRACKING_BASE_URL"] = "https://track.example.test"
+        result = core.tracked_html('<a href="https://example.com/offer">Offer</a>', 7, settings, True, True)
+        self.assertIn("https://track.example.test/bulk/track/c/", result)
+        self.assertIn("https://track.example.test/bulk/track/o/", result)
+        self.assertNotIn("mail.example.test/bulk/track/", result)
+        for invalid in ("http://track.example.test", "https://track.example.test/path",
+                        "https://user@track.example.test", "https://track.example.test?x=1",
+                        "https://track.example.test:8080"):
+            settings["TRACKING_BASE_URL"] = invalid
+            self.assertFalse(core.tracking_ready(settings))
+            with self.assertRaises(ValueError):
+                core.tracking_base_url(settings)
+
     def test_smtp_html_uses_signed_tracking_links_when_enabled(self):
         settings = {"OAUTH_BASE_URL": "https://mail.example.test", "URL_PREFIX": "/bulk", "SESSION_SECRET": SECRET,
                     "SMTP_HOST": "smtp.example.test", "SMTP_PORT": "465", "SMTP_USER": "sender@example.test",

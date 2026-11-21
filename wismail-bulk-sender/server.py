@@ -26,7 +26,7 @@ from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, a
                   save_automation_rule, set_automation_rule, delete_automation_rule, save_scheduled_rule,
                   set_scheduled_rule, delete_scheduled_rule, save_template, send_template_test,
                   revoke_mailbox_auth, remove_manual_suppression, remove_sender_alias, verify_sender_alias, save_contact, save_mailbox_auth, schedule_batch,
-                  set_batch_state, set_contact_deleted, set_contact_status, tracking_ready,
+                  set_batch_state, set_contact_deleted, set_contact_status, tracking_base_url, tracking_ready,
                   list_notifications, mark_notification_read, notification_preferences, record_audit_event,
                   record_tracking_event, save_notification_preferences, verify_tracking_token, utcnow, verify_mailbox_auth)
 from core import unsubscribe_token, verify_unsubscribe_token
@@ -56,6 +56,7 @@ SETTINGS = {
     "UTC_OFFSET_HOURS": os.getenv("WISMAIL_UTC_OFFSET_HOURS", "8"),
     "CREDENTIAL_KEY": os.getenv("WISMAIL_CREDENTIAL_KEY", ""),
     "OAUTH_BASE_URL": os.getenv("WISMAIL_OAUTH_BASE_URL", ""),
+    "TRACKING_BASE_URL": os.getenv("WISMAIL_TRACKING_BASE_URL", ""),
     "OAUTH_CLIENT_ID": os.getenv("WISMAIL_OAUTH_CLIENT_ID", ""),
     "OAUTH_CLIENT_SECRET": os.getenv("WISMAIL_OAUTH_CLIENT_SECRET", ""),
     "OAUTH_REDIRECT_URI": os.getenv("WISMAIL_OAUTH_REDIRECT_URI", ""),
@@ -1452,6 +1453,11 @@ def main():
         raise SystemExit("请设置至少 12 位的 WISMAIL_ADMIN_PASSWORD")
     if int(SETTINGS["DAILY_LIMIT"]) < 1 or int(SETTINGS["HOURLY_LIMIT"]) < 1 or int(SETTINGS["MIN_INTERVAL_SECONDS"]) < 1:
         raise SystemExit("发信上限和发送间隔必须为正数")
+    if SETTINGS["TRACKING_BASE_URL"]:
+        try:
+            tracking_base_url(SETTINGS)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
     init_db(DB_PATH)
     worker = Worker(DB_PATH, SETTINGS)
     worker.start()

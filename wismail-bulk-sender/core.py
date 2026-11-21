@@ -1789,8 +1789,29 @@ def cancel_batch(path, batch_id):
 
 
 def tracking_ready(settings):
-    return (settings.get("OAUTH_BASE_URL", "").startswith("https://") and
-            len(settings.get("SESSION_SECRET", "")) >= 32)
+    try:
+        tracking_base_url(settings)
+    except ValueError:
+        return False
+    return len(settings.get("SESSION_SECRET", "")) >= 32
+
+
+def tracking_base_url(settings):
+    """Use a separate HTTPS tracking origin when one has been configured."""
+    custom = settings.get("TRACKING_BASE_URL", "").strip()
+    base = custom or settings.get("OAUTH_BASE_URL", "").rstrip("/")
+    try:
+        parsed = urlparse(base)
+        valid = (parsed.scheme == "https" and parsed.hostname and not parsed.username and
+                 not parsed.password and parsed.port in (None, 443) and parsed.path in ("", "/") and
+                 not parsed.query and not parsed.fragment and
+                 re.fullmatch(r"[A-Za-z0-9.-]+", parsed.hostname) and
+                 not any(char.isspace() for char in base))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("跟踪域名必须是有效的 HTTPS 域名地址")
+    return base.rstrip("/")
 
 
 def _safe_click_target(target):
@@ -1842,7 +1863,7 @@ def verify_tracking_token(token, kind, secret):
 
 
 def _tracking_url(settings, kind, message_id, target=""):
-    base = settings["OAUTH_BASE_URL"].rstrip("/") + settings.get("URL_PREFIX", "").rstrip("/")
+    base = tracking_base_url(settings) + settings.get("URL_PREFIX", "").rstrip("/")
     token = tracking_token(message_id, kind, settings["SESSION_SECRET"], target)
     return base + "/track/" + kind + "/" + token + (".gif" if kind == "o" else "")
 
