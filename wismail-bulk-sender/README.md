@@ -2,6 +2,8 @@
 
 这是一个独立运行的 Wismail 网页模块，可与现有 mailcow 部署并存。V2 可通过 mailcow OAuth2 使用原网页邮箱账号登录；每位用户在模块中单独授权自己的发件邮箱。上传“一行一封完整邮件”的 Excel 或 UTF-8 CSV，检查后设置发送时间与间隔，由后台通过 SMTP 逐封发送。发送流程没有任何 AI API 调用，运行时不消耗 AI token。
 
+登录后的“域名状态”页只读查询当前邮箱域名的 MX、SPF、DKIM、DMARC 记录及跟踪域名的 A 记录和 HTTPS 证书。DKIM selector 默认 `dkim`，可由 `WISMAIL_DKIM_SELECTOR` 调整。该页只说明是否检测到记录，不证明记录与实际发信路径匹配，也不证明最终投递。SMTP 登录 IP 白名单需在 mailcow/服务商端另行核对。
+
 ## 已实现
 
 - 下载 `.xlsx` 上传模板；导入 `.xlsx`、UTF-8 `.csv`。

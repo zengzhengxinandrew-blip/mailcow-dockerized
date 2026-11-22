@@ -32,6 +32,7 @@ from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, a
 from core import unsubscribe_token, verify_unsubscribe_token
 import oauth_login
 from template_xlsx import build_template
+from domain_health import domain_health
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -57,6 +58,7 @@ SETTINGS = {
     "CREDENTIAL_KEY": os.getenv("WISMAIL_CREDENTIAL_KEY", ""),
     "OAUTH_BASE_URL": os.getenv("WISMAIL_OAUTH_BASE_URL", ""),
     "TRACKING_BASE_URL": os.getenv("WISMAIL_TRACKING_BASE_URL", ""),
+    "DKIM_SELECTOR": os.getenv("WISMAIL_DKIM_SELECTOR", "dkim"),
     "OAUTH_CLIENT_ID": os.getenv("WISMAIL_OAUTH_CLIENT_ID", ""),
     "OAUTH_CLIENT_SECRET": os.getenv("WISMAIL_OAUTH_CLIENT_SECRET", ""),
     "OAUTH_REDIRECT_URI": os.getenv("WISMAIL_OAUTH_REDIRECT_URI", ""),
@@ -96,6 +98,7 @@ def page(title, content, user=""):
                     '<a class="top-account" href="/logout">退出</a>'.format(h(user)) if oauth_login.configured(SETTINGS) and user
                     else '<span class="top-meta">外贸邮件工作台 / V2</span>')
     account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/campaigns">创建任务</a><a class="top-account" href="/automations">自动化</a><a class="top-account" href="/reports">统计报表</a><a class="top-account" href="/notifications">提醒</a><a class="top-account" href="/audit">操作日志</a>' + account_link
+    account_link = '<a class="top-account" href="/domains">域名状态</a>' + account_link
     markup = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Wismail</title>
 <link rel="stylesheet" href="/static.css"></head><body>
@@ -713,6 +716,20 @@ def account_page(user, error="", success=False):
     return page("发件授权", content, user)
 
 
+def domains_page(user):
+    domain, records = domain_health(user, SETTINGS)
+    rows = ''.join('<tr><th>{}</th><td>{}</td><td>{}</td></tr>'.format(h(label), h(state), h(detail))
+                   for label, state, detail in records)
+    tracking = SETTINGS["TRACKING_BASE_URL"] or SETTINGS["OAUTH_BASE_URL"] or "未配置"
+    content = '''<nav class="back"><a href="/account">← 返回发件授权</a></nav>
+<section class="panel"><h1>域名状态</h1><p>发件域名：{domain}。跟踪链接源：{tracking}。</p>
+<p class="muted">以下是当前公开 DNS 和 HTTPS 的只读检查。检测到记录不代表 SPF/DKIM/DMARC 与实际发信路径匹配，也不代表邮件已送达。</p>
+<div class="table-wrap"><table><thead><tr><th>项目</th><th>状态</th><th>观测值</th></tr></thead><tbody>{rows}</tbody></table></div></section>
+<section class="panel"><h2>SMTP 登录 IP</h2><p>Wismail 无法从 DNS 判断 mailcow 的登录 IP 白名单是否已启用；请在 mailcow 管理端核对发件账号的登录策略和服务器出口 IP。此处不显示“已通过”。</p></section>'''.format(
+        domain=h(domain), tracking=h(tracking), rows=rows)
+    return page("域名状态", content, user)
+
+
 AUDIT_LABELS = {
     "/account": "保存发件授权", "/account/revoke": "撤销发件授权",
     "/account/aliases/add": "添加代发地址", "/account/aliases/remove": "移除代发地址",
@@ -1070,6 +1087,8 @@ class Handler(BaseHTTPRequestHandler):
                        {"Content-Disposition": 'attachment; filename="wismail-contacts.csv"'})
         elif path == "/account" and oauth_login.configured(SETTINGS):
             self._send(200, account_page(self.current_user))
+        elif path == "/domains":
+            self._send(200, domains_page(self.current_user))
         elif path == "/audit":
             self._send(200, audit_page(self.current_user))
         elif path == "/notifications":
