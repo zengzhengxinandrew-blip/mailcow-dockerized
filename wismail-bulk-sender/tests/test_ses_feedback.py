@@ -44,14 +44,14 @@ class SesFeedbackTests(unittest.TestCase):
                  "delivery": {"recipients": ["buyer@example.com"]}}
         envelope, certificate = signed_envelope(event)
         fetch = lambda url: certificate
-        verified = verify_sns(json.dumps(envelope).encode(), TOPIC, "Notification", fetch)
+        verified = verify_sns(json.dumps(envelope).encode(), TOPIC, fetch)
         self.assertEqual(ses_feedback(verified)["message_id"], MESSAGE_ID)
         envelope["Message"] = "{}"
         with self.assertRaises(ValueError):
-            verify_sns(json.dumps(envelope).encode(), TOPIC, "Notification", fetch)
+            verify_sns(json.dumps(envelope).encode(), TOPIC, fetch)
         envelope["SigningCertURL"] = "https://sns.ap-southeast-2.amazonaws.com.evil.test/a.pem"
         with self.assertRaises(ValueError):
-            verify_sns(json.dumps(envelope).encode(), TOPIC, "Notification", fetch)
+            verify_sns(json.dumps(envelope).encode(), TOPIC, fetch)
 
     def test_feedback_matches_message_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -78,11 +78,11 @@ class SesFeedbackTests(unittest.TestCase):
         event = {"notificationType": "Delivery", "mail": {"headers": []},
                  "delivery": {"recipients": ["buyer@example.com"]}}
         envelope, certificate = signed_envelope(event)
-        verified = verify_sns(json.dumps(envelope).encode(), TOPIC, "Notification", lambda url: certificate)
+        verified = verify_sns(json.dumps(envelope).encode(), TOPIC, lambda url: certificate)
         self.assertIsNone(ses_feedback(verified))
         event["mail"]["headers"] = [{"name": "Message-ID", "value": "<other-format>"}]
         envelope, certificate = signed_envelope(event)
-        verified = verify_sns(json.dumps(envelope).encode(), TOPIC, "Notification", lambda url: certificate)
+        verified = verify_sns(json.dumps(envelope).encode(), TOPIC, lambda url: certificate)
         self.assertIsNone(ses_feedback(verified))
 
 

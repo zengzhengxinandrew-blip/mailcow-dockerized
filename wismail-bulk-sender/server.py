@@ -1167,8 +1167,7 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
                 if length < 1 or length > 262144:
                     raise ValueError("SNS 消息大小无效")
-                envelope = verify_sns(self.rfile.read(length), SETTINGS["SES_SNS_TOPIC_ARN"],
-                                      self.headers.get("x-amz-sns-message-type", ""))
+                envelope = verify_sns(self.rfile.read(length), SETTINGS["SES_SNS_TOPIC_ARN"])
                 if envelope["Type"] == "SubscriptionConfirmation":
                     confirm_sns_subscription(envelope)
                 else:

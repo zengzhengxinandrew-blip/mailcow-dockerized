@@ -37,7 +37,7 @@ def _sns_url(url, certificate=False):
     return url
 
 
-def verify_sns(body, topic_arn, header_type="", fetch=_fetch):
+def verify_sns(body, topic_arn, fetch=_fetch):
     if not topic_arn or not re.fullmatch(r"arn:aws:sns:ap-southeast-2:\d{12}:[A-Za-z0-9_-]+", topic_arn):
         raise ValueError("未配置 Sydney 区域 SNS Topic ARN")
     if len(body) > 262144:
@@ -49,7 +49,9 @@ def verify_sns(body, topic_arn, header_type="", fetch=_fetch):
     if not isinstance(envelope, dict):
         raise ValueError("SNS 消息结构无效")
     kind = envelope.get("Type")
-    if kind not in ("Notification", "SubscriptionConfirmation") or (header_type and header_type != kind):
+    # Type is covered by the SNS signature. An intermediary can alter or
+    # combine HTTP headers, so do not use the unsigned header to reject it.
+    if kind not in ("Notification", "SubscriptionConfirmation"):
         raise ValueError("SNS 消息类型无效")
     if envelope.get("TopicArn") != topic_arn:
         raise ValueError("SNS Topic ARN 不匹配")
