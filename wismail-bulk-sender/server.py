@@ -12,6 +12,7 @@ import html
 import http.cookies
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -1171,10 +1172,18 @@ class Handler(BaseHTTPRequestHandler):
                 if envelope["Type"] == "SubscriptionConfirmation":
                     confirm_sns_subscription(envelope)
                 else:
-                    event = ses_feedback(envelope)
+                    try:
+                        event = ses_feedback(envelope)
+                    except ValueError as exc:
+                        # The topic may carry an unrelated or malformed SES
+                        # message. Once SNS is verified, acknowledge it so
+                        # SNS does not retry a payload we cannot use.
+                        logging.warning("Verified SNS notification ignored: %s", exc)
+                        event = None
                     if event:
                         record_ses_feedback(DB_PATH, event)
-            except ValueError:
+            except ValueError as exc:
+                logging.warning("SES SNS notification rejected: %s", exc)
                 self._send(400, "SNS 消息无效")
                 return
             except OSError:

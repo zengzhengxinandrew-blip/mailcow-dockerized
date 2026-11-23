@@ -101,8 +101,11 @@ def ses_feedback(envelope):
         raise ValueError("SES 邮件头结构无效")
     original_ids = [str(header.get("value", "")).strip() for header in mail.get("headers", [])
                     if isinstance(header, dict) and str(header.get("name", "")).lower() == "message-id"]
+    # SES also publishes feedback for mail sent outside Wismail. Such mail can
+    # have no original Message-ID (or a different format), so acknowledge it
+    # without changing a Wismail message or making SNS retry it.
     if len(original_ids) != 1 or not re.fullmatch(r"<[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+>", original_ids[0]):
-        raise ValueError("SES 事件缺少唯一的原始 Message-ID")
+        return None
     key = {"Delivery": "delivery", "Bounce": "bounce", "Complaint": "complaint"}[kind]
     values = event.get(key) or {}
     if not isinstance(values, dict):

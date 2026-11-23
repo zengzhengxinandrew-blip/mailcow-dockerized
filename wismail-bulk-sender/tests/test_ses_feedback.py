@@ -74,6 +74,17 @@ class SesFeedbackTests(unittest.TestCase):
             db.close()
             gc.collect()
 
+    def test_feedback_without_wismail_message_id_is_ignored(self):
+        event = {"notificationType": "Delivery", "mail": {"headers": []},
+                 "delivery": {"recipients": ["buyer@example.com"]}}
+        envelope, certificate = signed_envelope(event)
+        verified = verify_sns(json.dumps(envelope).encode(), TOPIC, "Notification", lambda url: certificate)
+        self.assertIsNone(ses_feedback(verified))
+        event["mail"]["headers"] = [{"name": "Message-ID", "value": "<other-format>"}]
+        envelope, certificate = signed_envelope(event)
+        verified = verify_sns(json.dumps(envelope).encode(), TOPIC, "Notification", lambda url: certificate)
+        self.assertIsNone(ses_feedback(verified))
+
 
 if __name__ == "__main__":
     unittest.main()
