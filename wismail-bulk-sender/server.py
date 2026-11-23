@@ -28,11 +28,12 @@ from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, a
                   revoke_mailbox_auth, remove_manual_suppression, remove_sender_alias, verify_sender_alias, save_contact, save_mailbox_auth, schedule_batch,
                   set_batch_state, set_contact_deleted, set_contact_status, tracking_base_url, tracking_ready,
                   list_notifications, mark_notification_read, notification_preferences, record_audit_event,
-                  record_tracking_event, save_notification_preferences, verify_tracking_token, utcnow, verify_mailbox_auth)
+                  record_tracking_event, record_ses_feedback, save_notification_preferences, verify_tracking_token, utcnow, verify_mailbox_auth)
 from core import unsubscribe_token, verify_unsubscribe_token
 import oauth_login
 from template_xlsx import build_template
 from domain_health import domain_health
+from ses_feedback import confirm_sns_subscription, ses_feedback, verify_sns
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +60,7 @@ SETTINGS = {
     "OAUTH_BASE_URL": os.getenv("WISMAIL_OAUTH_BASE_URL", ""),
     "TRACKING_BASE_URL": os.getenv("WISMAIL_TRACKING_BASE_URL", ""),
     "DKIM_SELECTOR": os.getenv("WISMAIL_DKIM_SELECTOR", "dkim"),
+    "SES_SNS_TOPIC_ARN": os.getenv("WISMAIL_SES_SNS_TOPIC_ARN", ""),
     "OAUTH_CLIENT_ID": os.getenv("WISMAIL_OAUTH_CLIENT_ID", ""),
     "OAUTH_CLIENT_SECRET": os.getenv("WISMAIL_OAUTH_CLIENT_SECRET", ""),
     "OAUTH_REDIRECT_URI": os.getenv("WISMAIL_OAUTH_REDIRECT_URI", ""),
@@ -229,7 +231,8 @@ def reports_page(user, start="", end=""):
 
 
 EVENT_LABELS = {"attempt": "提交尝试", "submitted": "SMTP 已接受", "open": "观测到打开", "click": "观测到点击", "retry": "等待重试",
-                "failed": "发送失败", "needs_review": "需人工核对", "bounce": "检测到退信", "reply": "检测到回复"}
+                "failed": "发送失败", "needs_review": "需人工核对", "bounce": "检测到退信", "reply": "检测到回复",
+                "ses_delivery": "SES 已投递至收件方服务器", "complaint": "SES 投诉"}
 DEVICE_LABELS = {"mobile": "手机", "tablet": "平板", "desktop": "电脑", "unknown": "未知"}
 
 
@@ -1155,6 +1158,30 @@ class Handler(BaseHTTPRequestHandler):
                                 keep_blank_values=True)
 
     def do_POST(self):
+        if self._route_path() == "/ses/sns":
+            if not SETTINGS["SES_SNS_TOPIC_ARN"]:
+                self._send(404, "SES 回调未启用")
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length < 1 or length > 262144:
+                    raise ValueError("SNS 消息大小无效")
+                envelope = verify_sns(self.rfile.read(length), SETTINGS["SES_SNS_TOPIC_ARN"],
+                                      self.headers.get("x-amz-sns-message-type", ""))
+                if envelope["Type"] == "SubscriptionConfirmation":
+                    confirm_sns_subscription(envelope)
+                else:
+                    event = ses_feedback(envelope)
+                    if event:
+                        record_ses_feedback(DB_PATH, event)
+            except ValueError:
+                self._send(400, "SNS 消息无效")
+                return
+            except OSError:
+                self._send(503, "SNS 验证暂时失败")
+                return
+            self._send(200, "ok")
+            return
         if self._route_path() == "/unsubscribe":
             try:
                 owner, recipient = verify_unsubscribe_token(self._form().getfirst("token", ""), SETTINGS["SESSION_SECRET"])

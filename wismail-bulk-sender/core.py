@@ -283,6 +283,13 @@ def init_db(path):
           detail TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_delivery_events_message ON delivery_events(message_id,id);
+        CREATE TABLE IF NOT EXISTS ses_sns_events (
+          sns_message_id TEXT PRIMARY KEY,
+          event_kind TEXT NOT NULL,
+          original_message_id TEXT NOT NULL,
+          matched_count INTEGER NOT NULL,
+          received_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS notification_preferences (
           owner_email TEXT PRIMARY KEY,
           failures_enabled INTEGER NOT NULL DEFAULT 1,
@@ -1412,6 +1419,48 @@ def import_provider_feedback(path, owner_email, source_name, filename, data):
                           (import_id,row_number,recipient_email,status,previous_status) VALUES (?,?,?,?,?)""",
                        (import_id, number, address, status, previous))
     return len(items), changed, stopped
+
+
+def record_ses_feedback(path, event):
+    """Apply a verified SES event only to matching Wismail messages."""
+    kind = event["kind"]
+    if kind not in ("delivery", "bounce", "complaint"):
+        raise ValueError("SES 事件类型无效")
+    recipients = event["recipients"]
+    now = iso(utcnow())
+    with connect(path) as db:
+        if db.execute("SELECT 1 FROM ses_sns_events WHERE sns_message_id=?", (event["sns_message_id"],)).fetchone():
+            return 0
+        matched = 0
+        for recipient in recipients:
+            rows = db.execute("""SELECT m.id,b.owner_email,m.status FROM messages m
+                                 JOIN batches b ON b.id=m.batch_id
+                                 WHERE m.message_id=? AND lower(m.recipient_email)=?""",
+                              (event["message_id"], recipient)).fetchall()
+            for row in rows:
+                matched += 1
+                detail = {"delivery": "SES 已投递至收件方服务器", "bounce": "SES 报告最终退信",
+                          "complaint": "SES 报告投诉"}[kind]
+                db.execute("INSERT INTO delivery_events(message_id,kind,observed_at,detail) VALUES (?,?,?,?)",
+                           (row["id"], "ses_delivery" if kind == "delivery" else kind, now, detail))
+                if kind == "bounce":
+                    db.execute("UPDATE messages SET bounced_at=COALESCE(bounced_at,?) WHERE id=?",
+                               (now, row["id"]))
+                if kind == "complaint" or (kind == "bounce" and event.get("permanent")):
+                    status = "complained" if kind == "complaint" else "invalid"
+                    reason = "SES 投诉" if kind == "complaint" else "SES 永久退信"
+                    db.execute("""INSERT OR IGNORE INTO suppressions(owner_email,recipient_email,reason,created_at)
+                                  VALUES (?,?,?,?)""", (row["owner_email"], recipient, reason, now))
+                    db.execute("""UPDATE messages SET status='suppressed',last_error=? WHERE status='queued'
+                                  AND lower(recipient_email)=? AND batch_id IN
+                                  (SELECT id FROM batches WHERE owner_email=?)""",
+                               (reason, recipient, row["owner_email"]))
+                    db.execute("""UPDATE contacts SET status=?,status_reason=?,updated_at=?
+                                  WHERE owner_email=? AND email=? AND status NOT IN ('unsubscribed','complained')""",
+                               (status, reason, now, row["owner_email"], recipient))
+        db.execute("""INSERT INTO ses_sns_events(sns_message_id,event_kind,original_message_id,matched_count,received_at)
+                      VALUES (?,?,?,?,?)""", (event["sns_message_id"], kind, event["message_id"], matched, now))
+    return matched
 
 
 def _category_name(value):

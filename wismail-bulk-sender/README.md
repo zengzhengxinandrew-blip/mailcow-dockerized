@@ -4,6 +4,8 @@
 
 登录后的“域名状态”页只读查询当前邮箱域名的 MX、SPF、DKIM、DMARC 记录及跟踪域名的 A 记录和 HTTPS 证书。DKIM selector 默认 `dkim`，可由 `WISMAIL_DKIM_SELECTOR` 调整。该页只说明是否检测到记录，不证明记录与实际发信路径匹配，也不证明最终投递。SMTP 登录 IP 白名单需在 mailcow/服务商端另行核对。
 
+SES Sydney 反馈接收端默认为关闭。只有设置精确的 `WISMAIL_SES_SNS_TOPIC_ARN` 后，`/bulk/ses/sns` 才接收该 Topic 的 SNS 签名消息，并验证来自 AWS SNS 的签名证书 URL。请在 SES（ap-southeast-2）的已验证身份上把投递、退信和投诉通知发送到同区域 SNS Topic，勾选“包含原始邮件头”，再把 HTTPS 订阅端点设为 `https://mail.wiskind.top/bulk/ses/sns`。订阅确认经签名验证后自动完成。仅凭 SES 新分配的 `mail.messageId` 无法匹配 Wismail；缺少原始 `Message-ID` 的事件会被拒绝。匹配成功的事件写入逐封日志；永久退信和投诉会将对应账号的地址加入禁发名单。此功能不改变当前 mailcow → SES 发信路由，也不把 SMTP 接受误报为最终送达。启用前需先备份 SQLite 并用专用测试邮箱验收。
+
 ## 已实现
 
 - 下载 `.xlsx` 上传模板；导入 `.xlsx`、UTF-8 `.csv`。
