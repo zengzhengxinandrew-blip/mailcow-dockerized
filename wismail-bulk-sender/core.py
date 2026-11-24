@@ -2023,11 +2023,13 @@ def _smtp_submit(row, settings):
     message_id = "<{}@{}>".format(uuid.uuid4().hex, sender.rsplit("@", 1)[1])
     msg["Message-ID"] = message_id
     link = unsubscribe_url(settings, row["owner_email"], row["recipient_email"]) if "owner_email" in row.keys() else ""
-    msg.set_content(row["body"] + ("\n\n不再接收此类邮件：" + link if link else ""))
-    if "body_html" in row.keys() and row["body_html"]:
+    msg.set_content(row["body"])
+    body_html = row["body_html"] if "body_html" in row.keys() else ""
+    if body_html or link:
         footer = ('<p>不再接收此类邮件：<a href="{0}">退订</a></p>'.format(html.escape(link, quote=True)) if link else '')
-        content = row["body_html"]
-        if "id" in row.keys() and tracking_ready(settings) and (row["track_open"] or row["track_click"]):
+        content = body_html or '<div>{}</div>'.format(
+            html.escape(row["body"]).replace("\r\n", "\n").replace("\n", "<br>\n"))
+        if body_html and "id" in row.keys() and tracking_ready(settings) and (row["track_open"] or row["track_click"]):
             content = tracked_html(content, row["id"], settings, row["track_open"], row["track_click"])
         msg.add_alternative(content + footer, subtype="html")
     if link:

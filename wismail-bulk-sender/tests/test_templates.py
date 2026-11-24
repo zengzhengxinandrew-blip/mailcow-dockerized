@@ -270,9 +270,30 @@ class TemplateTests(unittest.TestCase):
         parts = list(message.iter_parts())
         self.assertEqual([part.get_content_type() for part in parts], ["text/plain", "text/html"])
         self.assertIn("Plain", parts[0].get_content())
+        self.assertNotIn("/unsubscribe?token=", parts[0].get_content())
         self.assertIn("<p>Rich</p>", parts[1].get_content())
-        self.assertIn("退订", parts[1].get_content())
+        self.assertIn(">退订</a>", parts[1].get_content())
         self.assertIn("List-Unsubscribe", message)
+
+    def test_plain_mail_shows_unsubscribe_button_without_long_url(self):
+        row = {"owner_email": "sender@example.test", "recipient_email": "buyer@example.test",
+               "subject": "Hello", "body": "First line\n<second line>"}
+        settings = {"SMTP_HOST": "smtp.example.test", "SMTP_PORT": "465", "SMTP_USER": "sender@example.test",
+                    "SMTP_PASSWORD": "secret", "SMTP_FROM": "sender@example.test",
+                    "OAUTH_BASE_URL": "https://mail.example.test", "URL_PREFIX": "/bulk",
+                    "SESSION_SECRET": "test-secret"}
+        with mock.patch.object(core.smtplib, "SMTP_SSL") as smtp_class:
+            smtp_class.return_value.send_message.return_value = {}
+            core._smtp_submit(row, settings)
+        message = smtp_class.return_value.send_message.call_args[0][0]
+        plain, rich = list(message.iter_parts())
+        self.assertEqual(plain.get_content_type(), "text/plain")
+        self.assertEqual(plain.get_content(), "First line\n<second line>\n")
+        self.assertEqual(rich.get_content_type(), "text/html")
+        self.assertIn("First line<br>", rich.get_content())
+        self.assertIn("&lt;second line&gt;", rich.get_content())
+        self.assertIn('>退订</a>', rich.get_content())
+        self.assertIn('/unsubscribe?token=', message["List-Unsubscribe"])
 
     def test_hourly_limit_blocks_due_message(self):
         owner = "__legacy_admin__"
