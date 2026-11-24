@@ -52,7 +52,9 @@ def verify_sns(body, topic_arn, fetch=_fetch):
     # Type is covered by the SNS signature. An intermediary can alter or
     # combine HTTP headers, so do not use the unsigned header to reject it.
     if kind not in ("Notification", "SubscriptionConfirmation"):
-        raise ValueError("SNS 消息类型无效")
+        kind_label = kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z]{1,32}", kind) else type(kind).__name__
+        keys = sorted(key for key in envelope if re.fullmatch(r"[A-Za-z]{1,32}", key))[:16]
+        raise ValueError("SNS 消息类型无效 (type={}, keys={})".format(kind_label, ",".join(keys)))
     if envelope.get("TopicArn") != topic_arn:
         raise ValueError("SNS Topic ARN 不匹配")
     version = envelope.get("SignatureVersion")

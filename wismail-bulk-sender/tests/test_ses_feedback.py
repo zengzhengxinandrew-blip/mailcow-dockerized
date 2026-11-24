@@ -85,6 +85,13 @@ class SesFeedbackTests(unittest.TestCase):
         verified = verify_sns(json.dumps(envelope).encode(), TOPIC, lambda url: certificate)
         self.assertIsNone(ses_feedback(verified))
 
+    def test_raw_notification_logs_structure_without_mail_content(self):
+        raw = {"notificationType": "Delivery", "mail": {"source": "private@example.com"},
+               "delivery": {"recipients": ["buyer@example.com"]}}
+        with self.assertRaisesRegex(ValueError, "type=NoneType, keys=delivery,mail,notificationType") as caught:
+            verify_sns(json.dumps(raw).encode(), TOPIC)
+        self.assertNotIn("private@example.com", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
