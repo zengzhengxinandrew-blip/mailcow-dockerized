@@ -274,6 +274,7 @@ class TemplateTests(unittest.TestCase):
         self.assertIn("<p>Rich</p>", parts[1].get_content())
         self.assertIn(">Unsubscribe</a>", parts[1].get_content())
         self.assertIn("List-Unsubscribe", message)
+        self.assertEqual(message["List-Unsubscribe-Post"], "List-Unsubscribe=One-Click")
 
     def test_plain_mail_shows_unsubscribe_button_without_long_url(self):
         row = {"owner_email": "sender@example.test", "recipient_email": "buyer@example.test",
@@ -294,6 +295,7 @@ class TemplateTests(unittest.TestCase):
         self.assertIn("&lt;second line&gt;", rich.get_content())
         self.assertIn('>Unsubscribe</a>', rich.get_content())
         self.assertIn('/unsubscribe?token=', message["List-Unsubscribe"])
+        self.assertEqual(message["List-Unsubscribe-Post"], "List-Unsubscribe=One-Click")
 
     def test_hourly_limit_blocks_due_message(self):
         owner = "__legacy_admin__"

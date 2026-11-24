@@ -2035,6 +2035,8 @@ def _smtp_submit(row, settings):
         msg.add_alternative(content + footer, subtype="html")
     if link:
         msg["List-Unsubscribe"] = "<{}>".format(link)
+        if link.startswith("https://"):
+            msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
     port = int(settings["SMTP_PORT"])
     timeout = 30
     if port == 465:

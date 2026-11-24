@@ -1192,7 +1192,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self._route_path() == "/unsubscribe":
             try:
-                owner, recipient = verify_unsubscribe_token(self._form().getfirst("token", ""), SETTINGS["SESSION_SECRET"])
+                length = int(self.headers.get("Content-Length", "0"))
+                if length < 1 or length > 4096:
+                    raise ValueError("Invalid unsubscribe request size")
+                one_click_token = parse_qs(urlparse(self.path).query).get("token", [""])[0]
+                if one_click_token and self.headers.get("Content-Type", "").split(";", 1)[0].lower() not in (
+                        "application/x-www-form-urlencoded", "multipart/form-data"):
+                    raise ValueError("Invalid one-click content type")
+                form = self._form()
+                if one_click_token and form.getfirst("List-Unsubscribe", "") != "One-Click":
+                    raise ValueError("Invalid one-click marker")
+                token = one_click_token or form.getfirst("token", "")
+                owner, recipient = verify_unsubscribe_token(token, SETTINGS["SESSION_SECRET"])
                 add_suppression(DB_PATH, recipient, "收件人退订", owner)
                 with connect(DB_PATH) as db:
                     row = db.execute("SELECT id FROM contacts WHERE owner_email=? AND email=?", (owner, recipient)).fetchone()
@@ -1201,7 +1212,10 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, KeyError):
                 self._send(400, "Invalid unsubscribe link")
                 return
-            self._send(200, page("Unsubscribed", '<section class="panel"><h1>Unsubscribed</h1><p>This address will no longer receive bulk emails from this sender.</p></section>'))
+            if one_click_token:
+                self._send(200, "ok", "text/plain; charset=utf-8")
+            else:
+                self._send(200, page("Unsubscribed", '<section class="panel"><h1>Unsubscribed</h1><p>This address will no longer receive bulk emails from this sender.</p></section>'))
             return
         if not self._auth_or_401():
             return

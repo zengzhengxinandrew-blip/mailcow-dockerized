@@ -68,6 +68,44 @@ class HttpFlowTests(unittest.TestCase):
         finally:
             server.SETTINGS["SESSION_SECRET"] = old_secret
 
+    def test_one_click_unsubscribe_requires_signed_url_and_post_marker(self):
+        old_secret = server.SETTINGS["SESSION_SECRET"]
+        server.SETTINGS["SESSION_SECRET"] = "a-long-test-secret"
+        try:
+            body = urlencode({"csrf": server.CSRF_TOKEN, "email": "buyer@example.com"})
+            status, _, _ = self.request("POST", "/contacts/add", body,
+                                        {"Content-Type": "application/x-www-form-urlencoded"})
+            self.assertEqual(status, 303)
+            token = core.unsubscribe_token("__legacy_admin__", "buyer@example.com", server.SETTINGS["SESSION_SECRET"])
+            url = "/unsubscribe?token=" + token
+            status, _, _ = self.request("GET", url)
+            self.assertEqual(status, 200)
+            with core.connect(server.DB_PATH) as db:
+                self.assertEqual(db.execute("SELECT status FROM contacts").fetchone()[0], "subscribed")
+            status, _, _ = self.request("POST", url, urlencode({"List-Unsubscribe": "No"}),
+                                        {"Content-Type": "application/x-www-form-urlencoded"})
+            self.assertEqual(status, 400)
+            tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
+            status, _, _ = self.request("POST", "/unsubscribe?token=" + tampered,
+                                        urlencode({"List-Unsubscribe": "One-Click"}),
+                                        {"Content-Type": "application/x-www-form-urlencoded"})
+            self.assertEqual(status, 400)
+            with core.connect(server.DB_PATH) as db:
+                self.assertEqual(db.execute("SELECT status FROM contacts").fetchone()[0], "subscribed")
+            status, _, response = self.request("POST", url, urlencode({"List-Unsubscribe": "One-Click"}),
+                                                {"Content-Type": "application/x-www-form-urlencoded"})
+            self.assertEqual((status, response), (200, b"ok"))
+            with core.connect(server.DB_PATH) as db:
+                self.assertEqual(db.execute("SELECT status FROM contacts").fetchone()[0], "unsubscribed")
+            boundary = "wismail-one-click"
+            multipart = ("--{}\r\nContent-Disposition: form-data; name=\"List-Unsubscribe\"\r\n\r\n"
+                         "One-Click\r\n--{}--\r\n").format(boundary, boundary).encode("ascii")
+            status, _, response = self.request("POST", url, multipart,
+                                                {"Content-Type": "multipart/form-data; boundary=" + boundary})
+            self.assertEqual((status, response), (200, b"ok"))
+        finally:
+            server.SETTINGS["SESSION_SECRET"] = old_secret
+
     def test_provider_feedback_upload_requires_csrf_and_records_source(self):
         def upload(token):
             boundary = "wismail-feedback-test"
