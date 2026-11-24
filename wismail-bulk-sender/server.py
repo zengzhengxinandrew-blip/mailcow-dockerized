@@ -32,6 +32,7 @@ from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, a
                   record_tracking_event, record_ses_feedback, save_notification_preferences, verify_tracking_token, utcnow, verify_mailbox_auth)
 from core import unsubscribe_token, verify_unsubscribe_token
 import oauth_login
+import local_accounts
 from template_xlsx import build_template
 from domain_health import domain_health
 from ses_feedback import confirm_sns_subscription, ses_feedback, verify_sns
@@ -58,6 +59,7 @@ SETTINGS = {
     "MIN_INTERVAL_SECONDS": os.getenv("WISMAIL_MIN_INTERVAL_SECONDS", "60"),
     "UTC_OFFSET_HOURS": os.getenv("WISMAIL_UTC_OFFSET_HOURS", "8"),
     "CREDENTIAL_KEY": os.getenv("WISMAIL_CREDENTIAL_KEY", ""),
+    "TEAM_ADMIN_EMAIL": os.getenv("WISMAIL_TEAM_ADMIN_EMAIL", "").strip().lower(),
     "OAUTH_BASE_URL": os.getenv("WISMAIL_OAUTH_BASE_URL", ""),
     "TRACKING_BASE_URL": os.getenv("WISMAIL_TRACKING_BASE_URL", ""),
     "DKIM_SELECTOR": os.getenv("WISMAIL_DKIM_SELECTOR", "dkim"),
@@ -102,6 +104,8 @@ def page(title, content, user=""):
                     else '<span class="top-meta">外贸邮件工作台 / V2</span>')
     account_link = '<a class="top-account" href="/contacts">联系人</a><a class="top-account" href="/templates">邮件模板</a><a class="top-account" href="/campaigns">创建任务</a><a class="top-account" href="/automations">自动化</a><a class="top-account" href="/reports">统计报表</a><a class="top-account" href="/notifications">提醒</a><a class="top-account" href="/audit">操作日志</a>' + account_link
     account_link = '<a class="top-account" href="/domains">域名状态</a>' + account_link
+    if user and user == SETTINGS["TEAM_ADMIN_EMAIL"]:
+        account_link = '<a class="top-account" href="/team">子账户</a>' + account_link
     markup = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Wismail</title>
 <link rel="stylesheet" href="/static.css"></head><body>
@@ -798,6 +802,52 @@ def notifications_page(user):
     return page("提醒", content, user)
 
 
+def team_login_page(nonce, error=""):
+    alert = '<div class="alert">{}</div>'.format(h(error)) if error else ''
+    content = '''<section class="panel"><h1>Wismail 子账户登录</h1><p>使用管理员创建的独立 Wismail 账号登录。首次使用请先完成邮箱验证。</p>
+{alert}<form method="post" action="/team/login"><input type="hidden" name="nonce" value="{nonce}">
+<label>邮箱地址</label><input type="email" name="email" autocomplete="username" required>
+<label>Wismail 登录密码</label><input type="password" name="password" autocomplete="current-password" required>
+<button class="button" type="submit">登录</button></form><p><a href="/team/activate">使用邀请码激活账号</a> · <a href="/login">使用 mailcow 邮箱账号登录</a></p></section>'''.format(
+        alert=alert, nonce=h(nonce))
+    return page("子账户登录", content)
+
+
+def team_activate_page(nonce, error=""):
+    alert = '<div class="alert">{}</div>'.format(h(error)) if error else ''
+    content = '''<section class="panel"><h1>激活 Wismail 子账户</h1><p>输入管理员提供的邀请码，并用你自己的邮箱应用密码验证发件权限。验证只执行 SMTP 登录，不发送邮件。</p>
+{alert}<form method="post" action="/team/activate"><input type="hidden" name="nonce" value="{nonce}">
+<label>邮箱地址</label><input type="email" name="email" autocomplete="username" required>
+<label>邀请码</label><input name="invite_code" autocomplete="off" required>
+<label>SMTP 应用密码</label><input type="password" name="smtp_password" autocomplete="new-password" required>
+<label>IMAP 应用密码（可选）</label><input type="password" name="imap_password" autocomplete="new-password">
+<label>新 Wismail 登录密码（至少 12 位）</label><input type="password" name="password" autocomplete="new-password" required>
+<label>再次输入 Wismail 登录密码</label><input type="password" name="password_repeat" autocomplete="new-password" required>
+<button class="button" type="submit">验证并激活</button></form><p><a href="/team/login">返回子账户登录</a></p></section>'''.format(
+        alert=alert, nonce=h(nonce))
+    return page("激活子账户", content)
+
+
+def team_page(admin_email, message="", invite=None):
+    rows = local_accounts.list_accounts(DB_PATH, admin_email)
+    alert = '<div class="notice">{}</div>'.format(h(message)) if message else ''
+    if invite:
+        alert += '<div class="notice">邮箱：{0}<br>一次性邀请码（24 小时有效）：<code>{1}</code><br>请通过安全方式交给该邮箱使用人；此页面关闭后不再显示。</div>'.format(
+            h(invite[0]), h(invite[1]))
+    items = ''.join('''<tr><td>{email}</td><td>{status}</td><td>{created}</td><td>
+<form method="post" action="/team/reset">{csrf}<input type="hidden" name="email" value="{email}"><button type="submit" onclick="return confirm('重置后会暂停该账号的活动任务，确定继续？')">重置邀请</button></form>
+<form method="post" action="/team/disable">{csrf}<input type="hidden" name="email" value="{email}"><button type="submit" onclick="return confirm('停用后会暂停该账号的活动任务，确定继续？')">停用</button></form></td></tr>'''.format(
+        email=h(row["mailbox_email"]), status="已激活" if row["active"] else "待激活或已停用",
+        created=h(row["created_at"][:10]), csrf=csrf(admin_email)) for row in rows)
+    content = '''<section class="panel"><h1>独立子账户</h1><p>每个账号只访问自己的联系人、模板、任务与报表，并用自己的邮箱应用密码发信。管理员只能查看账号状态，不能查看子账户内容。</p>
+{alert}<h2>创建账号</h2><form method="post" action="/team/create">{csrf}<label>子账户邮箱（与管理员同域）</label>
+<input type="email" name="email" required><button class="button" type="submit">生成邀请码</button></form>
+<p>请让新用户打开 <a href="/team/activate">子账户激活页</a> 完成邮箱验证并设置独立密码。</p>
+<h2>现有账号</h2><div class="table-wrap"><table><thead><tr><th>邮箱</th><th>状态</th><th>创建日期</th><th>操作</th></tr></thead><tbody>{items}</tbody></table></div></section>'''.format(
+        alert=alert, csrf=csrf(admin_email), items=items or '<tr><td colspan="4">暂无子账户</td></tr>')
+    return page("子账户", content, admin_email)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, _format, *_args):
         # OAuth callback URLs contain short-lived codes; never write them to access logs.
@@ -812,6 +862,26 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return False
         return hmac.compare_digest(supplied, ADMIN_USER + ":" + ADMIN_PASSWORD)
+
+    def _cookie(self, name):
+        cookies = http.cookies.SimpleCookie()
+        try:
+            cookies.load(self.headers.get("Cookie", ""))
+            return cookies[name].value if name in cookies else ""
+        except http.cookies.CookieError:
+            return ""
+
+    def _public_team_page(self, kind, error=""):
+        nonce = secrets.token_urlsafe(24)
+        cookie = "wismail_team_nonce={}; Path={}/team/; Max-Age=600; HttpOnly; SameSite=Strict{}".format(
+            nonce, URL_PREFIX, self._secure_cookie())
+        body = team_login_page(nonce, error) if kind == "login" else team_activate_page(nonce, error)
+        self._send(400 if error else 200, body, extra={"Set-Cookie": cookie})
+
+    def _valid_public_nonce(self, form):
+        supplied = form.getfirst("nonce", "")
+        saved = self._cookie("wismail_team_nonce")
+        return bool(saved and supplied and hmac.compare_digest(saved, supplied))
 
     def _send(self, code, body, content_type="text/html; charset=utf-8", extra=None):
         if isinstance(body, str):
@@ -832,19 +902,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _auth_or_401(self):
         if oauth_login.configured(SETTINGS):
-            cookies = http.cookies.SimpleCookie()
-            try:
-                cookies.load(self.headers.get("Cookie", ""))
-                token = cookies["wismail_session"].value if "wismail_session" in cookies else ""
-            except http.cookies.CookieError:
-                token = ""
+            token = self._cookie("wismail_session")
             self.current_user = oauth_login.read_session(token, SETTINGS)
             if self.current_user:
+                if SETTINGS["TEAM_ADMIN_EMAIL"] and not local_accounts.oauth_allowed(DB_PATH, self.current_user):
+                    self._send(403, "此 Wismail 账号已停用或尚未激活")
+                    return False
+                self.login_kind = "oauth"
+                return True
+            self.current_user = (local_accounts.read_session(DB_PATH, token)
+                                 if SETTINGS["TEAM_ADMIN_EMAIL"] else None)
+            if self.current_user:
+                self.login_kind = "local"
                 return True
             self._redirect("/login")
             return False
         if self._authorized():
             self.current_user = "__legacy_admin__"
+            self.login_kind = "legacy"
             return True
         self._send(401, "需要登录", extra={"WWW-Authenticate": 'Basic realm="Wismail bulk sender"'})
         return False
@@ -907,6 +982,13 @@ class Handler(BaseHTTPRequestHandler):
             content = '<section class="panel"><h1>Unsubscribe</h1><p>Confirm to stop receiving bulk emails from this sender.</p><form method="post" action="/unsubscribe"><input type="hidden" name="token" value="{}"><button class="button" type="submit">Confirm unsubscribe</button></form></section>'.format(h(token))
             self._send(200, page("Confirm unsubscribe", content))
             return
+        if path == "/static.css":
+            with open(os.path.join(ROOT, "static.css"), "rb") as stream:
+                self._send(200, stream.read(), "text/css; charset=utf-8")
+            return
+        if SETTINGS["TEAM_ADMIN_EMAIL"] and path in ("/team/login", "/team/activate"):
+            self._public_team_page("login" if path == "/team/login" else "activate")
+            return
         if oauth_login.configured(SETTINGS) and path == "/login":
             state, cookie = oauth_login.new_state(SETTINGS)
             header = "wismail_oauth_state={}; Path={}/oauth/callback; Max-Age=600; HttpOnly; SameSite=Lax{}".format(
@@ -931,18 +1013,32 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._send(400, page("登录失败", '<div class="alert">邮箱授权失败，请检查 mailcow OAuth2 配置后重试。</div>'))
                 return
+            if SETTINGS["TEAM_ADMIN_EMAIL"] and not local_accounts.oauth_allowed(DB_PATH, user):
+                self._send(403, "此 Wismail 账号已停用或尚未激活")
+                return
             session = oauth_login.new_session(user, SETTINGS)
             header = "wismail_session={}; Path={}/; Max-Age=28800; HttpOnly; SameSite=Lax{}".format(
                 session, URL_PREFIX, self._secure_cookie())
             self._redirect("/", cookie=header)
             return
         if oauth_login.configured(SETTINGS) and path == "/logout":
-            self._redirect("/login", cookie="wismail_session=; Path={}/; Max-Age=0; HttpOnly; SameSite=Lax{}".format(URL_PREFIX, self._secure_cookie()))
+            token = self._cookie("wismail_session")
+            is_local = bool(SETTINGS["TEAM_ADMIN_EMAIL"] and local_accounts.read_session(DB_PATH, token))
+            if is_local:
+                local_accounts.revoke_session(DB_PATH, token)
+            self._redirect("/team/login" if is_local else "/login",
+                           cookie="wismail_session=; Path={}/; Max-Age=0; HttpOnly; SameSite=Lax{}".format(
+                               URL_PREFIX, self._secure_cookie()))
             return
         if not self._auth_or_401():
             return
         if path == "/":
             self._send(200, dashboard(user=self.current_user))
+        elif path == "/team" and SETTINGS["TEAM_ADMIN_EMAIL"]:
+            if self.login_kind != "oauth" or self.current_user != SETTINGS["TEAM_ADMIN_EMAIL"]:
+                self._send(403, "无权管理子账户")
+            else:
+                self._send(200, team_page(self.current_user))
         elif path == "/suppressions":
             query = parse_qs(urlparse(self.path).query)
             self._send(200, suppressions_page(self.current_user, query.get("q", [""])[0]))
@@ -1097,9 +1193,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, audit_page(self.current_user))
         elif path == "/notifications":
             self._send(200, notifications_page(self.current_user))
-        elif path == "/static.css":
-            with open(os.path.join(ROOT, "static.css"), "rb") as stream:
-                self._send(200, stream.read(), "text/css; charset=utf-8")
         elif path == "/editor.js":
             with open(os.path.join(ROOT, "editor.js"), "rb") as stream:
                 self._send(200, stream.read(), "text/javascript; charset=utf-8")
@@ -1217,6 +1310,35 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(200, page("Unsubscribed", '<section class="panel"><h1>Unsubscribed</h1><p>This address will no longer receive bulk emails from this sender.</p></section>'))
             return
+        if SETTINGS["TEAM_ADMIN_EMAIL"] and self._route_path() in ("/team/login", "/team/activate"):
+            kind = "login" if self._route_path() == "/team/login" else "activate"
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length < 1 or length > 4096:
+                    raise ValueError("请求大小无效")
+                form = self._form()
+                if not self._valid_public_nonce(form):
+                    raise ValueError("页面已过期，请刷新后重试")
+                if kind == "login":
+                    token = local_accounts.login(DB_PATH, form.getfirst("email", ""),
+                                                 form.getfirst("password", ""))
+                    cookie = "wismail_session={}; Path={}/; Max-Age=28800; HttpOnly; SameSite=Lax{}".format(
+                        token, URL_PREFIX, self._secure_cookie())
+                    self._redirect("/", cookie=cookie)
+                else:
+                    password = form.getfirst("password", "")
+                    if password != form.getfirst("password_repeat", ""):
+                        raise ValueError("两次输入的 Wismail 密码不一致")
+                    local_accounts.activate_account(DB_PATH, form.getfirst("email", ""),
+                                                    form.getfirst("invite_code", ""),
+                                                    form.getfirst("smtp_password", ""),
+                                                    form.getfirst("imap_password", ""), password, SETTINGS)
+                    self._send(200, page("激活成功", '<section class="panel"><h1>账号已激活</h1><p>现在可以用独立的 Wismail 密码登录。</p><a href="/team/login">前往登录</a></section>'))
+            except Exception as exc:
+                logging.warning("Local account %s rejected: %s", kind, type(exc).__name__)
+                self._public_team_page(kind, "登录失败，请核对账号和密码" if kind == "login"
+                                       else "激活失败，请核对邀请码、邮箱应用密码和新密码")
+            return
         if not self._auth_or_401():
             return
         path = self._route_path()
@@ -1229,6 +1351,24 @@ class Handler(BaseHTTPRequestHandler):
                              if oauth_login.configured(SETTINGS) else CSRF_TOKEN)
             if not hmac.compare_digest(form.getfirst("csrf", ""), expected_csrf):
                 self._send(403, "请求校验失败，请刷新页面后重试")
+                return
+            if path in ("/team/create", "/team/reset", "/team/disable") and SETTINGS["TEAM_ADMIN_EMAIL"]:
+                if self.login_kind != "oauth" or self.current_user != SETTINGS["TEAM_ADMIN_EMAIL"]:
+                    self._send(403, "无权管理子账户")
+                    return
+                email = form.getfirst("email", "")
+                if path == "/team/create":
+                    invite = local_accounts.create_invite(DB_PATH, email, self.current_user)
+                    record_audit_event(DB_PATH, self.current_user, "team_invite")
+                    self._send(200, team_page(self.current_user, invite=invite))
+                elif path == "/team/reset":
+                    invite = local_accounts.reset_invite(DB_PATH, email, self.current_user)
+                    record_audit_event(DB_PATH, self.current_user, "team_reset")
+                    self._send(200, team_page(self.current_user, invite=invite))
+                else:
+                    local_accounts.disable_account(DB_PATH, email, self.current_user)
+                    record_audit_event(DB_PATH, self.current_user, "team_disable")
+                    self._send(200, team_page(self.current_user, message="子账户已停用，活动任务已暂停"))
                 return
             if path == "/account" and oauth_login.configured(SETTINGS):
                 smtp_password = form.getfirst("smtp_password", "")
@@ -1477,6 +1617,9 @@ class Handler(BaseHTTPRequestHandler):
                 cancel_batch(DB_PATH, batch_id)
             self._redirect("/batches/{}".format(batch_id))
         except (ValueError, KeyError) as exc:
+            if path.startswith("/team/") and SETTINGS["TEAM_ADMIN_EMAIL"]:
+                self._send(400, team_page(self.current_user, message=str(exc)))
+                return
             if path in ("/templates/save", "/templates/copy", "/templates/test", "/campaigns/from-contacts"):
                 self._send(400, templates_page(self.current_user, str(exc)))
                 return
@@ -1521,12 +1664,19 @@ def main():
         raise SystemExit("请设置至少 12 位的 WISMAIL_ADMIN_PASSWORD")
     if int(SETTINGS["DAILY_LIMIT"]) < 1 or int(SETTINGS["HOURLY_LIMIT"]) < 1 or int(SETTINGS["MIN_INTERVAL_SECONDS"]) < 1:
         raise SystemExit("发信上限和发送间隔必须为正数")
+    if SETTINGS["TEAM_ADMIN_EMAIL"] and not oauth_login.configured(SETTINGS):
+        raise SystemExit("子账户功能需要 mailcow OAuth2 登录")
+    if SETTINGS["TEAM_ADMIN_EMAIL"] and not re.fullmatch(
+            r"[^@\s]+@[a-z0-9][a-z0-9.-]+", SETTINGS["TEAM_ADMIN_EMAIL"]):
+        raise SystemExit("WISMAIL_TEAM_ADMIN_EMAIL 必须是有效邮箱地址")
     if SETTINGS["TRACKING_BASE_URL"]:
         try:
             tracking_base_url(SETTINGS)
         except ValueError as exc:
             raise SystemExit(str(exc))
     init_db(DB_PATH)
+    if SETTINGS["TEAM_ADMIN_EMAIL"]:
+        local_accounts.init_accounts(DB_PATH)
     worker = Worker(DB_PATH, SETTINGS)
     worker.start()
     host = os.getenv("WISMAIL_BIND_HOST", "127.0.0.1")
