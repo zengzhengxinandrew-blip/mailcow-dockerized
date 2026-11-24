@@ -56,11 +56,13 @@ class HttpFlowTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertIn(b"buyer@example.com", page)
             token = core.unsubscribe_token("__legacy_admin__", "buyer@example.com", server.SETTINGS["SESSION_SECRET"])
-            status, _, _ = self.request("GET", "/unsubscribe?token=" + token)
+            status, _, confirmation = self.request("GET", "/unsubscribe?token=" + token)
             self.assertEqual(status, 200)
-            status, _, _ = self.request("POST", "/unsubscribe", urlencode({"token": token}),
-                                        {"Content-Type": "application/x-www-form-urlencoded"})
+            self.assertIn(b"Confirm unsubscribe", confirmation)
+            status, _, success = self.request("POST", "/unsubscribe", urlencode({"token": token}),
+                                              {"Content-Type": "application/x-www-form-urlencoded"})
             self.assertEqual(status, 200)
+            self.assertIn(b"Unsubscribed", success)
             with core.connect(server.DB_PATH) as db:
                 self.assertEqual(db.execute("SELECT status FROM contacts").fetchone()["status"], "unsubscribed")
         finally:

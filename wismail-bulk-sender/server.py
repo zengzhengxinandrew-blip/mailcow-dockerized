@@ -902,10 +902,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 verify_unsubscribe_token(token, SETTINGS["SESSION_SECRET"])
             except ValueError:
-                self._send(400, "退订链接无效")
+                self._send(400, "Invalid unsubscribe link")
                 return
-            content = '<section class="panel"><h1>停止接收邮件</h1><p>确认后将不再向此邮箱发送 Wismail 批量邮件。</p><form method="post" action="/unsubscribe"><input type="hidden" name="token" value="{}"><button class="button" type="submit">确认退订</button></form></section>'.format(h(token))
-            self._send(200, page("确认退订", content))
+            content = '<section class="panel"><h1>Unsubscribe</h1><p>Confirm to stop receiving bulk emails from this sender.</p><form method="post" action="/unsubscribe"><input type="hidden" name="token" value="{}"><button class="button" type="submit">Confirm unsubscribe</button></form></section>'.format(h(token))
+            self._send(200, page("Confirm unsubscribe", content))
             return
         if oauth_login.configured(SETTINGS) and path == "/login":
             state, cookie = oauth_login.new_state(SETTINGS)
@@ -1199,9 +1199,9 @@ class Handler(BaseHTTPRequestHandler):
                 if row:
                     set_contact_status(DB_PATH, owner, row["id"], "unsubscribed", "收件人退订")
             except (ValueError, KeyError):
-                self._send(400, "退订链接无效")
+                self._send(400, "Invalid unsubscribe link")
                 return
-            self._send(200, page("退订完成", '<section class="panel"><h1>已退订</h1><p>该邮箱不会再收到此账号的批量邮件。</p></section>'))
+            self._send(200, page("Unsubscribed", '<section class="panel"><h1>Unsubscribed</h1><p>This address will no longer receive bulk emails from this sender.</p></section>'))
             return
         if not self._auth_or_401():
             return

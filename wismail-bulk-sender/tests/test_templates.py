@@ -272,7 +272,7 @@ class TemplateTests(unittest.TestCase):
         self.assertIn("Plain", parts[0].get_content())
         self.assertNotIn("/unsubscribe?token=", parts[0].get_content())
         self.assertIn("<p>Rich</p>", parts[1].get_content())
-        self.assertIn(">退订</a>", parts[1].get_content())
+        self.assertIn(">Unsubscribe</a>", parts[1].get_content())
         self.assertIn("List-Unsubscribe", message)
 
     def test_plain_mail_shows_unsubscribe_button_without_long_url(self):
@@ -292,7 +292,7 @@ class TemplateTests(unittest.TestCase):
         self.assertEqual(rich.get_content_type(), "text/html")
         self.assertIn("First line<br>", rich.get_content())
         self.assertIn("&lt;second line&gt;", rich.get_content())
-        self.assertIn('>退订</a>', rich.get_content())
+        self.assertIn('>Unsubscribe</a>', rich.get_content())
         self.assertIn('/unsubscribe?token=', message["List-Unsubscribe"])
 
     def test_hourly_limit_blocks_due_message(self):

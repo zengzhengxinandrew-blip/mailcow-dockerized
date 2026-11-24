@@ -2026,7 +2026,8 @@ def _smtp_submit(row, settings):
     msg.set_content(row["body"])
     body_html = row["body_html"] if "body_html" in row.keys() else ""
     if body_html or link:
-        footer = ('<p>不再接收此类邮件：<a href="{0}">退订</a></p>'.format(html.escape(link, quote=True)) if link else '')
+        footer = ('<p>No longer wish to receive these emails? <a href="{0}">Unsubscribe</a></p>'.format(
+            html.escape(link, quote=True)) if link else '')
         content = body_html or '<div>{}</div>'.format(
             html.escape(row["body"]).replace("\r\n", "\n").replace("\n", "<br>\n"))
         if body_html and "id" in row.keys() and tracking_ready(settings) and (row["track_open"] or row["track_click"]):
