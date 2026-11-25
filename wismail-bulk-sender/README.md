@@ -91,6 +91,8 @@ docker compose restart nginx-mailcow php-fpm-mailcow
 
 然后打开 `https://mail.wiskind.top/bulk/`。模块会跳转到 mailcow 登录，再返回批量发送页面。`site.bulk.custom` 使用 mailcow 官方支持的 `site.*.custom` 扩展方式；如站点前还有一层反向代理，须确保 `/bulk/` 请求原样转发给 mailcow。详见 [mailcow 自定义站点文档](https://docs.mailcow.email/manual-guides/Nginx/u_e-nginx_custom/)。
 
+腾讯云的自动部署脚本以 `deploy/wismail-deploy.sh` 为版本源，安装在服务器的 `/usr/local/sbin/wismail-deploy`。它只从功能分支提取 Wismail 目录、Compose 扩展、Nginx 路由及 `vars.local.inc.php`，不会覆盖 mailcow 的 PHP 核心和模板。每次更新前自动备份当前源码、`.env` 和 SQLite 数据库；部署后校验 Nginx、刷新 PHP 缓存，并检查管理登录页与 Wismail 登录页。Compose 扩展挂载 `deploy/php-runtime.ini`，让 PHP 每两秒检查源码变化，并把 PHP 错误写入容器日志；本设置与部署重启共同避免旧缓存导致的白屏。mailcow 主程序的更新仍由 master 分支及 `mailcow-deploy` 负责，后者同样会重启 PHP 并检查管理登录页。不要用整个功能分支的归档覆盖 mailcow 目录。
+
 Python 本地启动时，`.env` 不会自动加载；需要在当前进程环境中设置相同变量。未配置 OAuth2 时仍可使用旧版单管理员模式，例如：
 
 ```powershell

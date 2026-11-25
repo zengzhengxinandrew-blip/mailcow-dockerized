@@ -1,5 +1,9 @@
 # Place beside mailcow's docker-compose.yml, with ./wismail-bulk-sender as a sibling folder.
 services:
+  php-fpm-mailcow:
+    volumes:
+      - ./wismail-bulk-sender/deploy/php-runtime.ini:/usr/local/etc/php/conf.d/zz-wismail-runtime.ini:ro
+
   wismail-bulk-sender:
     build:
       context: ./wismail-bulk-sender
