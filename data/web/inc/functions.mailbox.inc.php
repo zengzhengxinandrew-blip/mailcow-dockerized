@@ -4838,14 +4838,14 @@ function mailbox($_action, $_type, $_data = null, $_extra = null) {
               `mailbox`.`created`,
               `mailbox`.`modified`,
               `mailbox`.`authsource`,
-              `quota2`.`bytes`,
+              COALESCE(`quota2`.`bytes`, 0) AS `bytes`,
               `attributes`,
               `custom_attributes`,
-              `quota2`.`messages`
-                FROM `mailbox`, `quota2`, `domain`
+              COALESCE(`quota2`.`messages`, 0) AS `messages`
+                FROM `mailbox`
+                INNER JOIN `domain` ON `domain`.`domain` = `mailbox`.`domain`
+                LEFT JOIN `quota2` ON `quota2`.`username` = `mailbox`.`username`
                   WHERE (`mailbox`.`kind` = '' OR `mailbox`.`kind` = NULL)
-                    AND `mailbox`.`username` = `quota2`.`username`
-                    AND `domain`.`domain` = `mailbox`.`domain`
                     AND `mailbox`.`username` = :mailbox");
           }
           else {
@@ -4860,20 +4860,23 @@ function mailbox($_action, $_type, $_data = null, $_extra = null) {
               `mailbox`.`created`,
               `mailbox`.`modified`,
               `mailbox`.`authsource`,
-              `quota2replica`.`bytes`,
+              COALESCE(`quota2replica`.`bytes`, 0) AS `bytes`,
               `attributes`,
               `custom_attributes`,
-              `quota2replica`.`messages`
-                FROM `mailbox`, `quota2replica`, `domain`
+              COALESCE(`quota2replica`.`messages`, 0) AS `messages`
+                FROM `mailbox`
+                INNER JOIN `domain` ON `domain`.`domain` = `mailbox`.`domain`
+                LEFT JOIN `quota2replica` ON `quota2replica`.`username` = `mailbox`.`username`
                   WHERE (`mailbox`.`kind` = '' OR `mailbox`.`kind` = NULL)
-                    AND `mailbox`.`username` = `quota2replica`.`username`
-                    AND `domain`.`domain` = `mailbox`.`domain`
                     AND `mailbox`.`username` = :mailbox");
           }
           $stmt->execute(array(
             ':mailbox' => $_data,
           ));
           $row = $stmt->fetch(PDO::FETCH_ASSOC);
+          if (!$row) {
+            return false;
+          }
 
           $mailboxdata['username'] = $row['username'];
           $mailboxdata['active'] = $row['active'];
@@ -4883,8 +4886,10 @@ function mailbox($_action, $_type, $_data = null, $_extra = null) {
           $mailboxdata['local_part'] = $row['local_part'];
           $mailboxdata['quota'] = $row['quota'];
           $mailboxdata['messages'] = $row['messages'];
-          $mailboxdata['attributes'] = json_decode($row['attributes'], true);
-          $mailboxdata['custom_attributes'] = json_decode($row['custom_attributes'], true);
+          $attributes = json_decode($row['attributes'], true);
+          $custom_attributes = json_decode($row['custom_attributes'], true);
+          $mailboxdata['attributes'] = is_array($attributes) ? $attributes : array();
+          $mailboxdata['custom_attributes'] = is_array($custom_attributes) ? $custom_attributes : array();
           $mailboxdata['quota_used'] = intval($row['bytes']);
           $mailboxdata['percent_in_use'] = ($row['quota'] == 0) ? '- ' : round((intval($row['bytes']) / intval($row['quota'])) * 100);
           $mailboxdata['created'] = $row['created'];
