@@ -920,7 +920,12 @@ jQuery(function($){
           return JSON.stringify(d);
         },
         dataSrc: function(json){
+          if (!json || !Array.isArray(json.data)) {
+            return [];
+          }
+          json.data = json.data.filter(item => item && typeof item === 'object');
           $.each(json.data, function (i, item) {
+            item.attributes = item.attributes || {};
             item.quota = {
               sortBy: item.quota_used,
               value: item.quota
@@ -946,7 +951,7 @@ jQuery(function($){
             }
             */
             item.chkbox = '<input type="checkbox" class="form-check-input" data-id="mailbox" name="multi_select" value="' + encodeURIComponent(item.username) + '" />';
-            if (item.attributes.passwd_update != '0') {
+            if (typeof item.attributes.passwd_update === 'string' && item.attributes.passwd_update !== '0') {
               var last_pw_change = new Date(item.attributes.passwd_update.replace(/-/g, "/"));
               item.last_pw_change = last_pw_change.toLocaleDateString(undefined, {year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit"});
             } else {
@@ -2444,7 +2449,9 @@ jQuery(function($){
 
     // get all domains
     var domains = [];
-    json.forEach(obj => {
+    var rows = Array.isArray(json) ? json : (json && Array.isArray(json.data) ? json.data : []);
+    rows.forEach(obj => {
+      if (!obj || typeof obj !== 'object') return;
       Object.entries(obj).forEach(([key, value]) => {
         if(key === 'domain') {
           domains.push(value)
@@ -2459,7 +2466,7 @@ jQuery(function($){
 
     // add domains to select
     domains.forEach(function(domain) {
-        select.append($('<option>' + domain + '</option>'));
+        select.append($('<option>').val(domain).text(domain));
     });
   }
 
