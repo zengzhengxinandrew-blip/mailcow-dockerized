@@ -1,13 +1,13 @@
 openapi: 3.1.0
 info:
   description: >-
-    mailcow is complete e-mailing solution with advanced antispam, antivirus,
+    Wismail is a complete e-mailing solution with advanced antispam, antivirus,
     nice UI and API.
 
 
     In order to use this API you have to create a API key and add your IP
     address to the whitelist of allowed IPs this can be done by logging into the
-    Mailcow UI using your admin account, then go to Configuration > Access >
+    Wismail UI using your admin account, then go to Configuration > Access >
     Edit administrator details > API. There you will find a collapsed API menu.
 
 
@@ -19,7 +19,7 @@ info:
     defined in mailcow.conf (API_KEY, API_KEY_READ_ONLY, API_ALLOW_FROM) are
     shown in the UI, but can only be changed in mailcow.conf.
 
-  title: mailcow API
+  title: Wismail API
   version: "1.0.0"
 
 servers:
@@ -180,7 +180,7 @@ paths:
       description: >-
         You may create a time limited alias using this action. It takes a JSON
         object containing a domain and mailbox informations.
-        Mailcow will generate a random alias.
+        Wismail will generate a random alias.
       operationId: Create time limited alias
       requestBody:
         content:
@@ -1127,7 +1127,7 @@ paths:
       tags:
         - Fordwarding Hosts
       description: >-
-        Add a new Forwarding host to mailcow. You can chose to enable or disable
+        Add a new Forwarding host to Wismail. You can choose to enable or disable
         spam filtering of incoming emails by specifing `filter_spam` 0 =
         inactive, 1 = active.
       operationId: Add Forward Host
@@ -1734,7 +1734,7 @@ paths:
                 active: "1"
               properties:
                 username:
-                  description: local mailcow mailbox (destination, user2); users always create jobs for their own mailbox
+                  description: local Wismail mailbox (destination, user2); users always create jobs for their own mailbox
                   type: string
                 source_id:
                   description: >-
@@ -4245,7 +4245,7 @@ paths:
                       description: is access to SOGo webmail active or not
                       type: boolean
                     shared:
-                      description: shared mailbox, no login of its own (IMAP, SMTP, SOGo, app passwords, mailcow UI)
+                      description: shared mailbox, no login of its own (IMAP, SMTP, SOGo, app passwords, Wismail UI)
                       type: boolean
                   type: object
                 items:
@@ -5854,7 +5854,7 @@ paths:
           headers: {}
       tags:
         - Fordwarding Hosts
-      description: You can list all Forwarding Hosts in your mailcow.
+      description: You can list all Forwarding Hosts in your Wismail installation.
       operationId: Get Forwarding Hosts
       summary: Get Forwarding Hosts
   "/api/v1/get/logs/acme/{count}":
@@ -6132,14 +6132,14 @@ paths:
                   value:
                     - from: awesome@mailcow.email
                       header_from: '"Awesome" <awesome@mailcow.email>'
-                      header_subject: Mailcow is amazing
+                      header_subject: Wismail is amazing
                       ip: 172.22.1.248
                       message_id: 6a-5d892500-7-240abd80@90879116
                       qid: E3CF91500458
                       rcpt: hello@mailcow.email
                       rl_hash: RLsdz3tuabozgd4oacbdh8kc78
                       rl_info: mailcow(RLsdz3tuabozgd4oacbdh8kc78)
-                      rl_name: mailcow
+                      rl_name: Wismail
                       time: 1569269003
                       user: awesome@mailcow.email
           description: OK
@@ -6698,7 +6698,7 @@ paths:
                     rcpt: admin@domain.tld
                     score: 15.48
                     sender: bounces@send.domain.tld
-                    subject: mailcow is awesome
+                    subject: Wismail is awesome
                     virus_flag: 0
           description: OK
           headers: {}
@@ -7649,7 +7649,7 @@ paths:
       description: >-
         This endpoint allows you to manage Cross-Origin Resource Sharing (CORS) settings for the API.
         CORS is a security feature implemented by web browsers to prevent unauthorized cross-origin requests.
-        By editing the CORS settings, you can specify which domains and which methods are permitted to access the API resources from outside the mailcow domain.
+        By editing the CORS settings, you can specify which domains and which methods are permitted to access the API resources from outside the Wismail domain.
       operationId: Edit Cross-Origin Resource Sharing (CORS) settings
       requestBody:
         content:
@@ -7770,13 +7770,13 @@ paths:
                       description: The base URL of your Keycloak server. Required if `authsource` is keycloak.
                       type: string
                     realm:
-                      description: The Keycloak realm where the mailcow client is configured. Required if `authsource` is keycloak.
+                      description: The Keycloak realm where the Wismail client is configured. Required if `authsource` is keycloak.
                       type: string
                     client_id:
-                      description: The Client ID assigned to mailcow Client in OIDC Provider. Required if `authsource` is keycloak or generic-oidc.
+                      description: The Client ID assigned to the Wismail client in the OIDC provider. Required if `authsource` is keycloak or generic-oidc.
                       type: string
                     client_secret:
-                      description: The Client Secret assigned to mailcow Client in OIDC Provider. Required if `authsource` is keycloak or generic-oidc.
+                      description: The Client Secret assigned to the Wismail client in the OIDC provider. Required if `authsource` is keycloak or generic-oidc.
                       type: string
                     redirect_url:
                       description: The redirect URL that OIDC Provider will use after authentication. Required if `authsource` is keycloak or generic-oidc.
@@ -7801,15 +7801,15 @@ paths:
                       type: boolean
                       default: false
                     mailpassword_flow:
-                      description: If enabled, mailcow will attempt to validate user credentials using the Keycloak Admin REST API instead of relying solely on the Authorization Code Flow.
+                      description: If enabled, Wismail will attempt to validate user credentials using the Keycloak Admin REST API instead of relying solely on the Authorization Code Flow.
                       type: boolean
                       default: false
                     periodic_sync:
-                      description: If enabled, mailcow periodically performs a full sync of all users from Keycloak or LDAP.
+                      description: If enabled, Wismail periodically performs a full sync of all users from Keycloak or LDAP.
                       type: boolean
                       default: false
                     import_users:
-                      description: If enabled, new users are automatically imported from Keycloak or LDAP into mailcow.
+                      description: If enabled, new users are automatically imported from Keycloak or LDAP into Wismail.
                       type: boolean
                       default: false
                     sync_interval:
@@ -7871,7 +7871,7 @@ paths:
                       type: number
                       default: 10
                     group_sync:
-                      description: (Keycloak, LDAP) Syncs the members of Identity Provider groups to mailbox groups. Members added in mailcow stay.
+                      description: (Keycloak, LDAP) Syncs the members of Identity Provider groups to mailbox groups. Members added in Wismail stay.
                       type: boolean
                       default: false
                     group_autocreate:
@@ -7879,7 +7879,7 @@ paths:
                       type: boolean
                       default: false
                     group_default_domain:
-                      description: (Keycloak, LDAP) Domain of new groups whose mail is not in a mailcow domain.
+                      description: (Keycloak, LDAP) Domain of new groups whose mail is not in a Wismail domain.
                       type: string
                     group_paths:
                       description: (Keycloak) Comma-separated group paths, e.g. `/Sales` or `/mailcow/*` (all groups below /mailcow). Needs the `query-groups` permission.
@@ -7988,7 +7988,7 @@ tags:
   - name: Fordwarding Hosts
     description: Forwarding Hosts enable you to send mail using a relay
   - name: Logs
-    description: Get all mailcow system logs
+    description: Get all Wismail system logs
   - name: Queue Manager
     description: Manage the postfix mail queue
   - name: Quarantine
@@ -8006,7 +8006,7 @@ tags:
   - name: Outgoing TLS Policy Map Overrides
     description: Force global TLS policys
   - name: oAuth Clients
-    description: Use mailcow as a oAuth server
+    description: Use Wismail as an OAuth server
   - name: API Keys
     description: Manage API keys
   - name: Groups

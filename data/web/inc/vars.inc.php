@@ -33,7 +33,7 @@ if ($https_port === FALSE) {
 //$https_port = 1234;
 // Other settings =>
 $autodiscover_config = array(
-  'displayName' => 'A mailcow mail server',
+  'displayName' => 'Wismail mail server',
   'displayShortName' => 'mail server',
   // General autodiscover service type: "activesync" or "imap"
   // emClient uses autodiscover, but does not support ActiveSync. mailcow excludes emClient from ActiveSync.
@@ -167,7 +167,7 @@ $SESSION_SAMESITE_POLICY = "Lax";
 $SESSION_NAME = "MCSESSID";
 
 // Label for OTP devices
-$OTP_LABEL = "mailcow UI";
+$OTP_LABEL = "Wismail";
 
 // Failed second factor logins (TOTP, Yubico OTP, WebAuthn) of an account before its second factor is locked
 $TFA_MAX_FAILS = 10;
