@@ -76,7 +76,7 @@
               <label class="control-label" for="iam_{{ iam_form }}_group_paths">{{ lang.admin.iam_group_paths }}:</label>
             </div>
             <div class="col-12 col-md-9 col-lg-4">
-              <input type="text" class="form-control" placeholder="/mailcow/*" id="iam_{{ iam_form }}_group_paths" name="group_paths" value="{{ iam_settings.group_paths }}">
+              <input type="text" class="form-control" placeholder="/wismail/*" id="iam_{{ iam_form }}_group_paths" name="group_paths" value="{{ iam_settings.group_paths }}">
             </div>
           </div>
           {% else %}
@@ -93,7 +93,7 @@
               <label class="control-label" for="iam_{{ iam_form }}_group_filter">{{ lang.admin.iam_group_filter }}:</label>
             </div>
             <div class="col-12 col-md-9 col-lg-4">
-              <input type="text" class="form-control" placeholder="(&amp;(objectClass=group)(cn=mailcow-*))" id="iam_{{ iam_form }}_group_filter" name="group_filter" value="{{ iam_settings.group_filter }}">
+              <input type="text" class="form-control" placeholder="(&amp;(objectClass=group)(cn=wismail-*))" id="iam_{{ iam_form }}_group_filter" name="group_filter" value="{{ iam_settings.group_filter }}">
             </div>
           </div>
           <div class="row mb-2">

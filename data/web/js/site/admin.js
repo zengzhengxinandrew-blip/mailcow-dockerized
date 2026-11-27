@@ -677,7 +677,7 @@ jQuery(function($){
         if (item.service == 1) {
           // service keys are shown, but cannot be changed here
           item.desc = '<i class="bi bi-lock-fill" title="' + lang.api_service_key + '"></i> ' + item.desc +
-            ' <span class="badge bg-secondary">mailcow.conf</span>';
+            ' <span class="badge bg-secondary">系统配置</span>';
           item.chkbox = '<input type="checkbox" class="form-check-input" disabled />';
           item.action = '<div class="btn-group">' +
             '<a class="btn btn-xs btn-xs-lg btn-xs-half btn-secondary disabled" aria-disabled="true"><i class="bi bi-pencil-fill"></i> ' + lang.edit + '</a>' +
