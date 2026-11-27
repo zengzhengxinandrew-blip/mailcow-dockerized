@@ -706,7 +706,7 @@ def account_page(user, error="", success=False):
     imap_state = "已开启" if row and row["imap_password_enc"] else "未开启"
     alias_rows = ''.join('<li>{address} · 已验证 {time}<form method="post" action="/account/aliases/remove">{csrf}<input type="hidden" name="alias_email" value="{value}"><button type="submit">移除</button></form></li>'.format(
         address=h(item["alias_email"]), time=local_time(item["verified_at"]), csrf=csrf(user), value=h(item["alias_email"])) for item in aliases)
-    content = '''<nav class="back"><a href="/">← 返回发送批次</a></nav><section class="batch-head"><div><div class="eyebrow">邮箱授权</div><h1>让后台以你的邮箱发信</h1><p class="muted">当前登录：{user}。此邮箱也可轮用已获 mailcow 授权的代发地址；所有邮件仍使用当前邮箱的 SMTP 登录和发送限额。</p></div></section>
+    content = '''<nav class="back"><a href="/">← 返回发送批次</a></nav><section class="batch-head"><div><div class="eyebrow">邮箱授权</div><h1>让后台以你的邮箱发信</h1><p class="muted">当前登录：{user}。此邮箱也可轮用已获 Wismail 授权的代发地址；所有邮件仍使用当前邮箱的 SMTP 登录和发送限额。</p></div></section>
 {alert}{confirmation}<div class="two-col"><section class="panel"><h2>配置应用密码</h2><p class="muted">请输入在邮箱设置中创建的应用密码。Wismail 会先测试登录，不会发送测试邮件；通过后加密保存，供定时任务使用。</p>
 <form method="post" action="/account">{csrf}<label for="smtp-password">SMTP 应用密码</label><input id="smtp-password" name="smtp_password" type="password" autocomplete="new-password" required>
 <label for="imap-password">IMAP 应用密码（可选）</label><input id="imap-password" name="imap_password" type="password" autocomplete="new-password">
@@ -714,7 +714,7 @@ def account_page(user, error="", success=False):
 <section class="panel side"><h2>当前状态</h2><div class="account-state"><div><span>SMTP 发件授权</span><strong>{state}</strong></div><div><span>IMAP 状态同步</span><strong>{imap_state}</strong></div><div><span>SMTP 服务器</span><strong>{smtp_host}:{smtp_port}</strong></div><div><span>IMAP 服务器</span><strong>{imap_host}:{imap_port}</strong></div></div>
 <p class="muted">登录 Wismail 的密码只用于网页登录。后台定时发送需要独立的应用密码；该密码不会显示在页面或上传表格中。</p>
 <form method="post" action="/account/revoke">{csrf}<button class="button subtle" type="submit" onclick="return confirm('撤销授权后，正在排队的批次会暂停。确定撤销？')">撤销发件授权</button></form></section></div>
-<section class="panel"><h2>验证代发地址</h2><p>请先在 mailcow 为当前邮箱授予该地址的 send-as 权限。验证只执行 SMTP MAIL/RCPT 握手，不提交邮件内容；通过的地址暂不参与发送，后续可用于轮换。</p>
+<section class="panel"><h2>验证代发地址</h2><p>请先在 Wismail 管理页为当前邮箱授予该地址的代发权限。验证只执行 SMTP MAIL/RCPT 握手，不提交邮件内容；通过的地址暂不参与发送，后续可用于轮换。</p>
 <form method="post" action="/account/aliases/add">{csrf}<label>代发邮箱<input type="email" name="alias_email" required></label><button class="button" type="submit">验证并保存</button></form><p class="muted">验证通过后可在待确认批次中勾选轮用。移除地址会暂停仍有该地址待发送邮件的批次。</p><ul>{alias_rows}</ul></section>'''.format(
         user=h(user), alert=alert, confirmation=confirmation, csrf=csrf(user), state=h(state),
         alias_rows=alias_rows,
@@ -733,7 +733,7 @@ def domains_page(user):
 <section class="panel"><h1>域名状态</h1><p>发件域名：{domain}。跟踪链接源：{tracking}。</p>
 <p class="muted">以下是当前公开 DNS 和 HTTPS 的只读检查。检测到记录不代表 SPF/DKIM/DMARC 与实际发信路径匹配，也不代表邮件已送达。</p>
 <div class="table-wrap"><table><thead><tr><th>项目</th><th>状态</th><th>观测值</th></tr></thead><tbody>{rows}</tbody></table></div></section>
-<section class="panel"><h2>SMTP 登录 IP</h2><p>Wismail 无法从 DNS 判断 mailcow 的登录 IP 白名单是否已启用；请在 mailcow 管理端核对发件账号的登录策略和服务器出口 IP。此处不显示“已通过”。</p></section>'''.format(
+<section class="panel"><h2>SMTP 登录 IP</h2><p>此页面无法从 DNS 判断邮箱服务器的登录 IP 白名单是否已启用；请在 Wismail 管理页核对发件账号的登录策略和服务器出口 IP。此处不显示“已通过”。</p></section>'''.format(
         domain=h(domain), tracking=h(tracking), rows=rows)
     return page("域名状态", content, user)
 
@@ -808,7 +808,7 @@ def team_login_page(nonce, error=""):
 {alert}<form method="post" action="/team/login"><input type="hidden" name="nonce" value="{nonce}">
 <label>邮箱地址</label><input type="email" name="email" autocomplete="username" required>
 <label>Wismail 登录密码</label><input type="password" name="password" autocomplete="current-password" required>
-<button class="button" type="submit">登录</button></form><p><a href="/team/activate">使用邀请码激活账号</a> · <a href="/login">使用 mailcow 邮箱账号登录</a></p></section>'''.format(
+<button class="button" type="submit">登录</button></form><p><a href="/team/activate">使用邀请码激活账号</a> · <a href="/login">使用 Wismail 邮箱账号登录</a></p></section>'''.format(
         alert=alert, nonce=h(nonce))
     return page("子账户登录", content)
 
@@ -1011,7 +1011,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 user = oauth_login.exchange_code(SETTINGS, code)
             except Exception:
-                self._send(400, page("登录失败", '<div class="alert">邮箱授权失败，请检查 mailcow OAuth2 配置后重试。</div>'))
+                self._send(400, page("登录失败", '<div class="alert">邮箱授权失败，请检查 Wismail 登录配置后重试。</div>'))
                 return
             if SETTINGS["TEAM_ADMIN_EMAIL"] and not local_accounts.oauth_allowed(DB_PATH, user):
                 self._send(403, "此 Wismail 账号已停用或尚未激活")
@@ -1391,7 +1391,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     verify_sender_alias(DB_PATH, self.current_user, form.getfirst("alias_email", ""), SETTINGS)
                 except Exception:
-                    raise ValueError("代发地址验证失败；请检查 mailcow send-as 授权及 SMTP 连接")
+                    raise ValueError("代发地址验证失败；请检查 Wismail 代发权限及 SMTP 连接")
                 self._redirect("/account")
                 return
             if path == "/account/aliases/remove" and oauth_login.configured(SETTINGS):
@@ -1605,7 +1605,7 @@ class Handler(BaseHTTPRequestHandler):
                         try:
                             verify_sender_alias(DB_PATH, self.current_user, sender, SETTINGS)
                         except Exception:
-                            raise ValueError("代发地址验证失败；请检查 mailcow send-as 授权")
+                            raise ValueError("代发地址验证失败；请检查 Wismail 代发权限")
                 schedule_batch(DB_PATH, batch_id, start, interval, int(SETTINGS["UTC_OFFSET_HOURS"]),
                                track_open, track_click, form.getfirst("reply_to", ""), account["SMTP_FROM"], hourly_limit,
                                senders)

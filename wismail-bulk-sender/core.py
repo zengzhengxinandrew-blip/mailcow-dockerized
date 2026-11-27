@@ -1734,10 +1734,10 @@ def verify_sender_alias(path, owner_email, alias_email, settings):
         smtp.login(account["SMTP_USER"], account["SMTP_PASSWORD"])
         code, _ = smtp.mail(alias_email)
         if not 200 <= code < 300:
-            raise ValueError("mailcow 未允许当前账号使用此发件地址")
+            raise ValueError("Wismail 未允许当前账号使用此发件地址")
         code, _ = smtp.rcpt(owner_email)
         if not 200 <= code < 300:
-            raise ValueError("mailcow 未允许当前账号使用此发件地址")
+            raise ValueError("Wismail 未允许当前账号使用此发件地址")
         smtp.rset()
     finally:
         try:
