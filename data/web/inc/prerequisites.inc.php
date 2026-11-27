@@ -273,6 +273,14 @@ if(file_exists($langFile)) {
   $lang = array_merge_real($lang, json_decode(file_get_contents($langFile), true));
 }
 
+// Brand the displayed language strings without changing internal keys, URLs,
+// service names, configuration filenames or example email addresses.
+array_walk_recursive($lang, static function (&$value) {
+  if (is_string($value)) {
+    $value = preg_replace('/(?<![a-z0-9.\/@_-])mailcow(?![a-z0-9.\/@_-])/iu', 'Wismail', $value);
+  }
+});
+
 
 require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/functions.acl.inc.php';
 require_once $_SERVER['DOCUMENT_ROOT'] . '/inc/functions.address_rewriting.inc.php';
