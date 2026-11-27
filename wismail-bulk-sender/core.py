@@ -62,12 +62,14 @@ def connect(path):
     conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
 def init_db(path):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with connect(path) as db:
+        db.execute("PRAGMA journal_mode=WAL")
         db.executescript("""
         CREATE TABLE IF NOT EXISTS batches (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1701,7 +1703,7 @@ def verify_mailbox_auth(owner_email, smtp_password, imap_password, settings):
     if imap_password:
         if not settings.get("IMAP_HOST"):
             raise ValueError("服务器尚未配置 IMAP 主机")
-        mailbox = imaplib.IMAP4_SSL(settings["IMAP_HOST"], int(settings.get("IMAP_PORT", 993)))
+        mailbox = imaplib.IMAP4_SSL(settings["IMAP_HOST"], int(settings.get("IMAP_PORT", 993)), timeout=15)
         try:
             mailbox.login(owner_email, imap_password)
         finally:
@@ -2142,15 +2144,19 @@ def dispatch_one(path, settings):
         if isinstance(exc, smtplib.SMTPRecipientsRefused):
             response = list(exc.recipients.values())[0]
             code = response[0] if response else None
-        temporary = code is None or 400 <= int(code) < 500
-        retry = temporary and row["attempt_count"] + 1 < 3
+        try:
+            code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            code = None
+        uncertain = code is None and not isinstance(exc, smtplib.SMTPRecipientsRefused)
+        retry = code is not None and 400 <= code < 500 and row["attempt_count"] + 1 < 3
         next_at = iso(now + dt.timedelta(minutes=10 * (row["attempt_count"] + 1))) if retry else None
         error = str(exc).replace(sender_settings.get("SMTP_PASSWORD", "\0"), "[redacted]")[:500]
         with connect(path) as db:
             db.execute("UPDATE messages SET status=?,next_attempt_at=?,last_error=? WHERE id=?",
-                       ("queued" if retry else "failed", next_at, error, row["id"]))
+                       ("needs_review" if uncertain else "queued" if retry else "failed", next_at, error, row["id"]))
             db.execute("INSERT INTO delivery_events(message_id,kind,smtp_code,observed_at,detail) VALUES (?,?,?,?,?)",
-                       (row["id"], "retry" if retry else "failed", int(code) if code is not None else None,
+                       (row["id"], "needs_review" if uncertain else "retry" if retry else "failed", code,
                         iso(utcnow()), error))
     else:
         with connect(path) as db:
@@ -2183,26 +2189,39 @@ def poll_imap(path, settings, owner_email="__legacy_admin__"):
     required = ("IMAP_HOST", "IMAP_USER", "IMAP_PASSWORD")
     if not all(settings.get(key) for key in required):
         return 0
-    mailbox = imaplib.IMAP4_SSL(settings["IMAP_HOST"], int(settings.get("IMAP_PORT", 993)))
+    mailbox = imaplib.IMAP4_SSL(settings["IMAP_HOST"], int(settings.get("IMAP_PORT", 993)), timeout=15)
     try:
         mailbox.login(settings["IMAP_USER"], settings["IMAP_PASSWORD"])
-        mailbox.select("INBOX", readonly=True)
+        selected, _ = mailbox.select("INBOX", readonly=True)
+        if selected != "OK":
+            return 0
         state_key = "last_uid:" + owner_email
+        validity_key = "uidvalidity:" + owner_email
+        validity_response = mailbox.response("UIDVALIDITY") if hasattr(mailbox, "response") else (None, None)
+        validity_values = validity_response[1] if validity_response else None
+        uidvalidity = (validity_values[0].decode() if isinstance(validity_values[0], bytes)
+                       else str(validity_values[0])) if validity_values and validity_values[0] else None
         with connect(path) as db:
             row = db.execute("SELECT value FROM imap_state WHERE key=?", (state_key,)).fetchone()
             last_uid = int(row["value"]) if row else 0
+            prior_validity = db.execute("SELECT value FROM imap_state WHERE key=?", (validity_key,)).fetchone()
+            if uidvalidity and prior_validity and prior_validity["value"] != uidvalidity:
+                last_uid = 0
+                db.execute("INSERT OR REPLACE INTO imap_state(key,value) VALUES (?,?)", (state_key, "0"))
+            if uidvalidity:
+                db.execute("INSERT OR REPLACE INTO imap_state(key,value) VALUES (?,?)", (validity_key, uidvalidity))
         status, data = mailbox.uid("SEARCH", None, "UID", "{}:*".format(last_uid + 1))
         if status != "OK":
             return 0
         uids = [int(x) for x in (data[0] or b"").split() if int(x) > last_uid]
         processed = 0
-        for uid in uids[:200]:
-            status, parts = mailbox.uid("FETCH", str(uid), "(RFC822)")
+        for uid in uids[:50]:
+            status, parts = mailbox.uid("FETCH", str(uid), "(BODY.PEEK[])")
             if status != "OK":
-                continue
-            raw = next((item[1] for item in parts if isinstance(item, tuple)), None)
+                break
+            raw = next((item[1] for item in parts or [] if isinstance(item, tuple)), None)
             if not raw:
-                continue
+                break
             msg = email.message_from_bytes(raw, policy=email.policy.default)
             references = " ".join([str(msg.get("In-Reply-To", "")), str(msg.get("References", ""))])
             ids = MESSAGE_ID_RE.findall(references)
@@ -2210,7 +2229,7 @@ def poll_imap(path, settings, owner_email="__legacy_admin__"):
             kind = "bounce" if recipient else "reply"
             matched = None
             with connect(path) as db:
-                source_uid = owner_email + ":" + str(uid)
+                source_uid = owner_email + ":" + (uidvalidity + ":" if uidvalidity else "") + str(uid)
                 already_seen = db.execute("SELECT 1 FROM imap_events WHERE source_uid=?", (source_uid,)).fetchone()
                 matched_by_id = False
                 for message_id in ids:
@@ -2266,7 +2285,6 @@ class Worker(threading.Thread):
         self.stop_event = stop_event or threading.Event()
 
     def run(self):
-        next_imap = utcnow()
         next_birthday = utcnow()
         while not self.stop_event.is_set():
             try:
@@ -2280,17 +2298,32 @@ class Worker(threading.Thread):
                 except Exception as exc:
                     print("定时草稿检查失败：{}".format(exc))
                 next_birthday = utcnow() + dt.timedelta(minutes=5)
-            if utcnow() >= next_imap:
+            self.stop_event.wait(5)
+
+
+class ImapWorker(threading.Thread):
+    def __init__(self, path, settings, stop_event=None):
+        super(ImapWorker, self).__init__(daemon=True)
+        self.path = path
+        self.settings = settings
+        self.stop_event = stop_event or threading.Event()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
                 with connect(self.path) as db:
                     owners = [row["owner_email"] for row in db.execute("SELECT owner_email FROM mailbox_auth")]
                 if self.settings.get("IMAP_USER") and self.settings.get("IMAP_PASSWORD"):
                     owners.append("__legacy_admin__")
                 for owner in owners:
+                    if self.stop_event.is_set():
+                        break
                     try:
                         account = mailbox_settings(self.path, owner, self.settings)
                         if account:
                             poll_imap(self.path, account, owner)
                     except Exception as exc:
                         print("IMAP 状态同步失败：{}".format(exc))
-                next_imap = utcnow() + dt.timedelta(seconds=120)
-            self.stop_event.wait(5)
+            except Exception as exc:
+                print("IMAP 账号检查失败：{}".format(exc))
+            self.stop_event.wait(120)

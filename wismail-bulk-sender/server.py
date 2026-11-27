@@ -16,12 +16,12 @@ import logging
 import os
 import re
 import secrets
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from cryptography.fernet import Fernet
 
-from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_category, rename_category, delete_category, set_contact_category, merge_contacts, create_draft,
+from core import (AUTOMATION_EVENTS, SCHEDULE_KINDS, MAX_UPLOAD_BYTES, ImapWorker, Worker, ab_click_guidance, add_suppression, cancel_batch, connect, copy_batch, copy_template, create_category, rename_category, delete_category, set_contact_category, merge_contacts, create_draft,
                   create_contact_campaign, engagement_details, failure_details, failure_summary, feedback_details, get_template, import_contacts, import_provider_feedback, init_db, mailbox_settings,
                   parse_contacts_upload, parse_upload, preflight_template, prepare_contact_campaign, render_template, report_data,
                   save_automation_rule, set_automation_rule, delete_automation_rule, save_scheduled_rule,
@@ -121,19 +121,24 @@ def csrf(user="__legacy_admin__"):
     return '<input type="hidden" name="csrf" value="{}">'.format(token)
 
 
+def summaries_for(db, batch_ids):
+    if not batch_ids:
+        return {}
+    placeholders = ",".join("?" for _ in batch_ids)
+    rows = db.execute("""SELECT batch_id,COUNT(*) AS total,
+        SUM(status='queued') AS queued, SUM(submitted_at IS NOT NULL) AS submitted,
+        SUM(opened_at IS NOT NULL) AS opened, SUM(clicked_at IS NOT NULL) AS clicked,
+        SUM(status IN ('failed','needs_review')) AS failed,
+        SUM(status='suppressed') AS suppressed,
+        SUM(replied_at IS NOT NULL) AS replied, SUM(bounced_at IS NOT NULL) AS bounced
+        FROM messages WHERE batch_id IN ({}) GROUP BY batch_id""".format(placeholders), batch_ids).fetchall()
+    return {row["batch_id"]: dict(row) for row in rows}
+
+
 def summary_for(db, batch_id):
-    rows = db.execute("SELECT status,submitted_at,opened_at,clicked_at,replied_at,bounced_at FROM messages WHERE batch_id=?", (batch_id,)).fetchall()
-    return {
-        "total": len(rows),
-        "queued": sum(x["status"] == "queued" for x in rows),
-        "submitted": sum(bool(x["submitted_at"]) for x in rows),
-        "opened": sum(bool(x["opened_at"]) for x in rows),
-        "clicked": sum(bool(x["clicked_at"]) for x in rows),
-        "failed": sum(x["status"] in ("failed", "needs_review") for x in rows),
-        "suppressed": sum(x["status"] == "suppressed" for x in rows),
-        "replied": sum(bool(x["replied_at"]) for x in rows),
-        "bounced": sum(bool(x["bounced_at"]) for x in rows),
-    }
+    return summaries_for(db, [batch_id]).get(batch_id, {
+        "total": 0, "queued": 0, "submitted": 0, "opened": 0, "clicked": 0,
+        "failed": 0, "suppressed": 0, "replied": 0, "bounced": 0})
 
 
 def batch_flow_html(batch, rows):
@@ -261,9 +266,10 @@ def dashboard(error="", user="__legacy_admin__"):
         suppressions = db.execute("""SELECT recipient_email,created_at FROM suppressions
                                    WHERE owner_email IN (?, '*') ORDER BY created_at DESC LIMIT 10""", (user,)).fetchall()
         suppression_count = db.execute("SELECT COUNT(*) AS n FROM suppressions WHERE owner_email IN (?, '*')", (user,)).fetchone()["n"]
+        batch_summaries = summaries_for(db, [batch["id"] for batch in batches])
         cards = []
         for batch in batches:
-            stats = summary_for(db, batch["id"])
+            stats = batch_summaries.get(batch["id"], {"total": 0, "submitted": 0, "failed": 0})
             cards.append('''<a class="batch-row" href="/batches/{id}"><div><span class="batch-name">{name}</span><span class="muted">创建于 {created}</span></div><div class="batch-facts"><span class="pill {state}">{state_label}</span><span>{total} 封</span><span>已提交 {submitted}</span><span>失败 {failed}</span></div></a>'''.format(
                 id=batch["id"], name=h(batch["name"]), created=local_time(batch["created_at"]),
                 state=h(batch["state"]), state_label=STATE.get(batch["state"], batch["state"]), **stats))
@@ -449,7 +455,9 @@ def automations_page(user, error=""):
 
 def templates_page(user, error="", selected_id=0, selected_version=None, preview_contact_id=0, precheck=False):
     with connect(DB_PATH) as db:
-        templates = db.execute("SELECT * FROM templates WHERE owner_email=? ORDER BY updated_at DESC,id DESC", (user,)).fetchall()
+        templates = db.execute("""SELECT t.*,COALESCE((SELECT MAX(v.version) FROM template_versions v
+                                  WHERE v.template_id=t.id),0) AS latest_version
+                                  FROM templates t WHERE t.owner_email=? ORDER BY t.updated_at DESC,t.id DESC""", (user,)).fetchall()
         contacts = db.execute("SELECT id,email,name FROM contacts WHERE owner_email=? AND status='subscribed' AND deleted_at IS NULL ORDER BY id DESC LIMIT 200", (user,)).fetchall()
         categories = db.execute("SELECT name FROM contact_categories WHERE owner_email=? ORDER BY name", (user,)).fetchall()
         versions = db.execute("SELECT version,created_at FROM template_versions WHERE template_id=? ORDER BY version DESC", (selected_id,)).fetchall() if selected_id else []
@@ -457,7 +465,7 @@ def templates_page(user, error="", selected_id=0, selected_version=None, preview
         contact = db.execute("SELECT * FROM contacts WHERE id=? AND owner_email=?", (preview_contact_id, user)).fetchone() if preview_contact_id else None
     selected = get_template(DB_PATH, user, selected_id, selected_version) if selected_id else None
     list_html = ''.join('<li><a href="/templates?id={id}">{name} · v{version}</a></li>'.format(
-        id=row["id"], name=h(row["name"]), version=h(get_template(DB_PATH, user, row["id"])["version"])) for row in templates)
+        id=row["id"], name=h(row["name"]), version=h(row["latest_version"])) for row in templates)
     version_html = ''.join('<a href="/templates?id={}&version={}">v{} · {}</a> '.format(selected_id, row["version"], row["version"], local_time(row["created_at"])) for row in versions)
     contact_options = ''.join('<option value="{}" {}>{}</option>'.format(row["id"], 'selected' if preview_contact_id == row["id"] else '', h(row["email"])) for row in contacts)
     category_options = ''.join('<option value="{0}">{0}</option>'.format(h(row["name"])) for row in categories)
@@ -1678,17 +1686,21 @@ def main():
     if SETTINGS["TEAM_ADMIN_EMAIL"]:
         local_accounts.init_accounts(DB_PATH)
     worker = Worker(DB_PATH, SETTINGS)
+    imap_worker = ImapWorker(DB_PATH, SETTINGS)
     worker.start()
+    imap_worker.start()
     host = os.getenv("WISMAIL_BIND_HOST", "127.0.0.1")
     port = int(os.getenv("WISMAIL_PORT", "8765"))
     print("Wismail 批量发送模块运行在 http://{}:{}".format(host, port))
     try:
-        HTTPServer((host, port), Handler).serve_forever()
+        ThreadingHTTPServer((host, port), Handler).serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         worker.stop_event.set()
+        imap_worker.stop_event.set()
         worker.join(timeout=5)
+        imap_worker.join(timeout=5)
 
 
 if __name__ == "__main__":
